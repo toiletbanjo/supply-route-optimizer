@@ -48,6 +48,7 @@
     "src/ui/psg/profile.js",
     "src/ui/psg/request.js",
     "src/ui/psg/myrequests.js",
+    "src/ui/planner/map.js",
     "src/ui/planner/queue.js",
     "src/ui/planner/plan.js",
     "src/ui/planner/route.js",
