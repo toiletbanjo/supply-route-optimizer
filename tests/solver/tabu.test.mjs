@@ -352,7 +352,8 @@ test('shouldStop is asked at least every 250 ms; the run then stops at once with
     assert.equal(res.stopReason, 'stopped');
     assert.ok(maxGap <= 250, 'max gap between shouldStop calls ' + maxGap.toFixed(0) + ' ms');
     assert.ok(after < 50, 'returned ' + after.toFixed(0) + ' ms (CPU) after shouldStop turned true');
-    assert.ok(calls > 10);
+    // the contract is a gap of at most 250 ms (checked above), so that many calls at least
+    assert.ok(calls >= Math.floor(stopAfter / 250), 'shouldStop calls ' + calls);
     assert.ok(res.total <= res.extra.startTotal);
     if (stopAfter > 1000) assert.ok(res.extra.restarts >= 1, 'stopped after a restart');
   }

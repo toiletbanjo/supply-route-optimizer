@@ -3139,6 +3139,52 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
   .psg-cart .psg-line-remove { grid-column: 2; grid-row: 1 / span 2; }
 }
 /* ==== end PSG views ============================================================================ */
+
+/* Planner audit fixes */
+/* compare table: the indented cost parts add up to the total; counts start below a rule */
+.pp-cmp-table tr.pp-cmp-part th[scope="row"] { padding-left: 10px; font-weight: 500; }
+.pp-cmp-table tr.pp-cmp-part td { color: var(--text-muted); }
+.pp-cmp-table tr.pp-cmp-part td.is-best { color: var(--ok); }
+.pp-cmp-table tr.pp-cmp-part td.text-danger { color: var(--danger); }
+.pp-cmp-table tr.pp-cmp-total th[scope="row"], .pp-cmp-table tr.pp-cmp-total td { font-weight: 700; }
+.pp-cmp-table tr.pp-cmp-first th, .pp-cmp-table tr.pp-cmp-first td { border-top: 2px solid var(--border-strong); }
+/* MIP proof notice and optimizer notes kept open */
+.pp-gap-note { margin-top: 3px; }
+.pp-key-notes ul, .pp-confirm-viol ul { margin: 2px 0 0; padding-left: 1.1em; display: flex; flex-direction: column; gap: 3px; }
+.pp-key-notes > div { min-width: 0; overflow-wrap: break-word; }
+/* re-plan summary: 'From now' and 'This window' strips */
+.pp-summary-cap { color: var(--text-muted); font-size: 0.7rem; margin-bottom: -4px; }
+.pp-summary-window .stat-unit { white-space: nowrap; }
+/* truck card: the stops in order, in plain words */
+.pp-truck-stops { color: var(--text); font-size: 0.8667rem; line-height: 1.35; overflow-wrap: anywhere; }
+/* refused approval: the plans that meet every rule */
+.pp-alt-list .list-row { align-items: center; gap: 8px; }
+.pp-alt-list .list-row-title { white-space: normal; overflow-wrap: break-word; }
+/* route detail: ETA-change cost, the turn-back point, a finished trip */
+.pr-c-stability { --cost-c: var(--warn); }
+.pr-turn .pr-marker { border-style: dashed; color: var(--warn); }
+.pr-turn .pr-marker .icon { width: 14px; height: 14px; }
+.pr-cost-done .card-header { margin-bottom: 0; }
+/* planner map: where a truck turned back from a closed road */
+.pm-turn-icon { background: none; border: 0; }
+.pm-turn-callout { position: relative; width: 44px; height: 44px; --stalk: var(--truck, var(--warn)); }
+.pm-turn-stalk { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.pm-turn-stalk path { stroke: var(--stalk); stroke-width: 2; fill: none; }
+.pm-turn-stalk circle { fill: var(--stalk); stroke: var(--bg); stroke-width: 1.5; }
+.pm-turn-callout > .pm-turn { position: absolute; right: 0; top: 0; }
+.pm-turn {
+  display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; box-sizing: border-box;
+  border: 2px solid var(--truck, var(--warn)); border-radius: 50%; background: var(--surface); color: var(--warn);
+  box-shadow: 0 0 0 2px var(--bg); cursor: pointer;
+}
+.pm-turn.pm-turn-sm { width: 16px; height: 16px; border-width: 1.5px; box-shadow: none; cursor: default; color: var(--warn); }
+/* plan head: planning rules the plan breaks; approve dialog: departures already past */
+.pp-viol ul { margin: 2px 0 4px; padding-left: 1.1em; display: flex; flex-direction: column; gap: 3px; }
+.pp-viol > div, .pp-confirm-late > div { min-width: 0; overflow-wrap: break-word; }
+/* plan picker: the label above the select, so the select gets the panel width for name, cost and status */
+.pp-picker-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+/* 'This window' strip: stops already made, on a line under the stop count */
+.pp-stat-note { display: block; font-size: 0.75rem; line-height: 1.2; color: var(--text-muted); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -10602,7 +10648,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
 !function(e,t){"object"==typeof exports&&"undefined"!=typeof module?t(exports):"function"==typeof define&&define.amd?define(["exports"],t):t((e=e||self).mgrs={})}(this,(function(e){"use strict";const t=65,r=73,n=79;function o(e){return e*(Math.PI/180)}function a(e){return e/Math.PI*180}function i(e){const t=e.northing,r=e.easting,{zoneLetter:n,zoneNumber:o}=e;if(o<0||o>60)return null;const s=6378137,c=(1-Math.sqrt(.99330562))/(1+Math.sqrt(.99330562)),f=r-5e5;let h=t;n<"N"&&(h-=1e7);const u=6*(o-1)-180+3,l=h/.9996/6367449.145945056,b=l+(3*c/2-27*c*c*c/32)*Math.sin(2*l)+(21*c*c/16-55*c*c*c*c/32)*Math.sin(4*l)+151*c*c*c/96*Math.sin(6*l),d=s/Math.sqrt(1-.00669438*Math.sin(b)*Math.sin(b)),M=Math.tan(b)*Math.tan(b),g=.006739496752268451*Math.cos(b)*Math.cos(b),p=.99330562*s/Math.pow(1-.00669438*Math.sin(b)*Math.sin(b),1.5),w=f/(.9996*d);let y=b-d*Math.tan(b)/p*(w*w/2-(5+3*M+10*g-4*g*g-.06065547077041606)*w*w*w*w/24+(61+90*M+298*g+45*M*M-1.6983531815716497-3*g*g)*w*w*w*w*w*w/720);y=a(y);let m,A=(w-(1+2*M+g)*w*w*w/6+(5-2*g+28*M-3*g*g+.05391597401814761+24*M*M)*w*w*w*w*w/120)/Math.cos(b);if(A=u+a(A),"number"==typeof e.accuracy){const t=i({northing:e.northing+e.accuracy,easting:e.easting+e.accuracy,zoneLetter:e.zoneLetter,zoneNumber:e.zoneNumber});m={top:t.lat,right:t.lon,bottom:y,left:A}}else m={lat:y,lon:A};return m}function s(e){if(e<=84&&e>=72)return"X";if(e<72&&e>=-80){const t=8,r=-80;return"CDEFGHJKLMNPQRSTUVWX"[Math.floor((e-r)/t)]}return e>84||e<-80?"Z":void 0}function c(e){let t=e%6;return 0===t&&(t=6),t}function f(e){if(e&&0===e.length)throw new TypeError("MGRSPoint coverting from nothing");e=e.replace(/ /g,"");const{length:o}=e;let a,i=null,s="",f=0;for(;!/[A-Z]/.test(a=e.charAt(f));){if(f>=2)throw new Error("MGRSPoint bad conversion from: "+e);s+=a,f++}const u=parseInt(s,10);if(0===f||f+3>o)throw new Error("MGRSPoint bad conversion from "+e);const l=e.charAt(f++);if(l<="A"||"B"===l||"Y"===l||l>="Z"||"I"===l||"O"===l)throw new Error(`MGRSPoint zone letter ${l} not handled: ${e}`);i=e.substring(f,f+=2);const b=c(u),d=function(e,o){let a="AJSAJS".charCodeAt(o-1),i=1e5,s=!1;for(;a!==e.charCodeAt(0);){if(a++,a===r&&a++,a===n&&a++,a>90){if(s)throw new Error("Bad character: "+e);a=t,s=!0}i+=1e5}return i}(i.charAt(0),b);let M=function(e,o){if(e>"V")throw new TypeError("MGRSPoint given invalid Northing "+e);let a="AFAFAF".charCodeAt(o-1),i=0,s=!1;for(;a!==e.charCodeAt(0);){if(a++,a===r&&a++,a===n&&a++,a>86){if(s)throw new Error("Bad character: "+e);a=t,s=!0}i+=1e5}return i}(i.charAt(1),b);for(;M<h(l);)M+=2e6;const g=o-f;if(g%2!=0)throw new Error("MGRSPoint has to have an even number\nof digits after the zone letter and two 100km letters - front\nhalf for easting meters, second half for\nnorthing meters "+e);const p=g/2;let w=0,y=0;const m=1e5/Math.pow(10,p);if(p>0){const t=e.substring(f,f+p);w=parseFloat(t)*m;const r=e.substring(f+p);y=parseFloat(r)*m}return{easting:w+d,northing:y+M,zoneLetter:l,zoneNumber:u,accuracy:m}}function h(e){let t;switch(e){case"C":t=11e5;break;case"D":t=2e6;break;case"E":t=28e5;break;case"F":t=37e5;break;case"G":t=46e5;break;case"H":t=55e5;break;case"J":t=64e5;break;case"K":t=73e5;break;case"L":t=82e5;break;case"M":t=91e5;break;case"N":t=0;break;case"P":t=8e5;break;case"Q":t=17e5;break;case"R":t=26e5;break;case"S":t=35e5;break;case"T":t=44e5;break;case"U":t=53e5;break;case"V":t=62e5;break;case"W":t=7e6;break;case"X":t=79e5;break;default:t=-1}if(t>=0)return t;throw new TypeError("Invalid zone letter: "+e)}e.forward=function(e,a){if(a="number"==typeof a?a:5,!Array.isArray(e))throw new TypeError("forward did not receive an array");if("string"==typeof e[0]||"string"==typeof e[1])throw new TypeError("forward received an array of strings, but it only accepts an array of numbers.");const[i,f]=e;if(i<-180||i>180)throw new TypeError("forward received an invalid longitude of "+i);if(f<-90||f>90)throw new TypeError("forward received an invalid latitude of "+f);if(f<-80||f>84)throw new TypeError(`forward received a latitude of ${f}, but this library does not support conversions of points in polar regions below 80°S and above 84°N`);return function(e,o){const a="00000"+e.easting,i="00000"+e.northing;return e.zoneNumber+e.zoneLetter+function(e,o,a){const i=c(a),s=Math.floor(e/1e5),f=Math.floor(o/1e5)%20;return function(e,o,a){const i=a-1,s="AJSAJS".charCodeAt(i),c="AFAFAF".charCodeAt(i);let f=s+e-1,h=c+o,u=!1;f>90&&(f=f-90+t-1,u=!0);(f===r||s<r&&f>r||(f>r||s<r)&&u)&&f++;(f===n||s<n&&f>n||(f>n||s<n)&&u)&&(f++,f===r&&f++);f>90&&(f=f-90+t-1);h>86?(h=h-86+t-1,u=!0):u=!1;(h===r||c<r&&h>r||(h>r||c<r)&&u)&&h++;(h===n||c<n&&h>n||(h>n||c<n)&&u)&&(h++,h===r&&h++);h>86&&(h=h-86+t-1);return String.fromCharCode(f)+String.fromCharCode(h)}(s,f,i)}(e.easting,e.northing,e.zoneNumber)+a.substr(a.length-5,o)+i.substr(i.length-5,o)}(function(e){const t=e.lat,r=e.lon,n=6378137,a=o(t),i=o(r);let c;c=Math.floor((r+180)/6)+1,180===r&&(c=60);t>=56&&t<64&&r>=3&&r<12&&(c=32);t>=72&&t<84&&(r>=0&&r<9?c=31:r>=9&&r<21?c=33:r>=21&&r<33?c=35:r>=33&&r<42&&(c=37));const f=o(6*(c-1)-180+3),h=n/Math.sqrt(1-.00669438*Math.sin(a)*Math.sin(a)),u=Math.tan(a)*Math.tan(a),l=.006739496752268451*Math.cos(a)*Math.cos(a),b=Math.cos(a)*(i-f),d=n*(.9983242984503243*a-.002514607064228144*Math.sin(2*a)+2639046602129982e-21*Math.sin(4*a)-3.418046101696858e-9*Math.sin(6*a)),M=.9996*h*(b+(1-u+l)*b*b*b/6+(5-18*u+u*u+72*l-.39089081163157013)*b*b*b*b*b/120)+5e5;let g=.9996*(d+h*Math.tan(a)*(b*b/2+(5-u+9*l+4*l*l)*b*b*b*b/24+(61-58*u+u*u+600*l-2.2240339282485886)*b*b*b*b*b*b/720));t<0&&(g+=1e7);return{northing:Math.trunc(g),easting:Math.trunc(M),zoneNumber:c,zoneLetter:s(t)}}({lat:f,lon:i}),a)},e.getLetterDesignator=s,e.inverse=function(e){const t=i(f(e.toUpperCase()));return"number"==typeof t.lat&&"number"==typeof t.lon?[t.lon,t.lat,t.lon,t.lat]:[t.left,t.bottom,t.right,t.top]},e.toPoint=function(e){if(""===e)throw new TypeError("toPoint received a blank string");const t=i(f(e.toUpperCase()));return"number"==typeof t.lat&&"number"==typeof t.lon?[t.lon,t.lat]:[(t.left+t.right)/2,(t.top+t.bottom)/2]},Object.defineProperty(e,"__esModule",{value:!0})}));
 </script>
 <script data-src="build-info">
-(function(root){var SRO=root.SRO=root.SRO||{};SRO.build={"hash": "6e31317b2cbc", "libs": {"highs": "1.15.3", "leaflet": "1.9.4", "mgrs": "2.2.0", "milsymbol": "3.0.4"}, "missing": []};})(typeof self!=="undefined"?self:globalThis);
+(function(root){var SRO=root.SRO=root.SRO||{};SRO.build={"hash": "a83c0b8f4940", "libs": {"highs": "1.15.3", "leaflet": "1.9.4", "mgrs": "2.2.0", "milsymbol": "3.0.4"}, "missing": []};})(typeof self!=="undefined"?self:globalThis);
 </script>
 <script data-src="src/core/ns.js">
 // Creates the shared SRO namespace. Must load before every other script.
@@ -25338,8 +25384,13 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     selFns.push(fn);
     return function () { const i = selFns.indexOf(fn); if (i >= 0) selFns.splice(i, 1); };
   };
-  // show a plan in the planner views and tell the others (Outputs listens to 'planner:plan-selected')
+  // show a plan in the planner views and tell the others (Outputs listens to 'planner:plan-selected').
+  // The planner's pick wins over a plan stored just before it (Compare stores one plan per method, the
+  // last of them not the cheapest): the current ui.lastPlanId counts as seen, so the next
+  // K.viewedPlan does not hand the view to that stored plan.
   K.showPlan = function (planId) {
+    const st = SRO.app && SRO.app.store && SRO.app.store.getState();
+    if (planId && st) K._seenLastPlanId = (st.ui || {}).lastPlanId;
     const changed = K.select({ planId: planId || null });
     if (planId && ui.emit) ui.emit('planner:plan-selected', { planId: planId, source: 'plan' });
     return changed;
@@ -25356,6 +25407,8 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
   K.gallons = function (x) { return F().gallons(x); };
   K.num = function (x, d) { return F().number(x, d || 0); };
   K.qty = function (q, unit) { return F().qty(q, unit); };
+  // a radius or travel limit: '50 mi', '12.5 mi' (no '.0' on whole miles)
+  K.radius = function (x) { return K.isNum(x) ? F().qty(Math.round(x * 10) / 10, 'mi') : F().NA; };
   K.classLabel = function (c) { return F().classLabel(c); };
   K.mgrs = function (lat, lon) { return F().mgrs(lat, lon, 5); };
   K.duration = function (min) { return F().duration(min); };
@@ -25363,6 +25416,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
   // run times are seconds, which format.duration (whole minutes) cannot show
   K.secs = function (s) {
     if (typeof s !== 'number' || !isFinite(s)) return 'n/a';
+    if (s > 0 && s < 0.05) return '<0.1 s';
     if (s < 10) return (Math.round(s * 10) / 10).toFixed(1) + ' s';
     if (s < 90) return Math.round(s) + ' s';
     const m = Math.floor(Math.round(s) / 60), r = Math.round(s) % 60;
@@ -25449,18 +25503,27 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     (r.lines || []).forEach(function (l) { if (l && l.classId) seen[l.classId] = true; });
     return order.filter(function (c) { return seen[c]; }).concat(Object.keys(seen).filter(function (c) { return order.indexOf(c) < 0; }));
   };
-  // 'Diesel / JP-8, JP-8: 500 gal'
+  // 'MREs, Mixed menus: 32 cases'; 'Diesel / JP-8: 500 gal' (option JP-8 left out: the name says it)
   K.lineText = function (line, qtyOverride) {
     const CH = SRO.data.catalogHelpers;
     const it = CH && CH.itemById(line.itemId);
     const name = it ? it.name : (line.itemId || 'Item');
     let opt = '';
     if (it && it.freeText) opt = line.option || '';
-    else if (it) { const o = CH.optionById(line.itemId, line.option); opt = o ? o.label : (line.option || ''); }
+    else if (it && (it.options || []).length > 1) { const o = CH.optionById(line.itemId, line.option); opt = o ? o.label : (line.option || ''); }
+    else if (!it) opt = line.option || '';
     const q = qtyOverride !== undefined ? qtyOverride : line.qty;
     const unit = CH && CH.unitLabel ? CH.unitLabel(line.unit || (it && it.unit), q) : (line.unit || '');
-    const optText = opt && opt.toLowerCase() !== name.toLowerCase() ? ', ' + opt : '';
-    return name + optText + ': ' + K.qty(q, unit);
+    return K.itemName(name, opt) + ': ' + K.qty(q, unit);
+  };
+  // Item name and option in one, the option only when it adds something: an item with one option
+  // shows its name alone (the caller passes no option), 'Diesel / JP-8' already says JP-8, and an
+  // option that contains the name ('AT4 (84 mm)') stands for both.
+  K.itemName = function (name, opt) {
+    const nl = String(name || '').toLowerCase(), ol = String(opt || '').toLowerCase();
+    if (!ol || ol === nl || (ol.length >= 3 && nl.indexOf(ol) >= 0)) return name;
+    if (nl.length >= 2 && ol.indexOf(nl) >= 0) return opt;
+    return name + ', ' + opt;
   };
   K.lineUnit = function (line, qty) {
     const CH = SRO.data.catalogHelpers;
@@ -25526,6 +25589,37 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     const miles = legs.reduce(function (a, l) { return a + (K.isNum(l.miles) ? l.miles : 0); }, 0);
     const mpg = (state && state.scenario && state.scenario.settings && state.scenario.settings.mpg) || 2;
     return { miles: miles, gallons: miles / mpg, replannedMiles: K.isNum(route.miles) ? route.miles : null };
+  };
+
+  // For each leg of a route, the index of the stop it arrives at, or -1 (the drive back to the hub, or
+  // a re-plan's turn-back leg to a 'pos:<truck>' point). Legs and stops are in time order and match
+  // by node key (leg.toKey = stop.nodeKey); legs without keys pair up with stops by position.
+  K.legStops = function (route) {
+    const legs = (route && route.legs) || [], stops = (route && route.stops) || [];
+    const keyed = legs.every(function (l) { return l && l.toKey; }) && stops.every(function (st) { return st && st.nodeKey; });
+    if (!keyed) return legs.map(function (l, i) { return i < stops.length ? i : -1; });
+    let s = 0;
+    return legs.map(function (l) {
+      if (s < stops.length && l.toKey === stops[s].nodeKey && !l.turnedBack) return s++;
+      return -1;
+    });
+  };
+  // The turn-back of a re-plan: a truck driving into a newly closed road turned where it was and
+  // was routed on from that point. -> null or { legIndex, leg, lat, lon, at, nextStop }
+  K.turnBack = function (route) {
+    const legs = (route && route.legs) || [];
+    const i = legs.findIndex(function (l) { return l && l.turnedBack; });
+    if (i < 0) return null;
+    const leg = legs[i];
+    let pt = null;
+    try {
+      const c = typeof leg.path === 'string' && leg.path ? SRO.core.geo.decodePolyline(leg.path, 5) : Array.isArray(leg.coords) ? leg.coords : null;
+      if (c && c.length) pt = c[c.length - 1];
+    } catch (e) { pt = null; }
+    const ix = K.legStops(route);
+    let next = null;
+    for (let j = i + 1; j < legs.length; j++) if (ix[j] >= 0) { next = route.stops[ix[j]]; break; }
+    return { legIndex: i, leg: leg, lat: pt ? pt[0] : null, lon: pt ? pt[1] : null, at: leg.arrive, nextStop: next };
   };
 
   const indexCache = new WeakMap();
@@ -25622,7 +25716,11 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     if (hub) pts.push({ lat: hub.lat, lon: hub.lon, label: hub.name });
     stops.forEach(function (s) { pts.push({ lat: s.lat, lon: s.lon, label: s.label }); });
     if (hub) pts.push({ lat: hub.lat, lon: hub.lon, label: hub.name });
-    let legs = (route.legs || []).map(function (l, i) {
+    // a leg with no path is drawn between the points it joins: by stop when the legs carry node keys
+    // (a re-plan's turn-back leg is not one leg per stop), else by position
+    const ix = K.legStops(route);
+    let legs = (route.legs || []).map(function (l, i0) {
+      const i = ix[i0] >= 0 ? ix[i0] : (i0 === (route.legs || []).length - 1 ? stops.length : i0);
       let coords = null, approx = false, source = l.source || null;
       if (Array.isArray(l.coords) && l.coords.length >= 2) coords = l.coords;
       else if (typeof l.path === 'string' && l.path) { try { coords = geo.decodePolyline(l.path, 5); } catch (e) { coords = null; } }
@@ -25767,7 +25865,8 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         truckId: rt.truckId, color: K.truckColor(state, rt.truckId, rt), legs: legs,
         label: rt.truckId + ' (' + K.truckTypeLabel(rt.type || (t && t.type)) + ')',
         summary: (rt.stops || []).length + ' stops, ' + K.miles(K.routeTrip(rt, state).miles) +
-          (K.isStoppedRoute(rt) ? ', ' + (rt.out ? 'out of service' : 'cut off by a closed road') : ', back ' + K.dtg(rt.returnAt)),
+          (K.isStoppedRoute(rt) ? ', ' + (rt.out ? 'out of service' : 'cut off by a closed road') : ', back ' + K.dtg(rt.returnAt)) +
+          (K.turnBack(rt) ? '; turned back from a closed road at ' + K.time(K.turnBack(rt).at) : ''),
         stops: (rt.stops || []).map(function (s, i) { return { lat: s.lat, lon: s.lon, seq: s.seq !== undefined ? s.seq : i + 1, label: s.label }; })
       };
     });
@@ -25795,10 +25894,15 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       const t = K.truck(state, id) || {};
       let status = pos.status === 'en-route' ? 'En route' : 'At stop';
       const stops = rt.stops || [];
-      const nextIdx = pos.status === 'en-route' ? pos.legIndex : pos.legIndex + 1;
+      // legIndex counts legs, not stops (a re-plan's turn-back leg ends at no stop)
+      const ix = K.legStops(rt);
+      const stopAfter = function (li) { for (let j = Math.max(0, li); j < ix.length; j++) if (ix[j] >= 0) return ix[j]; return stops.length; };
+      const nextIdx = pos.status === 'en-route' ? stopAfter(pos.legIndex) : stopAfter(pos.legIndex + 1);
+      const atIdx = pos.legIndex >= 0 ? ix[pos.legIndex] : -1;
       if (pos.status === 'en-route' && nextIdx < stops.length) status += ' to stop ' + (nextIdx + 1) + ', ETA ' + K.dtg(stops[nextIdx].arrive);
       else if (pos.status === 'en-route') status += ' back to hub, ETA ' + K.dtg(rt.returnAt);
-      else if (pos.legIndex >= 0 && stops[pos.legIndex]) status = 'At stop ' + (pos.legIndex + 1) + ' (' + (stops[pos.legIndex].label || '') + ')';
+      else if (atIdx >= 0 && stops[atIdx]) status = 'At stop ' + (atIdx + 1) + ' (' + (stops[atIdx].label || '') + ')';
+      else if (pos.legIndex >= 0 && rt.legs[pos.legIndex] && rt.legs[pos.legIndex].turnedBack) status = 'Turned back from a closed road';
       out.push({ id: id, color: K.truckColor(state, id, rt), type: rt.type || t.type, lat: pos.lat, lon: pos.lon, heading: pos.status === 'en-route' ? pos.heading : null, status: status });
     });
     return out;
@@ -25932,6 +26036,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         const routeKey = [plan && plan.routes, sc.zones, sc.fleet, hi];
         if (!same(routeKey, last.routeKey)) {
           m.setRoutes(routesFor(state, plan), { highlightTruckId: hi });
+          this.drawTurnBacks(state, plan);
           last.routeKey = routeKey;
         }
         const legendKey = [plan && plan.routes, sc.fleet];
@@ -25948,6 +26053,36 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
           if (!m.leaflet.getBounds().pad(-0.12).contains(ll)) m.leaflet.panTo(ll, { animate: true });
         }
       } else if (K.sel.focusSeq !== last.focusSeq && K.sel.source !== 'queue') last.focusSeq = K.sel.focusSeq;
+    },
+
+    // A truck of a re-plan that drove into a newly closed road: its route shows the part it drove
+    // (the turn-back leg, solid like any driven road: a dashed line on this map means an approximate
+    // road, and the map moves lines into lanes, so an overlay would not stay on it) ending at a marker
+    // where it turned and was routed on from. The marker is a callout, a dot on the turn point and the
+    // turn-back badge up and to the right, so the truck symbol, which sits on that point at the moment
+    // of the re-plan, does not hide it. It is in the map's stop pane, in the truck's colour.
+    drawTurnBacks: function (state, plan) {
+      const L = root.L, lm = this.m && this.m.leaflet;
+      if (!L || !lm) return;
+      if (!this.turnLayer) this.turnLayer = L.layerGroup().addTo(lm);
+      this.turnLayer.clearLayers();
+      const self = this;
+      K.usedRoutes(plan).forEach(function (rt) {
+        const tb = K.turnBack(rt);
+        if (!tb || !K.isNum(tb.lat) || !K.isNum(tb.lon)) return;
+        const color = K.truckColor(state, rt.truckId, rt);
+        const tipText = rt.truckId + ' turned back here at ' + K.dtg(tb.at) + ': the road ahead is closed. Re-routed from this point' +
+          (tb.nextStop ? ' to ' + (tb.nextStop.label || 'its next stop') : '') + '.';
+        const mk = L.marker([tb.lat, tb.lon], {
+          pane: 'sro-stops', keyboard: false, zIndexOffset: 1200, title: tipText, alt: tipText,
+          icon: L.divIcon({ className: 'pm-turn-icon', iconSize: [44, 44], iconAnchor: [5, 39],
+            html: '<div class="pm-turn-callout" style="--truck:' + color + '">' +
+              '<svg class="pm-turn-stalk" viewBox="0 0 44 44" width="44" height="44" aria-hidden="true"><path d="M5 39L24 20"/><circle cx="5" cy="39" r="3.5"/></svg>' +
+              '<div class="pm-turn" data-truck="' + String(rt.truckId).replace(/[^\w-]/g, '') + '">' +
+              '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div></div>' })
+        }).addTo(self.turnLayer);
+        mk.on('click', function () { self.openRoute(rt.truckId); });
+      });
     },
 
     // ---- legend (Leaflet control, bottom right: open sea east of Taiwan) ----------------------------------------------------
@@ -26028,7 +26163,10 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
           sym(S.SIDC.hub, 'Hub', { infoFields: false }),
           sym(S.SIDC.rally, 'Rally point', { infoFields: false }),
           h('div.pm-legend-row', h('span.pm-legend-zone.is-closed'), h('span', 'Closed zone')),
-          h('div.pm-legend-row', h('span.pm-legend-zone.is-risk'), h('span', 'Risk zone'))),
+          h('div.pm-legend-row', h('span.pm-legend-zone.is-risk'), h('span', 'Risk zone')),
+          routes.some(function (rt) { return K.turnBack(rt); })
+            ? h('div.pm-legend-row', { 'data-testid': 'legend-turnback' }, h('span.pm-turn.pm-turn-sm', { html: '<svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' }), h('span', 'Turned back (road closed ahead)'))
+            : null),
         h('div.pm-legend-hint', 'Faint rally points are candidates the plan does not use.')));
     }
   };
@@ -26269,7 +26407,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       add('Location', h('span.num', k.mgrs(r.lat, r.lon) || 'n/a'));
       add('NLT', h('span.num', k.dtg(r.nlt)));
       if (k.isNum(r.deadline) && r.deadline !== r.nlt) add('Deadline', h('span.num.text-danger', k.dtg(r.deadline) + ' (supply runs out)'));
-      add('Mobility', (k.MOBILITY_LABELS[r.mobility] || r.mobility) + (k.isNum(r.maxTravelMi) && r.mobility !== 'fixed' ? ', up to ' + k.miles(r.maxTravelMi) + ' to a pickup point' : ''));
+      add('Mobility', (k.MOBILITY_LABELS[r.mobility] || r.mobility) + (k.isNum(r.maxTravelMi) && r.mobility !== 'fixed' ? ', up to ' + k.radius(r.maxTravelMi) + ' to a pickup point' : ''));
       add('Pickup', k.pickupText(state, r));
       if (r.directOnly && r.directReason) add('Direct because', r.directReasonText || String(r.directReason).replace(/-/g, ' '));
       const x = idx.byRequest[r.id];
@@ -26351,12 +26489,22 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
 //                    reports how close to optimal it got), Plan now, Compare mode (pick methods -> run
 //                    them -> comparison table -> keep one). While running: progress bar, live best-cost
 //                    sparkline (engine status.history), elapsed time, Cancel (keeps the best plan).
-//   Plan             name (rename), status, plan picker, the summary strip in spec order (requests,
-//                    stops, trucks used, miles, gallons, risk, delayed (red, opens the list of delayed
-//                    requests and what blocked each), run time), Approve plan (confirm says what
-//                    happens), Save snapshot, Compare to previous plan (what moved), before/after list
-//                    after a contingency re-plan, per-truck route cards (open Route detail) and a
-//                    compact timeline with day / dusk / night / dawn shading.
+//   Plan             name (rename), status, what Exact (MIP) proved (plan.mipProof), optimizer notes
+//                    (plan.warnings; turn-backs and kept plans shown open), plan picker, the summary
+//                    strip in spec order (requests, stops, trucks used, miles, gallons, risk, delayed
+//                    (red, opens the list of delayed requests and what blocked each), run time; a
+//                    re-plan adds a 'This window' strip from plan.windowStats next to its 'From now'
+//                    one), Approve plan (confirm says what happens, which trucks leave and which carry
+//                    on, and lists plan.violations; a refused approval ('infeasible-plan') offers the
+//                    plans that meet every rule), Save snapshot, Compare to previous plan (what
+//                    moved), before/after list after a contingency re-plan, per-truck route cards
+//                    with the stops in order in plain words (open Route detail) and a compact
+//                    timeline with day / dusk / night / dawn shading.
+//   Compare table    one column per method: total cost and the parts that add up to it (fuel,
+//                    distance, risk, simplicity, platoon travel, lateness, delay and ETA-change
+//                    penalties, plus pinned and rule-break penalties when any plan has them), then late
+//                    and delayed requests, run time and MIP gap. After a compare (or Cancel during
+//                    one) the lowest-cost plan is shown and is the one Approve acts on.
 // All numbers come from the stored Plan (plan.stats, plan.cost, plan.routes); the optimizer runs through
 // SRO.core.engine (DESIGN.md 8b). The view keeps only UI state (compare picks, toggles, estimate text).
 (function (root) {
@@ -26401,10 +26549,83 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     });
     return out;
   }
+  function pickerLabel(p, withId) {
+    const k = K();
+    const st = statusOf(p);
+    // a stopped plan's name already says '(stopped)'
+    const lab = st.key === 'cancelled' && /stopped/i.test(p.name || '') ? 'draft' : st.label.toLowerCase();
+    // the id last: a closed select cut short still shows the name, cost and status
+    return (p.name || p.id) + ' · ' + (p.cost && k.isNum(p.cost.total) ? k.num(p.cost.total, 0) + ' pts' : 'no cost') + ' · ' + lab + (withId ? ' · ' + p.id : '');
+  }
   function stableKey(o) { try { return JSON.stringify(o); } catch (e) { return String(Math.random()); } }
   function openCount(state) {
     const k = K();
     return k.queueRequests(state).filter(function (r) { return k.OPEN_STATUSES.indexOf(r.status) >= 0; }).length;
+  }
+
+  // What Exact (MIP) proved, from plan.mipProof ({ stopReason 'optimal' | 'gap' | 'time' | 'cancel' |
+  // 'error', gap, dualBound, gapTarget, exactModel }); plans stored before that field get one from
+  // plan.stopReason and plan.mipGap. null for the heuristics.
+  function mipProofOf(plan) {
+    const k = K();
+    if (!plan) return null;
+    if (plan.mipProof) return plan.mipProof;
+    if (plan.method !== 'mip' && !k.isNum(plan.mipGap)) return null;
+    const g = k.isNum(plan.mipGap) ? plan.mipGap : null;
+    const sr = plan.cancelled ? 'cancel' : plan.stopReason === 'time' ? 'time'
+      : plan.stopReason === 'optimal' || plan.stopReason === 'gap' ? (g !== null && g <= 1e-6 ? 'optimal' : 'gap')
+      : plan.stopReason === 'error' ? 'error' : 'unknown';
+    return { stopReason: sr, gap: g, dualBound: null, gapTarget: plan.params && k.isNum(plan.params.mipGap) ? plan.params.mipGap : null, exactModel: null };
+  }
+  // a proven gap as an upper bound ('within 0.1%' for anything smaller); a gap target with the
+  // decimals it was set with (0.01%)
+  function pctText(g) { return g > 0 && g < 0.0005 ? '0.1%' : (g * 100).toFixed(1) + '%'; }
+  function targetText(g) { return (+(g * 100).toFixed(2)) + '%'; }
+  // One plain sentence (plus a caveat) for the notice under the plan name. The gap is measured against
+  // the exact model's bound (the lowest cost the model could still prove possible), not against every
+  // possible plan, and the model is exact only when there is one time-of-day period.
+  function mipNotice(plan) {
+    const k = K(), pr = mipProofOf(plan);
+    if (!pr) return null;
+    const g = k.isNum(pr.gap) ? pr.gap : null;
+    const within = g !== null ? h('span', ' proven within ', h('strong.num', pctText(g)), ' of the exact model\'s bound.') : null;
+    let lead;
+    if (pr.stopReason === 'optimal') lead = h('span', 'Exact (MIP) proved this is the best plan its model can make (gap ', h('strong.num', '0%'), ').');
+    else if (pr.stopReason === 'gap') lead = h('span', 'Exact (MIP) stopped at your gap target' + (k.isNum(pr.gapTarget) ? ' of ' + targetText(pr.gapTarget) : '') + ':', within);
+    else if (pr.stopReason === 'time') lead = within ? h('span', 'Exact (MIP) reached its time limit:', within) : h('span', 'Exact (MIP) reached its time limit before it could prove a gap.');
+    // Cancel stops the solver worker, so a cancelled run keeps the plan but no proven gap (whatever the
+    // progress line showed while it ran)
+    else if (pr.stopReason === 'cancel') lead = within ? h('span', 'Exact (MIP) was stopped with Cancel:', within) : h('span', 'Exact (MIP) was stopped with Cancel, so this plan carries no proven gap.');
+    else if (pr.stopReason === 'unknown') lead = within ? h('span', 'Exact (MIP):', within) : h('span', 'Exact (MIP) did not record what it proved for this plan.');
+    else lead = h('span', 'Exact (MIP) hit a solver error, so this is the starting plan it was given; no gap is proven.');
+    const notes = [];
+    if (g !== null && pr.stopReason !== 'optimal') notes.push('The bound is the lowest cost the model could still prove possible, so the best plan lies somewhere in that gap.');
+    if (pr.exactModel === false) notes.push('The model uses each leg\'s average time-of-day speed and risk, while the plan is scored on the real times, so its cost can differ a little from the model\'s.');
+    return h('div.notice.notice-info.pp-gap', { 'data-testid': 'mip-notice', 'data-reason': pr.stopReason }, ui.icon('info'),
+      h('div', lead, notes.length ? h('div.small.muted.pp-gap-note', notes.join(' ')) : null));
+  }
+
+  // The stops of a route in plain words, in order: rally point names, and the unit designator for a
+  // direct delivery ("Su'ao > 1/B/4-98CAV > Sanyi > Zhudong"); a turn-back reads 'turned back'.
+  function stopsLine(state, rt) {
+    const k = K();
+    const stops = rt.stops || [];
+    const ix = k.legStops(rt), tb = k.turnBack(rt);
+    const tbAt = tb ? ix.slice(tb.legIndex + 1).find(function (x) { return x >= 0; }) : undefined;
+    const names = [];
+    stops.forEach(function (st, i) {
+      if (tb && tbAt === i) names.push('turned back');
+      // short place names ("Su'ao interchange", not "... (Suhua Hwy north end)")
+      let name = String((st.kind === 'rally' && st.gridId ? k.gridName(st.gridId) : st.label) || '').replace(/\s*\([^)]*\)\s*$/, '');
+      if (st.kind !== 'rally') {
+        const ids = {};
+        (st.deliveries || []).forEach(function (d) { ids[d.requestId] = true; });
+        const one = Object.keys(ids).length === 1 ? k.request(state, Object.keys(ids)[0]) : null;
+        if (one && one.designator) name = one.designator;
+      }
+      names.push(name || ('Stop ' + (i + 1)));
+    });
+    return names.join(' > ');
   }
 
   // small SVG line of best cost over time, drawn on to the elapsed time (nowT) so a run that has
@@ -26632,7 +26853,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       const limit = effectiveLimit(state, method);
       if (root.document.activeElement !== r.limit && String(r.limit.value) !== String(limit)) r.limit.value = String(limit);
       r.limitHelp.textContent = method === 'mip'
-        ? 'The exact solver runs until this limit, then returns its best plan and how close it is to the best possible.'
+        ? 'The exact solver runs until this limit (or until it proves its gap target), then returns its best plan and its proven gap to the exact model\'s bound.'
         : 'The run stops here at the latest and keeps the best plan found so far.';
       const eng = k.engine();
       const running = self.isRunning();
@@ -26726,7 +26947,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       let text;
       if (method === 'mip') {
         text = h('span', h('strong.num', 'Up to ' + k.secs(res.seconds)), ': a quick heuristic start, then the exact solver until its ' + k.secs(limit) +
-          ' limit. It reports how close the plan is to the best possible (proven gap).');
+          ' limit. It reports how close the plan is to the exact model\'s bound (proven gap).');
       } else {
         const range = k.isNum(res.low) && k.isNum(res.high) && res.high > res.low ? ' (' + k.secs(res.low) + ' to ' + k.secs(res.high) + ')' : '';
         text = h('span', 'Estimated run time ', h('strong.num', 'about ' + k.secs(res.seconds)), h('span.num', range),
@@ -26814,13 +27035,15 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         let best = null;
         plans.forEach(function (x) { if (x.cost && (!best || x.cost.total < best.cost.total)) best = x; });
         self.pulseId = best ? best.id : null;
+        // the cheapest plan is shown (and is what Approve acts on), not the last one stored
         if (best) K().showPlan(best.id);
         const st = eng.status ? eng.status() : { phase: 'done' };
         self.onStatus(st);
         self.render(self.ctx.getState(), true);
+        const which = best ? ' (' + k.methodLabel(best.method) + (best.cancelled ? ', stopped early' : '') + ')' : '';
         if (!plans.length) ui.toast('Stopped before any method finished a plan.', 'warn');
-        else if (st.phase === 'cancelled') ui.toast('Stopped. Kept ' + plans.length + (plans.length === 1 ? ' plan' : ' plans') + ' found so far; keep the one you want.', 'warn');
-        else ui.toast('Compared ' + plans.length + ' methods. Showing the lowest-cost plan; keep the one you want.', 'success');
+        else if (st.phase === 'cancelled') ui.toast('Stopped. Kept ' + plans.length + (plans.length === 1 ? ' plan' : ' plans') + ' found so far. Showing the lowest-cost one' + which + '; keep the one you want.', 'warn');
+        else ui.toast('Compared ' + plans.length + ' methods. Showing the lowest-cost plan' + which + '; keep the one you want.', 'success');
         self.scrollTo(self.secCompare);
       }, function (err) { self.failed(err); });
     },
@@ -26881,16 +27104,62 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       if (!plans.length) return;
       let best = null;
       plans.forEach(function (p) { if (p.cost && (!best || p.cost.total < best.cost.total)) best = p; });
+      // the cost parts add up to the total: the route terms, the plan-level penalties, and (only when a
+      // plan has them) ETA changes of a re-plan, unused pinned points and the penalty for broken rules
+      const n0 = function (v) { return k.num(v, 0); };
+      const part = function (key) { return function (p) { return p.cost && k.isNum(p.cost[key]) ? p.cost[key] : 0; }; };
+      const PARTS = ['fuel', 'distance', 'risk', 'simplicity', 'platoon', 'lateness', 'deferral', 'stability', 'pinned'];
+      const rest = function (p) {
+        if (!p.cost || !k.isNum(p.cost.total)) return 0;
+        const r = p.cost.total - PARTS.reduce(function (a, key) { return a + part(key)(p); }, 0);
+        return r > 0.5 ? r : 0;
+      };
+      const any = function (get) { return plans.some(function (p) { return get(p) > 0.005; }); };
       const rows = [
-        { label: 'Total cost', get: function (p) { return p.cost && p.cost.total; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Fuel', get: function (p) { return p.cost && p.cost.fuel; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Distance', get: function (p) { return p.cost && p.cost.distance; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Risk', get: function (p) { return p.cost && p.cost.risk; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Simplicity', get: function (p) { return p.cost && p.cost.simplicity; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Delayed', get: function (p) { return p.stats && p.stats.delayed; }, fmt: function (v) { return k.num(v, 0); }, low: true, alert: true },
+        { label: 'Total cost', get: function (p) { return p.cost && p.cost.total; }, fmt: n0, low: true, cls: 'pp-cmp-total' },
+        { label: 'Fuel', get: part('fuel'), fmt: n0, low: true, part: true },
+        { label: 'Distance', get: part('distance'), fmt: n0, low: true, part: true },
+        { label: 'Risk', get: part('risk'), fmt: n0, low: true, part: true },
+        { label: 'Simplicity', get: part('simplicity'), fmt: n0, low: true, part: true },
+        { label: 'Platoon travel', get: part('platoon'), fmt: n0, low: true, part: true },
+        { label: 'Late penalty', get: part('lateness'), fmt: n0, low: true, part: true },
+        { label: 'Delay penalty', get: part('deferral'), fmt: n0, low: true, part: true },
+        any(part('stability')) || plans.some(function (p) { return p.parentPlanId; }) ? { label: 'ETA changes', get: part('stability'), fmt: n0, low: true, part: true } : null,
+        any(part('pinned')) ? { label: 'Unused pinned points', get: part('pinned'), fmt: n0, low: true, part: true } : null,
+        any(rest) ? { label: 'Broken rules', get: rest, fmt: n0, low: true, part: true, alert: true } : null,
+        { label: 'Late', get: function (p) { return p.stats && p.stats.late; }, fmt: n0, low: true, alert: true, cls: 'pp-cmp-first' },
+        { label: 'Delayed', get: function (p) { return p.stats && p.stats.delayed; }, fmt: n0, low: true, alert: true },
         { label: 'Run time', get: function (p) { return p.stats && k.isNum(p.stats.runtimeSec) ? p.stats.runtimeSec : p.runtimeSec; }, fmt: function (v) { return k.secs(v); } },
         { label: 'Gap (MIP)', get: function (p) { return k.isNum(p.mipGap) ? p.mipGap : null; }, fmt: function (v) { return v === null ? '-' : (v * 100).toFixed(1) + '%'; } }
-      ];
+      ].filter(Boolean);
+      // each plan's parts rounded so that the shown parts add up to the shown total (largest remainder):
+      // rounding every row on its own can leave the sum a point off the total. Only a part with a
+      // fraction takes an extra point (a whole number stays as it is), and equal parts (fuel and
+      // distance often are) take it together or not at all, so they still read equal.
+      const partRows = rows.filter(function (row) { return row.part; });
+      const shown = plans.map(function (p) {
+        const vals = partRows.map(function (row) { const v = row.get(p); return k.isNum(v) ? Math.max(0, v) : 0; });
+        const out = vals.map(Math.floor);
+        const target = p.cost && k.isNum(p.cost.total) ? Math.round(p.cost.total) : null;
+        if (target === null) return vals.map(Math.round);
+        let diff = target - out.reduce(function (a, v) { return a + v; }, 0);
+        const frac = function (i) { return vals[i] - out[i]; };
+        const byFrac = vals.map(function (v, i) { return i; }).filter(function (i) { return frac(i) > 1e-9; })
+          .sort(function (a, b) { return frac(b) - frac(a) || a - b; });
+        const given = {};
+        const give = function (i) { out[i] += 1; given[i] = true; diff--; };
+        byFrac.forEach(function (i) {
+          if (diff <= 0 || given[i]) return;
+          const same = byFrac.filter(function (j) { return !given[j] && Math.abs(vals[j] - vals[i]) < 1e-9; });
+          if (same.length <= diff) same.forEach(give);
+        });
+        // still short: split a group of equal parts, then (a total with a part not shown) the largest part
+        byFrac.forEach(function (i) { if (diff > 0 && !given[i]) give(i); });
+        const big = vals.reduce(function (a, v, i) { return v > vals[a] ? i : a; }, 0);
+        if (diff > 0) out[big] += diff;
+        while (diff < 0 && out[big] > 0) { out[big] -= 1; diff++; }
+        return out;
+      });
       const head = h('tr', h('th', { scope: 'col' }, h('span.sr-only', 'Measure')), plans.map(function (p) {
         return h('th.num', { scope: 'col', class: { 'is-viewed': p === viewed } }, h('div.pp-cmp-m', k.methodLabel(p.method)),
           p === best ? h('div.pp-cmp-best', 'Lowest cost') : null, p.cancelled ? h('div.faint', 'stopped early') : null);
@@ -26899,11 +27168,12 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         const vals = plans.map(function (p) { const v = row.get(p); return k.isNum(v) ? v : null; });
         const nums = vals.filter(function (v) { return v !== null; });
         const min = row.low && nums.length > 1 ? Math.min.apply(null, nums) : null;
-        return h('tr', h('th', { scope: 'row' }, row.label), vals.map(function (v, i) {
+        return h('tr', { class: [row.part ? 'pp-cmp-part' : null, row.cls || null].filter(Boolean).join(' ') || null },
+          h('th', { scope: 'row', title: row.part ? 'Part of the total cost' : null }, row.label), vals.map(function (v, i) {
           return h('td.num', {
             class: { 'is-best': min !== null && v === min && nums.some(function (x) { return x !== min; }), 'text-danger': row.alert && v > 0, 'is-viewed': plans[i] === viewed },
             'data-col': plans[i].method, 'data-row': row.label
-          }, row.fmt(v));
+          }, row.part && v !== null ? n0(shown[i][partRows.indexOf(row)]) : row.fmt(v));
         }));
       });
       const keep = h('tr.pp-cmp-keep', h('th', { scope: 'row' }, h('span.sr-only', 'Keep')), plans.map(function (p) {
@@ -26919,7 +27189,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         }, kept ? ui.icon('check') : null, kept ? 'Kept' : 'Keep'));
       }));
       sec.appendChild(h('div.card.pp-cmp-card',
-        h('div.card-header', h('div', h('h2.card-title', 'Method comparison'), h('div.card-sub', 'Same requests, cost points from one scoring rule. Lower is better.')),
+        h('div.card-header', h('div', h('h2.card-title', 'Method comparison'), h('div.card-sub', 'Same requests, cost points from one scoring rule; the indented rows add up to the total. Lower is better.')),
           h('button.btn.btn-ghost.btn-icon.btn-sm', { type: 'button', 'aria-label': 'Close comparison', onClick: function () { self.compareIds = null; self.render(self.ctx.getState(), true); } }, ui.icon('x'))),
         h('div.table-wrap.pp-cmp-wrap', h('table.table.table-compact.pp-cmp-table', { 'data-testid': 'compare-table' }, h('thead', head), h('tbody', body, keep)))));
     },
@@ -26945,14 +27215,24 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         h('span.badge.pp-status.is-' + stt.key, { 'data-testid': 'plan-status' }, stt.key === 'approved' ? ui.icon('check') : null, stt.label),
         h('span', k.methodLabel(plan.method)),
         win ? h('span.num', 'Window ' + k.windowLabel(win)) : null,
-        k.isNum(plan.createdAt) ? h('span.num', 'Made ' + k.dtg(plan.createdAt)) : null);
+        k.isNum(plan.createdAt) ? h('span.num', 'Made ' + k.dtg(plan.createdAt)) : null,
+        // id and total cost: tell apart two plans with the same name (the picker, closed, may cut its label)
+        h('span.num', { 'data-testid': 'plan-id' }, plan.id),
+        plan.cost && k.isNum(plan.cost.total) ? h('span.num', { 'data-testid': 'plan-cost' }, 'Cost ' + k.num(plan.cost.total, 0) + ' pts') : null);
       sec.appendChild(title);
       sec.appendChild(meta);
-      if (k.isNum(plan.mipGap)) {
-        sec.appendChild(h('div.notice.notice-info.pp-gap', ui.icon('info'), h('div', 'Exact (MIP): within ', h('strong.num', (plan.mipGap * 100).toFixed(1) + '%'),
-          ' of the best possible plan (proven when the time limit was reached).')));
-      }
+      const mn = mipNotice(plan);
+      if (mn) sec.appendChild(mn);
       if (plan.cancelled) sec.appendChild(h('div.notice.notice-warn', ui.icon('alert'), h('div', 'Stopped early with Cancel: this is the best plan found before stopping.')));
+      // planning rules the plan breaks (plan.violations): seen before Approve, not only in its dialog
+      const viol = Array.isArray(plan.violations) ? plan.violations : [];
+      if (viol.length) {
+        sec.appendChild(h('div.notice.notice-error.pp-viol', { 'data-testid': 'plan-violations' }, ui.icon('alert'),
+          h('div', h('strong', 'This plan breaks ' + (viol.length === 1 ? 'a planning rule' : viol.length + ' planning rules') + ':'),
+            h('ul', viol.map(function (v) { return h('li', v.detail || v.code); })),
+            plan.approved || plan.superseded ? null
+              : h('div.small', 'Approve plan refuses it while another plan for this window meets every rule. Re-plan, or change the settings (Scenario), to fix it.'))));
+      }
       if (plan.superseded) {
         const by = (state.plans || []).find(function (p) { return p.id === plan.supersededBy; });
         sec.appendChild(h('div.notice.notice-info', ui.icon('info'), h('div', 'Replaced by ' + (by ? by.name : 'a newer approved plan') + '.')));
@@ -26963,11 +27243,20 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       }
       // what the engine had to adjust (a lock it could not keep, a truck cut off, a pickup point out of
       // reach): the planner needs to see these before approving
+      // Notes about a truck on the road (turned back from a closed road, cut off, a load it could not
+      // place) and a re-plan that kept the current plan change what happens next: they stay open.
       const warns = (plan.warnings || []).filter(function (w, i, a) { return typeof w === 'string' && w && a.indexOf(w) === i; });
-      if (warns.length) {
+      const KEY_NOTE = /^Truck |turns back|cut off|keeps it\.|stays on the truck|rally points? (?:pinned|is out of reach)|out of reach of every platoon|used \d+ rally points?|already on the road carry/;
+      const key = warns.filter(function (w) { return KEY_NOTE.test(w); });
+      const other = warns.filter(function (w) { return key.indexOf(w) < 0; });
+      if (key.length) {
+        sec.appendChild(h('div.notice.notice-warn.pp-key-notes', { 'data-testid': 'plan-key-notes' }, ui.icon('alert'),
+          key.length === 1 ? h('div', key[0]) : h('ul.pp-key-list', key.map(function (w) { return h('li', w); }))));
+      }
+      if (other.length) {
         sec.appendChild(h('details.notice.notice-info.pp-warnings', { 'data-testid': 'plan-warnings' },
-          h('summary', ui.icon('info'), h('span', warns.length === 1 ? '1 note from the optimizer' : warns.length + ' notes from the optimizer')),
-          h('ul', warns.map(function (w) { return h('li', w); }))));
+          h('summary', ui.icon('info'), h('span', (other.length === 1 ? '1 note' : other.length + ' notes') + ' from the optimizer' + (key.length ? ' (more)' : ''))),
+          h('ul', other.map(function (w) { return h('li', w); }))));
       }
       // plan picker
       const list = k.plansForPicker(state, plan);
@@ -26976,8 +27265,10 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
           'data-testid': 'plan-picker',
           onChange: function (e) { K().showPlan(e.target.value); }
         }, list.map(function (p) {
-          const s2 = statusOf(p);
-          return h('option', { value: p.id, selected: p === plan }, p.name + ' (' + k.methodLabel(p.method) + ', ' + s2.label.toLowerCase() + ')');
+          // name (it names the method already), total cost and status; the plan id too when two plans
+          // share a name (the same method run twice in a window)
+          const twin = list.some(function (q) { return q !== p && q.name === p.name; });
+          return h('option', { value: p.id, selected: p === plan }, pickerLabel(p, twin));
         }));
         sel.value = plan.id;
         sec.appendChild(h('div.pp-picker-row', h('label.field-label', { for: 'pp-picker' }, 'Show plan'), sel));
@@ -27014,10 +27305,33 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         self.pulseId = null;
         strip.classList.add('is-pulse');
       }
+      // a re-plan: the strip above counts what is planned from now on; plan.windowStats adds the stops
+      // already made, for the whole window
+      const ws = plan.parentPlanId && plan.windowStats ? plan.windowStats : null;
+      if (ws) sec.appendChild(h('div.caps.pp-summary-cap', 'From now'));
       sec.appendChild(strip);
+      if (ws) {
+        // note: a small line under the value ('3 made'), not a unit run on to it ('153 made')
+        const wstat = function (key, label, value, display, unit, note) {
+          return h('div.stat', { 'data-wstat': key, 'data-value': k.isNum(value) ? String(value) : '' },
+            h('span.stat-label', label), h('span.stat-value', display, unit ? h('span.stat-unit', unit) : null),
+            note ? h('span.pp-stat-note', note) : null);
+        };
+        sec.appendChild(h('div.caps.pp-summary-cap', 'This window (stops made + planned)'));
+        sec.appendChild(h('div.summary.pp-summary.pp-summary-window', { role: 'group', 'aria-label': 'Whole window', 'data-testid': 'summary-window' },
+          wstat('requests', 'Requests', ws.requests, k.num(ws.requests, 0)),
+          wstat('stops', 'Stops', ws.stops, k.num(ws.stops, 0), null, k.isNum(ws.stopsDone) && ws.stopsDone ? ws.stopsDone + ' made' : null),
+          wstat('trucks', 'Trucks used', ws.trucksUsed, k.num(ws.trucksUsed, 0)),
+          wstat('miles', 'Miles', ws.miles, k.num(ws.miles, 0), 'mi'),
+          wstat('gallons', 'Gallons', ws.gallons, k.num(ws.gallons, 0), 'gal'),
+          wstat('risk', 'Risk', ws.riskUnits, k.num(ws.riskUnits, 1)),
+          wstat('delayed', 'Delayed', ws.delayed, k.num(ws.delayed, 0)),
+          wstat('rally', 'Rally points', ws.rallyPoints, k.num(ws.rallyPoints, 0), k.isNum(state.scenario.settings.maxRallyPoints) ? 'of ' + state.scenario.settings.maxRallyPoints : null)));
+      }
       if (plan.parentPlanId) {
         sec.appendChild(h('div.small.faint.pp-summary-note', { 'data-testid': 'summary-note' },
-          'Re-plan totals count what is planned from now on: for a truck already on the road, from its next stop. The truck cards show whole trips.'));
+          ws ? 'From now counts what is planned from now on: for a truck already on the road, from its next stop. This window adds the stops already made. The truck cards show whole trips.'
+            : 'Re-plan totals count what is planned from now on: for a truck already on the road, from its next stop. The truck cards show whole trips.'));
       }
       if (delayed > 0 && !plan.approved && !plan.superseded) {
         const win = k.planWindow(plan);
@@ -27037,10 +27351,11 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         onClick: function () { self.approve(plan); }
       }, ui.icon('check'), plan.approved ? 'Approved' : plan.superseded ? 'Replaced' : 'Approve plan');
       const snap = h('button.btn.btn-secondary', { type: 'button', 'data-testid': 'snapshot', onClick: function () { self.snapshot(plan); } }, ui.icon('download'), 'Save snapshot');
-      const cmp = prev ? h('button.btn.btn-secondary', {
-        type: 'button', 'aria-pressed': String(self.showDiff || !!plan.parentPlanId), 'data-testid': 'compare-previous', disabled: !!plan.parentPlanId,
+      // a re-plan always shows its before / after list, so there is nothing to toggle
+      const cmp = prev && !plan.parentPlanId ? h('button.btn.btn-secondary', {
+        type: 'button', 'aria-pressed': String(self.showDiff), 'data-testid': 'compare-previous',
         onClick: function () { self.showDiff = !self.showDiff; self.render(self.ctx.getState(), false); }
-      }, ui.icon('layers'), plan.parentPlanId ? 'Before / after shown' : self.showDiff ? 'Hide comparison' : 'Compare to previous plan') : null;
+      }, ui.icon('layers'), self.showDiff ? 'Hide comparison' : 'Compare to previous plan') : null;
       sec.appendChild(h('div.pp-actions-row', approve, snap, cmp));
       const snaps = (state.snapshots || []).filter(function (x) { return x.planId === plan.id; });
       if (snaps.length) sec.appendChild(h('div.small.faint', 'Snapshots: ' + snaps.map(function (x) { return x.name; }).join(', ')));
@@ -27090,15 +27405,37 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     // ==== approve / rename / snapshot ================================================================
     approve: function (plan) {
       const self = this, k = K();
+      const now = self.ctx.getState().clock.simMin;
       const routes = k.activeRoutes(plan);
-      const first = routes.reduce(function (a, r) { return k.isNum(r.depart) && (a === null || r.depart < a) ? r.depart : a; }, null);
+      // Only a re-plan has trucks already on the road: those that left before it was made carry on
+      // with it. Any other departure time already past (a plan approved after its trucks were due to
+      // leave) is a late start, never a truck on the road.
+      const made = plan.parentPlanId ? (k.isNum(plan.createdAt) ? Math.min(plan.createdAt, now) : now) : null;
+      const left = function (r) { return made !== null && k.isNum(r.depart) && r.depart <= made; };
+      const due = function (r) { return k.isNum(r.depart) && r.depart <= now; };
+      const onRoad = routes.filter(function (r) { return left(r) && !(k.isNum(r.returnAt) && r.returnAt <= now); });
+      const late = routes.filter(function (r) { return !left(r) && due(r); });
+      const leave = routes.filter(function (r) { return !left(r) && !due(r); });
+      const firstOf = function (list) { return list.reduce(function (a, r) { return k.isNum(r.depart) && (a === null || r.depart < a) ? r.depart : a; }, null); };
+      const first = firstOf(leave), firstLate = firstOf(late);
       const win = k.planWindow(plan);
       const delayed = (plan.stats && plan.stats.delayed) || 0;
+      const viol = Array.isArray(plan.violations) ? plan.violations : [];
+      const ids = function (list) { return list.map(function (r) { return r.truckId; }).join(', '); };
       const body = h('div.vstack-sm',
         h('p.modal-text', 'This plan becomes the movement schedule' + (win ? ' for ' + k.windowLabel(win) : '') + '.'),
+        viol.length ? h('div.notice.notice-error.pp-confirm-viol', { 'data-testid': 'approve-violations' }, ui.icon('alert'),
+          h('div', h('strong', 'This plan breaks ' + (viol.length === 1 ? 'a planning rule' : viol.length + ' planning rules') + ':'),
+            h('ul', viol.map(function (v) { return h('li', v.detail || v.code); })))) : null,
+        late.length ? h('div.notice.notice-warn.pp-confirm-late', { 'data-testid': 'approve-late' }, ui.icon('clock'),
+          h('div', h('strong', 'Departure ' + (late.length === 1 ? 'time' : 'times') + ' already past. '),
+            h('span', (late.length === 1 ? late[0].truckId + ' was due to leave at ' : late.length + ' trucks (' + ids(late) + ') were due to leave from ') + k.dtg(firstLate) +
+              '; it is now ' + k.dtg(now) + '. Approved as it is, ' + (late.length === 1 ? 'it starts' : 'they start') +
+              ' behind this schedule. For times that start now, press Plan now again and approve the new plan.'))) : null,
         h('ul.pp-confirm-list',
-          h('li', routes.length + (routes.length === 1 ? ' truck leaves' : ' trucks leave') + ' at the planned times' + (first !== null ? ' (first at ' + k.dtg(first) + ')' : '') + ': ' +
-            routes.map(function (r) { return r.truckId; }).join(', ') + '.'),
+          onRoad.length ? h('li', onRoad.length + (onRoad.length === 1 ? ' truck already on the road carries' : ' trucks already on the road carry') + ' on with the new plan: ' + ids(onRoad) + '.') : null,
+          leave.length ? h('li', leave.length + (leave.length === 1 ? ' truck leaves' : ' trucks leave') + ' at the planned times' + (first !== null ? ' (first at ' + k.dtg(first) + ')' : '') + ': ' + ids(leave) + '.')
+            : !onRoad.length && !late.length ? h('li', 'No truck drives in this plan.') : null,
           h('li', 'Platoon sergeants see their pickup point and ETA, and the truck callsign and frequency.'),
           delayed ? h('li', delayed === 1 ? 'The platoon sergeant of the 1 delayed request is told it is not in this window' : 'The platoon sergeants of the ' + delayed + ' delayed requests are told they are not in this window',
             (win ? '; the next plan starts at ' + k.dtg(win.end) : ''), '.') : null,
@@ -27111,12 +27448,48 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
           { label: 'Cancel', kind: 'secondary' },
           { label: 'Approve plan', kind: 'primary', id: 'approve', onClick: function () {
             const res = self.ctx.dispatch({ type: 'plan/approve', planId: plan.id, now: Math.floor(self.ctx.getState().clock.simMin) });
+            if (res && !res.ok && res.code === 'infeasible-plan') { self.refused(plan, res); return true; }
             if (!res || !res.ok) { ui.toast((res && res.error) || 'Could not approve the plan.', 'error'); return false; }
             K().showPlan(plan.id);
-            ui.toast('Plan approved. Platoon sergeants now see their pickup point and ETA.', 'success');
+            // approved although it breaks a rule (no other plan of the window meets them all)
+            if (res.warning) ui.toast(res.warning, 'warn', { timeout: 12000 });
+            else ui.toast('Plan approved. Platoon sergeants now see their pickup point and ETA.', 'success');
             return true;
           } }
         ]
+      });
+    },
+
+    // plan/approve refused a plan that breaks a planning rule while other drafts of the window meet
+    // them all: say why and offer those plans (the planner reviews one, then approves it).
+    refused: function (plan, res) {
+      const self = this, k = K();
+      const plans = self.ctx.getState().plans || [];
+      const alts = (res.alternativeIds || []).map(function (id) { return plans.find(function (p) { return p.id === id; }); }).filter(Boolean)
+        .sort(function (a, b) { return ((a.cost && a.cost.total) || 0) - ((b.cost && b.cost.total) || 0); });
+      ui.modal.open({
+        title: 'Not approved',
+        size: 'sm',
+        body: function (el, handle) {
+          el.appendChild(h('div.notice.notice-error', { 'data-testid': 'approve-refused' }, ui.icon('alert'), h('div', res.error || 'This plan breaks a planning rule.')));
+          if (alts.length) {
+            el.appendChild(h('p.modal-text', alts.length === 1 ? 'This plan for the same window meets every rule:' : 'These plans for the same window meet every rule:'));
+            el.appendChild(h('div.list.list-dense.pp-alt-list', alts.map(function (p) {
+              return h('div.list-row', { 'data-plan': p.id },
+                h('div.list-row-main', h('div.list-row-title', p.name || p.id),
+                  h('div.list-row-sub.num', p.id + ' · ' + k.methodLabel(p.method) + ' · ' + (p.cost ? k.num(p.cost.total, 0) + ' pts' : '') + ' · ' + ((p.stats && p.stats.delayed) || 0) + ' delayed')),
+                h('button.btn.btn-sm.btn-secondary.list-row-action', { type: 'button', 'data-testid': 'show-alt-' + p.id,
+                  onClick: function () {
+                    handle.close();
+                    K().showPlan(p.id);
+                    self.render(self.ctx.getState(), true);
+                    self.scrollTo(self.secHead);
+                    ui.toast('Showing ' + (p.name || p.id) + '. Review it, then approve.', 'info');
+                  } }, 'Show plan'));
+            })));
+          } else el.appendChild(h('p.modal-text', 'Re-plan, or change the settings, then try again.'));
+        },
+        actions: [{ label: 'Close', kind: 'secondary' }]
       });
     },
 
@@ -27238,6 +27611,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
         h('div.pp-truck-top', h('span.truck-chip', { style: { '--truck': color } }, rt.truckId), h('span.pp-truck-type', k.truckTypeLabel(type)),
           stopped ? h('span.badge.badge-danger', rt.out ? 'Out of service' : 'Cut off') : null,
           h('span.pp-truck-go', ui.icon('chevron'))),
+        h('div.pp-truck-stops', { 'data-testid': 'truck-stops', title: stopsLine(state, rt) }, stopsLine(state, rt)),
         h('div.pp-truck-grid',
           h('div', h('span.pp-k', 'Depart'), h('span.num', k.dtg(rt.depart))),
           stopped ? h('div', h('span.pp-k', 'Stopped'), h('span', 'after stop ' + nDone))
@@ -27333,9 +27707,12 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
 // Stop list in order with arrive / depart DTG, location name + MGRS, deliveries per request with class
 // labels and quantities, pickup by the platoon vs direct delivery, the leg before each stop with its
 // miles, drive time and time-of-day period; the cost split of the route (fuel, distance, risk,
-// simplicity, platoon travel, plus lateness when there is any) as a small bar; near-miss deadlines
+// simplicity, platoon travel, plus lateness and ETA changes (a re-plan's cost.stability) when there
+// are any) as a small bar, or one line for a truck whose trip is already over; near-miss deadlines
 // (arrival within 30 minutes of a deadline) and late arrivals flagged; and for delayed requests the
-// blocking reason in plain words (plan.deferred reason / note, from explainDeferred).
+// blocking reason in plain words (plan.deferred reason / note, from explainDeferred). A truck of a
+// re-plan that drove into a newly closed road shows the leg it drove, a 'Turned back' point where it
+// turned (the 'pos:<truck>' node of the engine) and the leg it is re-routed on from there.
 // Opened from a route or truck on the map, a truck card or timeline row in Plan (K.sel.truckId).
 (function (root) {
   'use strict';
@@ -27351,8 +27728,10 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     { key: 'risk', label: 'Risk' },
     { key: 'simplicity', label: 'Simplicity' },
     { key: 'platoon', label: 'Platoon travel' },
-    { key: 'lateness', label: 'Late arrival' }
+    { key: 'lateness', label: 'Late arrival' },
+    { key: 'stability', label: 'ETA changes' }
   ];
+  const ONLY_WHEN_SET = { lateness: true, stability: true };
 
   const RouteView = {
     label: 'Route detail', icon: 'route', region: 'right', order: 35, hidden: true, parent: 'plan',
@@ -27434,7 +27813,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       (rt.legs || []).forEach(function (l) { if (k.isNum(l.arrive) && k.isNum(l.depart)) driveMin += Math.max(0, l.arrive - l.depart); });
       fact('Drive time', k.duration(driveMin));
       fact('Fuel used', k.gallons(trip.gallons));
-      fact('Load', load.pct + '% (' + k.num(load.used, load.unit === 'gal' ? 0 : 1) + ' of ' + k.num(load.capacity, 0) + ' ' + load.unit + ')');
+      fact('Load', load.pct + '% · ' + k.num(load.used, load.unit === 'gal' ? 0 : 1) + '/' + k.num(load.capacity, 0) + ' ' + load.unit);
       fact('Risk', k.num(rt.riskUnits, 1));
       el.appendChild(kv);
 
@@ -27464,8 +27843,19 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       const k = K();
       const c = rt.cost || {};
       const parts = COSTS.map(function (x) { return { key: x.key, label: x.label, v: k.isNum(c[x.key]) ? Math.max(0, c[x.key]) : 0 }; })
-        .filter(function (x) { return x.key !== 'lateness' || x.v > 0; });
+        .filter(function (x) { return !ONLY_WHEN_SET[x.key] || x.v > 0; });
       const total = parts.reduce(function (a, x) { return a + x.v; }, 0);
+      // nothing left to cost in a re-plan (a truck out of service or cut off does not drive on; a truck
+      // whose stops are all made is driving home or back already): one line instead of a split of zeros
+      const stops = rt.stops || [];
+      const finished = stops.length && stops.every(function (st) { return st.done; });
+      if (!(total > 0) && (k.isStoppedRoute(rt) || finished)) {
+        const why = rt.out ? 'Out of service: the truck does not drive on, so nothing is left to cost in this re-plan.'
+          : rt.cutOff ? 'Cut off by a closed road: the truck does not drive on in this plan, so nothing is left to cost.'
+            : 'Trip finished: every stop is made, so nothing is left to cost in this re-plan.';
+        return h('div.card.pr-cost.pr-cost-done', { 'data-testid': 'cost-split', 'data-empty': rt.out ? 'out' : rt.cutOff ? 'cut-off' : 'done' },
+          h('div.card-header', h('div', h('h3.card-title', 'Cost split'), h('div.card-sub', why))));
+      }
       const bar = h('div.pr-costbar', { role: 'img', 'aria-label': 'Cost split: ' + parts.map(function (x) { return x.label + ' ' + k.num(x.v, 0); }).join(', ') });
       parts.forEach(function (x) {
         if (total > 0 && x.v > 0) bar.appendChild(h('span.pr-cost-seg.pr-c-' + x.key, { style: { width: (x.v / total * 100).toFixed(2) + '%' }, title: x.label + ' ' + k.num(x.v, 0) }));
@@ -27547,8 +27937,17 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       }
       // a leg can be missing (a re-plan keeps only the driven legs of a truck that stopped)
       const add = function (node) { if (node) list.appendChild(node); };
+      // a turn-back: the leg driven towards the closed road, the point it turned at, then the leg on
+      // from there (before[] holds that last one for the next stop)
+      const tb = k.turnBack(rt);
+      const tbBefore = tb ? k.legStops(rt).slice(tb.legIndex + 1).find(function (x) { return x >= 0; }) : undefined;
       stops.forEach(function (st, i) {
-        add(legRow(before[i], i === 0 ? hubName : (stops[i - 1].label || 'previous stop'), st.label || 'stop'));
+        const from = i === 0 ? hubName : (stops[i - 1].label || 'previous stop');
+        if (tb && tbBefore === i) {
+          add(legRow(tb.leg, from, 'the turn-back point'));
+          add(RouteView.turnRow(rt, tb, color));
+          add(legRow(before[i], 'the turn-back point', st.label || 'stop'));
+        } else add(legRow(before[i], from, st.label || 'stop'));
         add(RouteView.stopRow(state, plan, rt, st, i, color, settings));
       });
       if (k.isStoppedRoute(rt)) {
@@ -27566,6 +27965,18 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
           h('div.pr-stop-title', hubName, h('span.badge', 'Return')),
           h('div.small.num', 'Back ' + k.dtg(rt.returnAt)))));
       return list;
+    },
+
+    turnRow: function (rt, tb, color) {
+      const k = K();
+      return h('li.pr-stop.pr-turn', { 'data-testid': 'route-turnback' },
+        h('span.pr-marker.pr-turn-marker', { style: { '--truck': color } }, ui.icon('refresh', { size: 14 })),
+        h('div.pr-stop-main',
+          h('div.pr-stop-title', h('span', 'Turned back'), h('span.badge.badge-warn', 'Road closed ahead')),
+          k.isNum(tb.lat) ? h('div.small.faint.num', k.mgrs(tb.lat, tb.lon) || '') : null,
+          h('div.small.num.pr-times', 'Turned ' + k.dtg(tb.at)),
+          h('div.small.muted', rt.truckId + ' was driving into a road the re-plan found closed' + (k.isNum(tb.leg.miles) ? ', after ' + k.miles(tb.leg.miles) + ' of the leg' : '') +
+            '. It turned where it was and is routed on from this point' + (tb.nextStop ? ' to ' + (tb.nextStop.label || 'its next stop') : '') + '.')));
     },
 
     stopRow: function (state, plan, rt, st, i, color, settings) {
@@ -27668,8 +28079,9 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
 <script data-src="src/ui/planner/scenario.js">
 // Planner Scenario tab (right panel): fleet per hub (add / remove trucks, mark out / back), closed and
 // risk zones drawn on the planner map, drop points (max count, pin / ban), the visible settings, the
-// Advanced section (travel factors, time-of-day table, risk ratings, mobility radii, daily use rates and
-// SOLVER TUNING built from SRO.solver.PARAMS) and the "Re-plan now" banner after a contingency.
+// Advanced section (travel factors, the re-plan ETA-change cost, time-of-day table, risk ratings,
+// mobility radii, daily use rates, the sample seed and SOLVER
+// TUNING built from SRO.solver.PARAMS) and the "Re-plan now" banner after a contingency.
 // Sources: spec-answers.md Sections 3-5 (Fleet, Road network, Risk, Time of day, Rally points,
 // Contingency, Planner settings, Solver tuning); DESIGN.md sections 3, 7 (Method parameters), 8, 8b.
 //
@@ -27712,10 +28124,11 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     { key: 'simplicity', label: 'Simplicity', help: 'Fewer stops per truck and fewer trucks on the road. Raise it for simpler plans.' }
   ];
   const METHOD_HELP = {
-    tabu: 'Balanced. Usually 5-30 s on a full window.',
-    sa: 'Thorough. Usually 1-3 min on a full window.',
-    aco: 'Ant colony. Builds many trial plans and learns from the best ones.',
-    mip: 'Exact model. Starts from a quick heuristic plan, runs up to the time limit and reports how close to the best possible plan it is.'
+    // no fixed run times: the Plan tab measures this window and shows an estimate before each run
+    tabu: 'Balanced. Quick; the Plan tab shows the expected run time before you press Plan now.',
+    sa: 'Thorough. Explores more widely and usually takes a little longer than Tabu search; the Plan tab shows the expected run time.',
+    aco: 'Ant colony. Builds many trial plans and learns from the best ones; the Plan tab shows the expected run time.',
+    mip: 'Exact model. Starts from a quick heuristic plan, runs up to the time limit (or until it proves its gap target) and reports its proven gap to the exact model\'s bound.'
   };
   const METHOD_SHORT = { tabu: 'Tabu', sa: 'Annealing', aco: 'Ant colony', mip: 'MIP' };
   const OUT_REASONS = [
@@ -27733,7 +28146,8 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     { id: 'settings', label: 'Settings', icon: 'sliders' }
   ];
   // settings changes that do not call for a re-plan of an approved plan
-  const NON_CONTINGENCY_SETTINGS = ['method', 'methodParams', 'timeLimitSec', 'sampleSeed', 'maxStops'];
+  // (etaSlipPerMin only prices a re-plan's ETA changes)
+  const NON_CONTINGENCY_SETTINGS = ['method', 'methodParams', 'timeLimitSec', 'sampleSeed', 'maxStops', 'etaSlipPerMin'];
 
   // ==== small helpers ==============================================================================
   function F() { return SRO.core.format; }
@@ -28152,9 +28566,30 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
 
   // ==== drop points ===============================================================================
   function rallyCandidates() { return grid().filter(function (g) { return g.rallyCandidate; }); }
+  // Rally points of the current plan. A re-plan's plan.rallyPoints cover the whole window (the
+  // points of stops already made too), as does plan.windowStats.rallyPoints: both count toward the
+  // window's maxRallyPoints.
   function usedRally(st) {
     const p = activePlan(st) || (st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) : null);
     return (p && p.rallyPoints) || [];
+  }
+  function rallyCountOf(p) {
+    if (p && p.windowStats && isNum(p.windowStats.rallyPoints)) return p.windowStats.rallyPoints;
+    return ((p && p.rallyPoints) || []).length;
+  }
+  // ', 8 of 8 used this window (approved plan); 7 in draft P-0004': says which plan it counts, and adds
+  // the newest draft for the same window (a re-plan under review) when it uses a different number
+  function rallyUsedText(st, max) {
+    const ap = activePlan(st);
+    const last = st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) || null : null;
+    const p = ap || last;
+    if (!p) return '';
+    const n = rallyCountOf(p);
+    const draft = ap && last && last !== ap && !last.approved && !last.superseded && last.windowId === ap.windowId ? last : null;
+    const dn = draft ? rallyCountOf(draft) : null;
+    if (!n && !dn) return '';
+    return ', ' + n + ' of ' + max + ' used this window (' + (p.approved ? 'approved plan' : 'draft ' + p.id) + ')' +
+      (draft && dn !== n ? '; ' + dn + ' in draft ' + draft.id : '');
   }
   function rallyMapPoints(st, used) {
     const r = st.scenario.rally || {};
@@ -28172,7 +28607,10 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     const name = g ? shortName(g.name) : id;
     if (what === 'pin') act({ type: 'rally/pin', gridId: id }, name + ' pinned: the optimizer will use it.');
     else if (what === 'ban') act({ type: 'rally/ban', gridId: id }, name + ' banned: the optimizer will not use it.');
-    else act({ type: 'rally/clear', gridId: id }, name + ': the optimizer decides again.');
+    else {
+      const was = getState() ? rallyState(getState(), id) : 'open';
+      act({ type: 'rally/clear', gridId: id }, name + (was === 'banned' ? ' unbanned' : ' unpinned') + ': the optimizer may use it or not.');
+    }
   }
   // Pin / Ban / Clear dialog for one point (used by map clicks).
   function rallyDialog(id) {
@@ -28499,8 +28937,9 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       replanning = false;
       rerender();
       if (plan && plan.id) {
-        ui.toast('Re-plan ready: review and approve it in the Plan tab.', 'success', { action: { label: 'Open Plan', onClick: function () { ui.plannerTabs.show('plan'); } } });
+        // the Plan tab opens on the re-plan, so the toast needs no button to get there
         ui.plannerTabs.show('plan');
+        ui.toast('Re-plan ready. Review the changes, then approve.', 'success');
       }
     }, function (err) {
       replanning = false;
@@ -28707,7 +29146,8 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       h('p.field-help', 'The optimizer picks which candidate points become drop points each window and which platoons use them, within each platoon\'s mobility radius. Pinned points are always used and count toward the maximum; banned points are never used.'),
       (r.pinned || []).length > max ? h('div.notice.notice-warn', icon('alert'), 'More points are pinned (' + r.pinned.length + ') than the maximum (' + max + '). Unpin some or raise the maximum.') : null,
       h('div.hstack.wrap.spread',
-        h('span.small.muted', (r.pinned || []).length + ' pinned, ' + (r.banned || []).length + ' banned, ' + all.length + ' candidates' + (used.length ? ', ' + used.length + ' used in the current plan' : '')),
+        h('span.small.muted', { 'data-testid': 'rally-counts' }, (r.pinned || []).length + ' pinned, ' + (r.banned || []).length + ' banned, ' + all.length + ' candidates' +
+          rallyUsedText(st, max)),
         ((r.pinned || []).length || (r.banned || []).length) ? h('button.btn.btn-sm.btn-ghost', { type: 'button', onClick: function () { act({ type: 'rally/clear' }, 'All pins and bans cleared.'); } }, 'Clear all') : null));
     const chips = h('div.chip-group.sc-rally-filter', { role: 'group', 'aria-label': 'Filter drop points' }, filters.map(function (f) {
       return h('button.chip', { type: 'button', 'aria-pressed': String(rallyFilter === f[0]), onClick: function () { rallyFilter = f[0]; blocks.rally.render(getState(), true); } }, f[1]);
@@ -28798,6 +29238,25 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
       numField({ fk: 'mpg', label: 'Fuel burn', unit: 'mpg', value: s.mpg, def: d.mpg, min: 0.5, max: 10, step: 0.1, help: 'Miles per gallon per truck; gallons = miles / mpg.', onCommit: function (v) { updateSettings({ mpg: v }); } }),
       numField({ fk: 'service', label: 'Stop service time', unit: 'min', value: s.serviceMin, def: d.serviceMin, min: 0, max: 120, step: 1, int: true, help: 'Time spent at each stop to hand over supplies.', onCommit: function (v) { updateSettings({ serviceMin: v }); } }),
       numField({ fk: 'load', label: 'Hub load time', unit: 'min', value: s.loadMin, def: d.loadMin, min: 0, max: 240, step: 1, int: true, help: 'Time to load a truck at its hub before it leaves.', onCommit: function (v) { updateSettings({ loadMin: v }); } })));
+  }
+  // Re-plans: what an ETA change costs (settings.etaSlipPerMin; the engine's default when unset).
+  function buildReplanCost(st) {
+    const s = st.scenario.settings, d = scenarioDefaults();
+    const E = engine();
+    const dflt = isNum(d.etaSlipPerMin) ? d.etaSlipPerMin : (E && isNum(E.DEFAULT_ETA_SLIP_PER_MIN) ? E.DEFAULT_ETA_SLIP_PER_MIN : 1);
+    const v = isNum(s.etaSlipPerMin) ? s.etaSlipPerMin : dflt;
+    return advCard('Re-plans', null, h('div.form-grid',
+      numField({ fk: 'etaSlip', label: 'Cost of a later ETA', unit: 'points per minute', value: v, def: dflt, min: 0, max: 100, step: 0.5,
+        help: 'After a contingency, a re-plan that makes a load arrive later than the time the approved plan gave its platoon pays this for every minute later (on top of any late penalty). Higher keeps the times platoons were told; 0 lets a re-plan move them freely.',
+        onCommit: function (x) { updateSettings({ etaSlipPerMin: x }); } })));
+  }
+  // Demo data: the seed of the sample requests (spec: fixed seed, changeable).
+  function buildDemoData(st) {
+    const s = st.scenario.settings, d = scenarioDefaults();
+    return advCard('Demo data', null, h('div.form-grid',
+      numField({ fk: 'sampleSeed', label: 'Sample seed', value: s.sampleSeed, def: d.sampleSeed, min: 1, max: 999999999, step: 1, int: true,
+        help: 'Load sample requests (Queue) uses this number to pick and place the 19 sample requests. The same seed always gives the same set; change it for a different one. Takes effect the next time samples are loaded.',
+        onCommit: function (x) { updateSettings({ sampleSeed: x }); } })));
   }
   function periodBar(rows, v) {
     const colors = ['--sc-p0', '--sc-p1', '--sc-p2', '--sc-p3', '--sc-p4', '--sc-p5'];
@@ -28979,6 +29438,10 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
           const raw = input.value.trim();
           if (raw === '' || !isFinite(Number(raw))) { err.hidden = false; err.textContent = 'Enter a number from ' + showVal(e.min) + ' to ' + showVal(e.max) + '.'; return; }
           err.hidden = true;
+          // one commit (and one 'kept within' toast) per value: a second change event for the same
+          // text before the panel redraws (Enter then blur) changes nothing
+          if (input.getAttribute('data-committed') === raw) return;
+          input.setAttribute('data-committed', raw);
           commitKnob(method, e.key, Number(raw));
         }
       });
@@ -29053,6 +29516,8 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     blocks.counts = block('sc-b-counts', function (st) { return [st.scenario.fleet, st.scenario.hubs]; }, buildFleetShortcut);
     blocks.rallyMax = block('sc-b-rmax', function (st) { return [settingsOf(st).maxRallyPoints]; }, buildRallyShortcut);
     blocks.travel = block('sc-b-travel', function (st) { const s = settingsOf(st); return [s.convoyFactor, s.mpg, s.serviceMin, s.loadMin]; }, buildTravel);
+    blocks.replanCost = block('sc-b-replan', function (st) { return [settingsOf(st).etaSlipPerMin]; }, buildReplanCost);
+    blocks.demoData = block('sc-b-demo', function (st) { return [settingsOf(st).sampleSeed]; }, buildDemoData);
     blocks.periods = block('sc-b-periods', function (st) { return [settingsOf(st).periods]; }, buildPeriods);
     blocks.risk = block('sc-b-risk', function (st) { return [settingsOf(st).riskRatings]; }, buildRisk);
     blocks.mobility = block('sc-b-mob', function (st) { return [settingsOf(st).mobility]; }, buildMobility);
@@ -29065,7 +29530,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     rally: ['rally'],
     settings: ['optimizer', 'weights', 'counts', 'rallyMax']
   };
-  const ADV_BLOCKS = ['travel', 'periods', 'risk', 'mobility', 'dailyUse', 'tuning'];
+  const ADV_BLOCKS = ['travel', 'replanCost', 'periods', 'risk', 'mobility', 'dailyUse', 'tuning', 'demoData'];
   let panels = {};
   let tabBtns = {};
   let advEl = null;
@@ -29388,7 +29853,7 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
 
   // 'Diesel / JP-8, Diesel (DF-2)': item name and option, comma separated like the other planner
   // views (option labels carry their own parentheses, so no nesting). An item with one option, or an
-  // option named like the item, shows the item name only.
+  // option the item name already contains ('Diesel / JP-8' and JP-8), shows the item name only.
   function itemText(line) {
     const H = cats();
     const it = H && H.itemById ? H.itemById(line.itemId) : null;
@@ -29396,7 +29861,11 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     let opt = '';
     if (it.freeText) opt = line.option ? String(line.option) : '';
     else if (it.options.length > 1) { const op = H.optionById(line.itemId, line.option); opt = op ? op.label : ''; }
-    return opt && opt.toLowerCase() !== it.name.toLowerCase() ? it.name + ', ' + opt : it.name;
+    // the option only when it adds something (the same rule as plannerKit.itemName): 'Diesel / JP-8'
+    // already says JP-8, and an option that contains the name ('AT4 (84 mm)') stands for both
+    const nl = it.name.toLowerCase(), ol = opt.toLowerCase();
+    if (!ol || ol === nl || (ol.length >= 3 && nl.indexOf(ol) >= 0)) return it.name;
+    return nl.length >= 2 && ol.indexOf(nl) >= 0 ? opt : it.name + ', ' + opt;
   }
   // One delivery (or deferred line) -> display parts. Works with lineIdx (number or array) or without.
   function deliveryInfo(st, d) {
@@ -30044,7 +30513,8 @@ html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); b
     });
   }
   function buildData(st) {
-    const size = (function () { try { return (SRO.core.store.serialize(st).length / 1024); } catch (e) { return NaN; } })();
+    // the size of the file Export writes (pretty-printed JSON), not of the compact browser copy
+    const size = (function () { try { return (SRO.core.store.exportJson(st).length / 1024); } catch (e) { return NaN; } })();
     return [
       h('section.card.op-data',
         h('div.card-header', h('div', h('h3.card-title', 'Export all data'), h('div.card-sub', 'A JSON file with every request, plan, snapshot, the scenario and settings on this device' + (isNum(size) ? ' (about ' + F().number(Math.max(1, size), 0) + ' KB)' : '') + '. Data lives only in this browser, so export to back it up or move it to another device.'))),
