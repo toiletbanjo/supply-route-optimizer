@@ -2,16 +2,30 @@
 //
 //   const m = SRO.ui.map.create(el, { theme, tiles: true, compact: false, controls: true, scale: true })
 //   m.setZones(zones)                         closed = gray hatching + red outline; risk = amber..red fill + rating label
-//   m.setHubs(hubs)                           2525 supply installation symbols
+//   m.setHubs(hubs, { labels })               2525 supply installation symbols; the names (labels: false = none)
+//                                             draw above the platoon symbols
 //   m.setRally(points, { walkRingMi })        [{ id|gridId, lat, lon, label, used, pinned, banned, walkRingMi }]
-//   m.setPlatoons(requests, { selectedId })   2525 platoon symbols on urgency rings
-//   m.setRoutes(routes, { highlightTruckId }) [{ truckId, color, label?, summary?,
+//   m.setPlatoons(requests, { selectedId, labels, clearOf, clearPx })
+//                                             2525 platoon symbols on urgency rings; labels: false = no designator;
+//                                             clearOf: [{ lat, lon, rally }...] points a symbol must not cover (a pickup
+//                                             point; rally: true = a drop point symbol standing above its point):
+//                                             within clearPx it is drawn beside them with a leader line
+//   m.setRoutes(routes, { highlightTruckId, stopLabels }) [{ truckId, color, label?, summary?,
 //                                               legs: [{ coords: [[lat, lon]...] | path: 'encoded polyline', source, approximate }]
-//                                               | coords | path, stops: [{ lat, lon, seq, label }] }]
+//                                               | coords | path, stops: [{ lat, lon, seq, label, mine }] }]
 //                                             plan.routes can be passed as they are (leg.path, precision 5, is decoded
 //                                             and cached). Routes sharing a road are drawn side by side in lanes.
-//   m.setTrucks([{ id, color, lat, lon, heading, label, type }])   updated in place (animation)
-//   m.fitTaiwan(), m.fitTo(bounds | [[lat, lon], ...] | [{ lat, lon }, ...]), m.setView([lat, lon], zoom)
+//                                             A stop with mine: true gets a larger badge filled in the route color,
+//                                             above the drop point symbols; stopLabels: 'mine' draws the other stops
+//                                             as plain dots (compact maps)
+//   m.setTrucks([{ id, color, lat, lon, heading, label, type }], { clearOf, clearPx })   updated in place
+//                                             (animation); clearOf as for platoons, without the leader line (a truck
+//                                             at its hub is drawn beside the hub symbol)
+//   m.fitTaiwan({ padBottom }), m.fitTo(bounds | [[lat, lon], ...] | [{ lat, lon }, ...], { clearControls, iconPad,
+//                                             padBottom, padTop, ... }), m.setView([lat, lon], zoom); clearControls keeps the
+//                                             points clear of the zoom buttons and attribution with iconPad px (22) for
+//                                             their symbols; padBottom keeps px free at the bottom edge (a hint over the
+//                                             map), padTop at the top (drop point symbols stand above their points)
 //                                             a map made with no size (hidden tab) fits Taiwan once it has one, unless
 //                                             the caller set a view; a view set while it has no size is applied again then
 //   m.on('click:zone' | 'click:route' | 'click:platoon' | 'click:hub' | 'click:rally' | 'click:truck' | 'click:map' | 'tiles', fn) -> off()
@@ -195,7 +209,8 @@
     '.sro-note{background:var(--sro-label-bg);color:var(--sro-ctl-muted);border:1px solid var(--sro-ctl-border);border-radius:6px;padding:4px 8px;font-size:11px;line-height:1.3;max-width:240px}',
     '.sro-note b{color:var(--sro-ctl-fg);font-weight:600}',
     '.sro-note-short{display:none}',
-    '@container (max-width:560px){.sro-map .leaflet-control-scale{display:none}.sro-map .leaflet-bottom.leaflet-left{bottom:30px}.sro-note-long{display:none}.sro-note-short{display:inline}}',
+    // narrow: the short note, and room beside it for a control in the bottom-right corner (the planner legend)
+    '@container (max-width:560px){.sro-map .leaflet-control-scale{display:none}.sro-map .leaflet-bottom.leaflet-left{bottom:30px}.sro-note-long{display:none}.sro-note-short{display:inline}.sro-note{max-width:calc(100cqw - 150px)}}',
     '@media (pointer:coarse){.sro-map .leaflet-bar a,.sro-map .leaflet-bar a:hover{width:44px;height:44px;line-height:44px;font-size:20px}.sro-basemap button{height:44px;min-width:56px}}',
     // zones
     '.sro-zone-label{display:inline-block;transform:translate(-50%,0);white-space:nowrap;max-width:200px;max-width:min(240px,60cqw);overflow:hidden;text-overflow:ellipsis;box-sizing:border-box;font:700 10px/1 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:.06em;text-transform:uppercase;padding:3px 5px;border-radius:4px;background:var(--sro-label-bg);border:1px solid var(--sro-zone-c);color:var(--sro-zone-c);pointer-events:none}',
@@ -205,6 +220,16 @@
     '.sro-stop-icon{background:none;border:0}',
     '.sro-stop{box-sizing:border-box;width:20px;height:20px;border-radius:50%;background:var(--sro-ctl-bg);border:2px solid var(--sro-stop);color:var(--sro-ctl-fg);font:700 11px/16px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums;text-align:center}',
     '.sro-stop-dim{opacity:.35}',
+    '.sro-stop-dot{width:12px;height:12px}',
+    // the platoon sergeant's own stop: larger, filled in the route color, with a gap ring
+    '.sro-stop-mine{width:26px;height:26px;background:var(--sro-stop);color:var(--sro-stop-fg,#fff);border:2px solid var(--sro-sel-gap);box-shadow:0 0 0 2px var(--sro-stop),0 1px 4px rgba(0,0,0,.45);font-size:13px;line-height:22px}',
+    '.sro-map[data-sro-theme="night"] .sro-stop-mine{background:#000;color:var(--sro-ctl-fg);border-color:var(--sro-sel);box-shadow:0 0 0 2px #000}',
+    // hub names above the platoon symbols: milsymbol's outlined text only, the frame hidden
+    '.sro-icon-hublabel path,.sro-icon-hublabel circle,.sro-icon-hublabel ellipse,.sro-icon-hublabel rect,.sro-icon-hublabel line,.sro-icon-hublabel polyline,.sro-icon-hublabel polygon{display:none}',
+    // a symbol drawn beside its true position (clearOf): leader line and a dot on the spot
+    '.sro-leader{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}',
+    '.sro-leader line{stroke:var(--sro-sel);stroke-width:1.5;stroke-dasharray:3 2}',
+    '.sro-leader circle{fill:var(--sro-sel);stroke:var(--sro-sel-gap);stroke-width:1.5}',
     '.sro-route-dim{opacity:.3}',
     // tooltips
     '.sro-map .leaflet-tooltip.sro-tip{background:var(--sro-ctl-bg);color:var(--sro-ctl-fg);border:1px solid var(--sro-ctl-border);border-radius:6px;box-shadow:none;font-size:12px;padding:4px 7px}',
@@ -333,13 +358,14 @@
     internally(function () { map.fitBounds(MAP.TAIWAN_BOUNDS, { padding: [8, 8], animate: false }); });
 
     // panes (z-index): coast 150 < tiles 200 < roads 250 < zones 380 < walk 390 < routes 410 <
-    // labels 590 < rally 605 < hubs 610 < platoons 620 < trucks 640 < draw 650
-    const PANES = { coast: 150, roads: 250, zones: 380, walk: 390, routes: 410, labels: 590, stops: 595, rally: 605, hubs: 610, platoons: 620, trucks: 640, draw: 650 };
+    // labels 590 < stops 595 < rally 605 < hubs 610 < own stop 612 < platoons 620 < hub names 630 <
+    // trucks 640 < draw 650
+    const PANES = { coast: 150, roads: 250, zones: 380, walk: 390, routes: 410, labels: 590, stops: 595, rally: 605, hubs: 610, mystop: 612, platoons: 620, hublabels: 630, trucks: 640, draw: 650 };
     Object.keys(PANES).forEach(function (k) {
       const p = map.createPane('sro-' + k);
       p.style.zIndex = PANES[k];
       p.classList.add('sro-pane-' + k);
-      if (k === 'coast' || k === 'roads' || k === 'walk' || k === 'labels') p.style.pointerEvents = 'none';
+      if (k === 'coast' || k === 'roads' || k === 'walk' || k === 'labels' || k === 'hublabels' || k === 'mystop') p.style.pointerEvents = 'none';
     });
 
     // hatch pattern for closed zones (instance-unique id)
@@ -536,7 +562,7 @@
       walk: L.layerGroup().addTo(map), platoons: L.layerGroup().addTo(map), routes: L.layerGroup().addTo(map),
       stops: L.layerGroup().addTo(map), trucks: L.layerGroup().addTo(map), draw: L.layerGroup().addTo(map)
     };
-    const data = { zones: [], hubs: [], rally: [], rallyOpts: {}, platoons: [], platoonOpts: {}, routes: [], routeOpts: {}, trucks: [] };
+    const data = { zones: [], hubs: [], hubOpts: {}, rally: [], rallyOpts: {}, platoons: [], platoonOpts: {}, routes: [], routeOpts: {}, trucks: [], truckOpts: {} };
     let drawing = null;            // active zone-drawing session
 
     // Icon sizes by zoom: small at island zoom (phones), full size from zoom 9.5.
@@ -550,6 +576,57 @@
 
     function tip(layer, html, opt) {
       layer.bindTooltip(html, Object.assign({ className: 'sro-tip', direction: 'right', opacity: 1 }, opt || {}));
+    }
+
+    // clearOf: screen offset [dx, dy] that moves a symbol at p to minPx from every one of pts (or as
+    // far as it can get), or null when none is that close. down: px the symbol reaches below its point
+    // (a truck's callsign chip). Tries the straight push away and 16 spots around the symbol at a few
+    // distances; the best keeps clear of all points, inside the map, close to its true position and,
+    // on a tie, towards the middle of the map.
+    function clearOffset(p, pts, minPx, down) {
+      down = down > 0 ? down : 0;
+      if (!pts || !pts.length || !(minPx > 0) || !map._loaded) return null;
+      let a, size;
+      try { a = map.latLngToContainerPoint(p); size = map.getSize(); } catch (e) { return null; }
+      // a drop point symbol stands on its point (a pointer at the bottom): keep clear of its whole height
+      const up = Math.round(sizes().rally * 1.5);
+      const qs = [];
+      pts.forEach(function (q) { const ll = toLatLng(q); if (finitePt(ll)) { const c = map.latLngToContainerPoint(ll); qs.push({ x: c.x, y: c.y, up: q && q.rally ? up : 0 }); } });
+      // from the symbol at (x, y) (and down to y + down) to the nearest spot of a point's symbol: [dx, dy]
+      const away = function (x, y, b) { return [x - b.x, y > b.y ? y - b.y : y + down < b.y - b.up ? y + down - (b.y - b.up) : 0]; };
+      const covers = function (x, y) {
+        let s = 0;
+        qs.forEach(function (b) { const v = away(x, y, b), d = Math.sqrt(v[0] * v[0] + v[1] * v[1]); if (d < minPx) s += minPx - d; });
+        return s;
+      };
+      if (!(covers(a.x, a.y) > 0.5)) return null;
+      const diag = Math.sqrt(size.x * size.x + size.y * size.y) || 1;
+      const score = function (dx, dy) {
+        const x = a.x + dx, y = a.y + dy, m = 16;
+        const out = Math.max(0, m - x) + Math.max(0, x - (size.x - m)) + Math.max(0, m - y) + Math.max(0, y + down - (size.y - m));
+        const mid = Math.sqrt((x - size.x / 2) * (x - size.x / 2) + (y - size.y / 2) * (y - size.y / 2)) / diag;
+        return covers(x, y) * 4 + out * 4 + Math.sqrt(dx * dx + dy * dy) * 0.5 + mid * 10;
+      };
+      // the straight push away from the points it covers
+      let px = 0, py = 0;
+      qs.forEach(function (b) {
+        const v = away(a.x, a.y, b), d = Math.sqrt(v[0] * v[0] + v[1] * v[1]);
+        if (d < minPx && d > 0.5) { px += v[0] / d * (minPx - d); py += v[1] / d * (minPx - d); }
+      });
+      let best = null;
+      const consider = function (dx, dy) { const s = score(dx, dy); if (!best || s < best.s) best = { s: s, dx: dx, dy: dy }; };
+      if (Math.abs(px) >= 1 || Math.abs(py) >= 1) consider(px, py);
+      [0.6, 1, 1.4, 1.9].forEach(function (k) {
+        for (let i = 0; i < 16; i++) { const t = i * Math.PI / 8; consider(Math.cos(t) * minPx * k, Math.sin(t) * minPx * k); }
+      });
+      return best && (Math.abs(best.dx) >= 1 || Math.abs(best.dy) >= 1) ? [Math.round(best.dx), Math.round(best.dy)] : null;
+    }
+    // the divIcon moved by off px, with a dashed leader line from its true position to the symbol
+    function besideIcon(icon, off) {
+      const o = icon.options, a = o.iconAnchor, x0 = a[0] - off[0], y0 = a[1] - off[1];
+      const leader = '<svg class="sro-leader" width="1" height="1" aria-hidden="true" focusable="false"><line x1="' + x0 + '" y1="' + y0 + '" x2="' + a[0] + '" y2="' + a[1] +
+        '"/><circle cx="' + x0 + '" cy="' + y0 + '" r="3"/></svg>';
+      return L.divIcon(Object.assign({}, o, { html: leader + o.html, iconAnchor: [x0, y0] }));
     }
 
     // zones
@@ -593,18 +670,25 @@
       zoneLabels();
     }
 
-    // hubs
-    function hubOpts() { const z = sizes(); return z.text ? { theme: theme, size: z.hub } : { theme: theme, size: z.hub, label: '' }; }
-    function setHubs(hubs) {
+    // hubs: the symbol in the hubs pane, its name (when the zoom shows text) in a pane above the platoon
+    // symbols, which would otherwise cover it next to a hub
+    function setHubs(hubs, hopts) {
       data.hubs = (hubs || []).slice();
+      if (hopts !== undefined) data.hubOpts = Object.assign({}, hopts || {});
       groups.hubs.clearLayers();
+      const z = sizes(), named = z.text && data.hubOpts.labels !== false;
       data.hubs.forEach(function (h) {
         const p = toLatLng(h);
         if (!finitePt(p)) return;
-        const m = L.marker(p, { pane: 'sro-hubs', icon: symbols.hub(h, hubOpts()), keyboard: true, title: h.name || h.id, riseOnHover: true });
+        const m = L.marker(p, { pane: 'sro-hubs', icon: symbols.hub(h, { theme: theme, size: z.hub, label: '' }), keyboard: true, title: h.name || h.id, riseOnHover: true });
         tip(m, '<b>' + esc(h.name || h.id) + '</b>' + (h.callsign ? ' · ' + esc(h.callsign) : ''));
         m.on('click', function () { if (!drawing) emit('click:hub', { hub: h }); });
         m.addTo(groups.hubs);
+        if (named) {
+          const ic = symbols.hub(h, { theme: theme, size: z.hub });
+          L.marker(p, { pane: 'sro-hublabels', interactive: false, keyboard: false,
+            icon: L.divIcon(Object.assign({}, ic.options, { className: 'sro-icon sro-icon-hublabel' })) }).addTo(groups.hubs);
+        }
       });
     }
 
@@ -650,10 +734,15 @@
         const p = toLatLng(r);
         const key = p[0].toFixed(4) + ',' + p[1].toFixed(4);
         const dup = seen[key] = (seen[key] || 0) + 1;
-        let icon = symbols.platoon(r, { urgency: r.urgency || r.urgencyRequested, selected: r.id === sel, theme: theme, size: sz.plt, showDesignation: sz.text || r.id === sel });
+        const named = (sz.text && data.platoonOpts.labels !== false) || r.id === sel;
+        let icon = symbols.platoon(r, { urgency: r.urgency || r.urgencyRequested, selected: r.id === sel, theme: theme, size: sz.plt, showDesignation: named });
         if (dup > 1) {        // same spot (one platoon, several requests): fan out a little
           const a = icon.options.iconAnchor, k = dup - 1, f = sz.plt / 24;
           icon = L.divIcon(Object.assign({}, icon.options, { iconAnchor: [a[0] - 14 * f * k, a[1] + 10 * f * k] }));
+        } else {
+          // beside a point it would cover (the platoon's own pickup point on the PSG card): ring radius + 14 px
+          const off = clearOffset(p, data.platoonOpts.clearOf, data.platoonOpts.clearPx || Math.round(sz.plt * 0.98 + 2) + 14);
+          if (off) icon = besideIcon(icon, off);
         }
         const urg = r.urgency || r.urgencyRequested || 'Routine';
         const m = L.marker(p, {
@@ -984,13 +1073,22 @@
             if (b !== shown && b.route.truckId) { shown = b; hit.setTooltipContent(routeTip(b.route)); }
           });
         }
+        const dots = data.routeOpts.stopLabels === 'mine';
         (r.stops || []).forEach(function (s, i) {
           const p = toLatLng(s);
           if (!finitePt(p)) return;
           const n = s.seq !== undefined ? s.seq : i + 1;
+          let html = '<div class="sro-stop' + (rl.dim ? ' sro-stop-dim' : '') + '" style="--sro-stop:' + rl.color + '">' + esc(n) + '</div>', px = 20, pane = 'sro-stops';
+          if (s.mine) {
+            html = '<div class="sro-stop sro-stop-mine" style="--sro-stop:' + rl.color + ';--sro-stop-fg:' + (symbols.textOn ? symbols.textOn(rl.color) : '#fff') + '">' + esc(n) + '</div>';
+            px = 26; pane = 'sro-mystop';
+          } else if (dots) {
+            html = '<div class="sro-stop sro-stop-dot' + (rl.dim ? ' sro-stop-dim' : '') + '" style="--sro-stop:' + rl.color + '"></div>';
+            px = 12;
+          }
           L.marker(p, {
-            pane: 'sro-stops', interactive: false, keyboard: false, zIndexOffset: rl.isHi ? 1000 : 0,
-            icon: L.divIcon({ className: 'sro-stop-icon', html: '<div class="sro-stop' + (rl.dim ? ' sro-stop-dim' : '') + '" style="--sro-stop:' + rl.color + '">' + esc(n) + '</div>', iconSize: [20, 20], iconAnchor: [10, 10] })
+            pane: pane, interactive: false, keyboard: false, zIndexOffset: rl.isHi ? 1000 : 0,
+            icon: L.divIcon({ className: 'sro-stop-icon', html: html, iconSize: [px, px], iconAnchor: [px / 2, px / 2] })
           }).addTo(groups.stops);
         });
       });
@@ -1049,15 +1147,23 @@
         setHubs(data.hubs); setRally(data.rally, data.rallyOpts); setPlatoons(data.platoons, data.platoonOpts); setTrucks(data.trucks);
       }
     }
-    map.on('zoomend', function () { relayoutRoutes(true); zoneLabels(); resize(); });
+    map.on('zoomend', function () {
+      relayoutRoutes(true); zoneLabels(); resize();
+      // clearOf offsets are screen pixels
+      if (data.platoonOpts.clearOf) setPlatoons(data.platoons, data.platoonOpts);
+      if (data.truckOpts.clearOf) setTrucks(data.trucks);
+    });
     map.on('moveend', function () { relayoutRoutes(false); });
     map.on('resize', resize);
 
     // trucks (updated in place so the demo clock can animate them)
     const truckMarkers = new Map();     // id -> { marker, sig, data, tip }
     function truckTip(tr) { return '<b>' + esc(tr.id) + '</b>' + (tr.status ? '<br>' + esc(tr.status) : ''); }
-    function setTrucks(list) {
+    function setTrucks(list, topts) {
       data.trucks = (list || []).slice();
+      if (topts !== undefined) data.truckOpts = Object.assign({}, topts || {});
+      // default gap: the truck ring's radius plus half a hub symbol's width (what a truck waits on)
+      const szT = sizes(), ringR = Math.round(szT.truck * 0.95 + 2), clearPx = data.truckOpts.clearPx || ringR + Math.round(szT.hub * 0.9) + 4;
       const keep = {};
       data.trucks.forEach(function (tr) {
         const p = toLatLng(tr);
@@ -1082,6 +1188,12 @@
           if (tipHtml !== rec.tip && rec.marker.getTooltip()) { rec.marker.setTooltipContent(tipHtml); rec.tip = tipHtml; }
         }
         const elm = rec.marker.getElement();
+        const sym = elm && elm.querySelector('.sro-truck');
+        if (sym) {
+          const off = clearOffset(p, data.truckOpts.clearOf, clearPx, ringR + 11);   // to the middle of the callsign chip
+          const tf = off ? 'translate(' + off[0] + 'px,' + off[1] + 'px)' : '';
+          if (sym.style.transform !== tf) sym.style.transform = tf;
+        }
         const hd = elm && elm.querySelector('.sro-heading');
         if (hd) {
           if (isFinite(tr.heading)) { hd.classList.remove('sro-heading-none'); hd.style.transform = 'rotate(' + (+tr.heading).toFixed(1) + 'deg)'; }
@@ -1092,7 +1204,13 @@
     }
 
     // ---- view ----------------------------------------------------------------------------------------
-    function fitTaiwanNow(o) { map.fitBounds(MAP.TAIWAN_BOUNDS, Object.assign({ padding: [8, 8] }, o || {})); }
+    // o.padBottom: px kept free at the bottom edge (a hint drawn over the map there)
+    function fitTaiwanNow(o) {
+      const fo = Object.assign({ padding: [8, 8] }, o || {});
+      if (fo.padBottom > 0) { fo.paddingTopLeft = fo.padding; fo.paddingBottomRight = [fo.padding[0], fo.padding[1] + fo.padBottom]; }
+      delete fo.padBottom;
+      map.fitBounds(MAP.TAIWAN_BOUNDS, fo);
+    }
     function noAnim(o) { return Object.assign({}, o || {}, { animate: false }); }
     function fitTaiwan(o) {
       callerSetsView(function () { fitTaiwanNow(o); }, function () { fitTaiwanNow(noAnim(o)); });
@@ -1111,12 +1229,25 @@
       if (target.point) { map.setView(target.point, Math.max(map.getZoom(), 11), o && o.animate === false ? { animate: false } : undefined); return; }
       const fo = Object.assign({ maxZoom: 13 }, o || {});
       const pad = fo.padding || [28, 28];
-      delete fo.padding;
+      const clear = fo.clearControls, ip = isFinite(fo.iconPad) ? +fo.iconPad : 22, extra = fo.padBottom > 0 ? +fo.padBottom : 0, top = fo.padTop > 0 ? +fo.padTop : 0;
+      delete fo.padding; delete fo.clearControls; delete fo.iconPad; delete fo.padBottom; delete fo.padTop;
       // keep the fitted points clear of the attribution strip (two lines on phones and cards)
       const attrEl = attribution.getContainer();
       const attrH = attrEl ? attrEl.offsetHeight : 0;
-      fo.paddingTopLeft = fo.paddingTopLeft || pad;
-      fo.paddingBottomRight = fo.paddingBottomRight || [pad[0], pad[1] + attrH];
+      let tl = pad, br = [pad[0], pad[1] + attrH];
+      if (clear) {
+        // and of the zoom buttons (top left), with room for the symbols drawn on the points: on a
+        // compact map the buttons cover a good share of it
+        const zc = el.querySelector('.leaflet-control-zoom');
+        const zr = zc && zc.getClientRects().length ? zc.getBoundingClientRect() : null;
+        const left = zr ? Math.ceil(zr.right - el.getBoundingClientRect().left) : 0;
+        tl = [Math.max(pad[0], left + ip), Math.max(pad[1], ip)];
+        br = [Math.max(pad[0], ip), Math.max(pad[1], ip) + attrH];
+      }
+      if (extra) br = [br[0], br[1] + extra];
+      if (top) tl = [tl[0], tl[1] + top];
+      fo.paddingTopLeft = fo.paddingTopLeft || tl;
+      fo.paddingBottomRight = fo.paddingBottomRight || br;
       map.fitBounds(target.bounds, fo);
     }
     function fitTo(b, o) {

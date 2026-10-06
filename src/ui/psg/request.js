@@ -308,8 +308,9 @@
       R.unit.appendChild(h('div.psg-unit-strip' + (err.length ? '.is-invalid' : ''),
         psg.symbolSvg(p, 22),
         h('div.psg-unit-strip-main',
-          h('div.psg-unit-strip-name.truncate', p.unitName),
-          h('div.small.muted', h('span.mono.psg-nowrap', psg.mgrs(p.lat, p.lon) || 'No location'), ' · ', h('span.psg-nowrap', psg.nearText(p.lat, p.lon)))),
+          h('div.psg-unit-strip-name', psg.unitNameParts(p.unitName)),
+          // grid and place wrap as whole pieces; the dot between them is CSS (hidden when they wrap)
+          h('div.small.muted.psg-unit-strip-loc', h('span.mono', psg.mgrs(p.lat, p.lon) || 'No location'), h('span.psg-loc-near', psg.nearText(p.lat, p.lon)))),
         h('button.btn.btn-sm.btn-ghost.psg-strip-update', { type: 'button', onClick: function () { psg.openLocationSheet(self.ctx); } }, 'Update')));
       err.forEach(function (e) { R.unit.appendChild(fieldMsg('error', e.message)); });
     },
@@ -618,10 +619,13 @@
         try { m = psg.createMap(mapEl, { compact: true, tiles: true }); } catch (e) { mapEl.appendChild(h('div.notice.notice-warn', icon('alert'), h('div', 'The map could not load here.'))); return; }
         self.pickMap = m;
         mapEl.__sroMap = m;
-        m.setPlatoons([{ id: 'me', lat: prof.lat, lon: prof.lon, unitName: prof.unitName, designator: prof.designator, mobility: prof.mobility, urgency: draft.urgency }]);
+        // their own symbol without designator text (it ran under the zoom buttons), drawn beside a drop
+        // point it would cover so every drop point can be seen and tapped
+        m.setPlatoons([{ id: 'me', lat: prof.lat, lon: prof.lon, unitName: prof.unitName, designator: prof.designator, mobility: prof.mobility, urgency: draft.urgency }],
+          { labels: false, clearOf: near.slice(0, 10).map(function (g) { return { lat: g.lat, lon: g.lon, rally: true }; }) });
         m.setRally(near.map(function (g) { return { id: g.id, gridId: g.id, lat: g.lat, lon: g.lon, name: psg.placeName(g), label: '', used: !!(dp && dp.gridId === g.id) }; }), { walkRingMi: 0 });
         if (info.radiusMi > 0 && info.radiusMi <= showMi && root.L) {
-          root.L.circle([prof.lat, prof.lon], { pane: 'sro-walk', radius: info.radiusMi * 1609.344, color: cssVar('--text-faint', '#75838e'), weight: 1.5, dashArray: '4 6', fill: false, interactive: false }).addTo(m.leaflet);
+          root.L.circle([prof.lat, prof.lon], { pane: 'sro-walk', radius: info.radiusMi * 1609.344, color: cssVar('--text-faint', '#8a98a3'), weight: 1.5, dashArray: '4 6', fill: false, interactive: false }).addTo(m.leaflet);
         }
         m.on('click:rally', function (e) { const g = grid.find(function (x) { return x.id === (e.point.gridId || e.point.id); }); if (g) choose(g); });
         // The platoon symbol (and its urgency ring) sits on top of the drop points next to it and
@@ -637,7 +641,9 @@
           const g = SRO.core.geo.nearestGrid({ lat: e.lat, lon: e.lon }, near.length ? near : grid);
           if (g) choose(g);
         });
-        m.fitTo(pts.length > 1 ? pts : [[prof.lat, prof.lon]], { maxZoom: 12, padding: [30, 30], animate: false });
+        // clear of the zoom buttons, the attribution and the "Tap a drop point" hint over the bottom edge
+        const hintEl = mapEl.parentNode && mapEl.parentNode.querySelector('.psg-map-hint');
+        m.fitTo(pts.length > 1 ? pts : [[prof.lat, prof.lon]], { maxZoom: 12, padding: [14, 14], clearControls: true, iconPad: 24, padTop: 12, padBottom: hintEl ? hintEl.offsetHeight + 8 : 0, animate: false });
       });
       box.appendChild(fieldMsg('help', near.length ? 'Drop points near you. Tap one to suggest it.' : 'No drop points nearby. The planner will choose, or deliver direct.'));
     },
@@ -814,10 +820,13 @@
       }
       const n = draft.lines.length;
       const urg = ev.esc && ev.esc.urgency ? ev.esc.urgency : draft.urgency;
+      // escalated to Immediate with a run-out before the NLT: the footer gives that deadline, as the
+      // urgency result above does
+      const nlt = nltOf(st), dl = ev.esc && isNum(ev.esc.deadline) && ev.esc.deadline < nlt ? ev.esc.deadline : null;
       const summary = h('div.psg-footer-sum',
         n ? h('span', n + (n === 1 ? ' item' : ' items')) : h('span.faint', 'No items yet'),
         h('span.badge.badge-urgency.urg-' + urg.toLowerCase(), urg),
-        h('span.num', 'NLT ' + psg.time(nltOf(st), now)));
+        h('span.num.psg-footer-when', dl !== null ? 'Deadline ' + psg.time(dl, now) : 'NLT ' + psg.time(nlt, now)));
       f.appendChild(summary);
       const editing = draft.editingId;
       const r = editing ? (st.requests || []).find(function (x) { return x.id === editing; }) : null;

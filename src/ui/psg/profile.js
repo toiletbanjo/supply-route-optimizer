@@ -59,6 +59,13 @@
     const g = SRO.core.geo.nearestGrid({ lat: lat, lon: lon }, grid, filter);
     return g ? { name: psg.placeName(g), distMi: g.distMi, gridId: g.id, point: g } : null;
   };
+  // A unit name for display, in pieces that wrap only after a comma: '2nd PLT, B CO,' / '4-93 IN',
+  // never '4-' / '93 IN' at the battalion's hyphen.
+  psg.unitNameParts = function (name) {
+    const parts = String(name || '').split(/,\s*/), out = [];
+    parts.forEach(function (s, i) { if (i) out.push(' '); out.push(h('span.psg-name-part', s + (i < parts.length - 1 ? ',' : ''))); });
+    return out;
+  };
   psg.nearText = function (lat, lon) {
     const p = psg.place(lat, lon);
     if (!p) return '';
@@ -374,6 +381,8 @@
         // hubs are shown for orientation; a tap on one sets the location there
         m.on('click:hub', function (e) { if (e && e.hub) setLoc(e.hub.lat, e.hub.lon, 'map'); });
         if (loc) m.leaflet.setView([loc.lat, loc.lon], 10, { animate: false });
+        // the whole island, clear of the "Tap where your platoon is" hint over the bottom edge
+        else m.fitTaiwan({ animate: false, padBottom: tapHint.offsetHeight + 8 });
         draw();
       } catch (e) {
         m = null;
@@ -545,7 +554,7 @@
         preview.appendChild(h('div.psg-unit-name.faint', ord(form.plt) + ' PLT, ' + form.co + ' ' + coWord(form.br) + ', ', h('span.psg-unit-missing', 'battalion'), ' ' + form.br));
       } else {
         preview.appendChild(h('div.hstack.psg-unit-line', sym, h('div.vstack-sm.grow',
-          h('div.psg-unit-name', u.unitName),
+          h('div.psg-unit-name', psg.unitNameParts(u.unitName)),
           h('div.small.muted', 'Designator ', h('span.mono', u.designator)))));
       }
       if (showErrors && !unitValid()) {
@@ -708,21 +717,20 @@
       }
       this.mode = 'summary';
       const p = state.profile;
-      const mob = psg.mobilityInfo(state, p.mobility);
       const sym = symbolSvg(p, 34);
       el.appendChild(h('div.psg-head', h('h2.psg-title', 'Unit'), h('p.muted', 'Saved on this device. Requests use this unit and location.')));
       el.appendChild(h('div.card.psg-unit-card',
         h('div.hstack.psg-unit-line', sym, h('div.vstack-sm.grow',
-          h('div.psg-unit-name.psg-unit-name-lg', p.unitName || 'Unit'),
+          h('div.psg-unit-name.psg-unit-name-lg', p.unitName ? psg.unitNameParts(p.unitName) : 'Unit'),
           h('div.small.muted', 'Designator ', h('span.mono', p.designator || psg.designator(p.unitName))))),
         h('div.divider'),
         h('dl.kv.psg-kv',
-          h('dt', 'Grid'), h('dd', h('span.mono.psg-mgrs', psg.mgrs(p.lat, p.lon) || 'Not set'), h('div.small.muted', psg.nearText(p.lat, p.lon))),
-          h('dt', 'Moving'), h('dd', h('strong', mob.label), h('div.small.muted', mob.sub))),
+          h('dt', 'Grid'), h('dd', h('span.mono.psg-mgrs', psg.mgrs(p.lat, p.lon) || 'Not set'), h('div.small.muted', psg.nearText(p.lat, p.lon)))),
         h('div.psg-card-actions',
           h('button.btn.btn-secondary.btn-block.psg-update-loc', { type: 'button', onClick: function () { psg.openLocationSheet(ctx); } }, icon('pin'), 'Update my location'))));
+      // how the platoon moves shows once, as the choice itself (selected = current)
       el.appendChild(h('section.psg-section',
-        h('h3.psg-sec-title', 'Change how you move'),
+        h('h3.psg-sec-title', 'How you move'),
         psg.choiceGroup({
           label: 'Mobility', name: 'mobility', value: p.mobility,
           options: psg.mobilityModes(state).map(function (mo) { return { value: mo.id, title: mo.label, sub: mo.sub }; }),

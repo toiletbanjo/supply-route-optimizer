@@ -660,6 +660,10 @@
     if (meta && meta.getAttribute('content') !== THEME_META[t].color) meta.setAttribute('content', THEME_META[t].color);
     if (html.getAttribute('data-theme') === t) return;
     html.setAttribute('data-theme', t);
+    // inline 2525 symbols (unit strip, unit card, legends) are drawn per theme: at night the frame is
+    // a dim outline, not the friendly fill filtered to red (red reads as hostile)
+    const S = ui.symbols;
+    if (S && S.refreshInline) { try { S.refreshInline(doc.body, t); } catch (e) { /* keep the old drawings */ } }
     emit('theme', t);
   }
 

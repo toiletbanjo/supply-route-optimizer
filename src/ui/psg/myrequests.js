@@ -2,14 +2,19 @@
 // movement"; DESIGN.md sections 3, 8 and 8b). One card per request made on this device: status,
 // urgency, lines, NLT; Edit and Cancel until the plan is approved. Once approved: pickup point (name +
 // MGRS) or "Direct to your location", ETA (24 h), truck callsign, frequency and color, "N stops before
-// yours", a live line ("Alpha-2: 2 stops before yours. ETA 2000") and a compact map with the truck
-// moving along its real road route on the demo clock, the pickup point, the platoon and its line to
-// the pickup. Delayed: "Not in this window - next plan at HHMM" with the reason in plain words.
-// "Updated" with what changed ("Pickup moved to X. ETA now 1430.", from request.updatedChange) when an
-// approved re-plan moved or retimed any of its stops, carried more of it to the next window or brought
-// it back; it stays until seen: the note on screen for seenDwellMs (4 s) or a tap on the card
-// dispatches request/seen. Partial: "40 of 60 ... ; 20 more next window" from byRequest qtyByLine /
-// deferredQty. Empty state points to New request.
+// yours" and which ones ("1 Fengyuan 0853 · 2 Direct 1032 · 3 You 1128"), a live line ("Alpha-2: 2 stops
+// before yours. ETA 2000") and a compact map with the truck moving along its real road route on the
+// demo clock, the pickup point, the platoon and its line to the pickup, closed areas, and a one-line
+// key. The map fits the hub, this stop, the platoon and the truck (the whole route stays drawn), and
+// fits again when the truck leaves the view, until the platoon sergeant moves the map.
+// Delayed: "Not in this window - next plan at HHMM" with the reason in plain words.
+// "Updated" with what changed ("Pickup moved to X. ETA 1300 → 1430.", from request.updatedChange) when
+// an approved re-plan moved or retimed any of its stops, carried more of it to the next window or
+// brought it back; it stays until the platoon sergeant taps the card (or "Got it"), which dispatches
+// request/seen, or until a later plan replaces the one that changed it. Partial: "40 of 60 ... ; 20
+// more next window" from byRequest qtyByLine / deferredQty. Empty state points to New request.
+// Open requests sort by what needs attention: delayed, partial, updated, en route, approved, planned,
+// submitted (an updated card keeps its place once seen until the tab is left or a new plan arrives).
 //
 // Plan data: plan.byRequest[requestId] = { truckId, stopSeq, nodeKind, gridId, lat, lon, label, eta,
 // qtyByLine, deferredQty, stopsBefore } (DESIGN.md 8b; an array of these is accepted for split
@@ -31,6 +36,8 @@
 
   const ACTIVE = ['en_route', 'approved', 'partial', 'delayed', 'planned', 'submitted'];
   const TRACKED = ['approved', 'en_route', 'partial'];
+  // list order: what needs the platoon sergeant first (an updated, tracked request ranks 2)
+  const RANK = { delayed: 0, partial: 1, en_route: 3, approved: 4, planned: 5, submitted: 6 };
   const DEFER_REASON = {
     capacity: 'All trucks were full this window.',
     time: 'No truck could reach you in time this window.',
@@ -118,6 +125,17 @@
     return { plan: plan, entries: entries, deferred: deferred };
   }
   psg.planInfo = planInfo;
+
+  // 'Updated' shows until seen, or until a later plan replaces the one that changed the request (the
+  // store keeps the flag until request/seen).
+  function updatedShown(r, info) {
+    if (!r || !r.updated || r.status === 'cancelled' || r.status === 'delivered') return false;
+    const pid = r.updatedChange && r.updatedChange.planId;
+    return !pid || !info || !info.plan || info.plan.id === pid;
+  }
+  psg.updatedShown = function (state, r) {
+    return updatedShown(r, r && r.updated ? planInfo(state, r) : null);
+  };
 
   function gridPoint(id) { return (SRO.data.grid || []).find(function (g) { return g.id === id; }) || null; }
   function pickupName(e) {
@@ -286,7 +304,7 @@
       bits.push('Pickup ' + where(c) + ', ETA ' + psg.time(c.eta, now));
     }
     if (c.pickupMoved) bits.push(c.nodeKind === 'direct' ? 'Now delivered direct to your location' : 'Pickup moved to ' + pickupName(c));
-    if (c.etaChanged) bits.push('ETA now ' + psg.time(c.eta, now));
+    if (c.etaChanged) bits.push(isNum(c.prevEta) ? 'ETA ' + psg.time(c.prevEta, now) + ' \u2192 ' + psg.time(c.eta, now) : 'ETA now ' + psg.time(c.eta, now));
     if (c.truckChanged) bits.push('Truck now ' + c.truckId);
     (c.others || []).forEach(function (o) {
       bits.push((ORDINAL[o.order] || 'Another') + ' delivery (' + o.truckId + ') now ' + where(o) + ', ETA ' + psg.time(o.eta, now));
@@ -306,7 +324,7 @@
       const mine = psg.userRequests(state);
       const open = mine.filter(function (r) { return ACTIVE.indexOf(r.status) >= 0; });
       if (!open.length) return null;
-      const alert = mine.some(function (r) { return r.status === 'delayed' || (r.updated && TRACKED.indexOf(r.status) >= 0); });
+      const alert = mine.some(function (r) { return r.status === 'delayed' || (r.updated && TRACKED.indexOf(r.status) >= 0 && psg.updatedShown(state, r)); });
       return { text: String(open.length), alert: alert };
     },
     mount: function (el, ctx) {
@@ -320,23 +338,18 @@
       el.append(this.head, this.list);
       const self = this;
       this.offTheme = ui.on ? ui.on('theme', function () { self.recolor(); }) : null;
-      this.seenTimers = {};
-      // 'Updated' notes on screen for a moment count as seen (hidden tabs and roles are not on screen)
-      this.seenIo = typeof IntersectionObserver === 'function' ? new IntersectionObserver(function (entries) {
-        entries.forEach(function (en) { self.seenVisible(en.target.getAttribute('data-seen-id'), en.isIntersecting && en.intersectionRatio >= 0.5); });
-      }, { threshold: [0, 0.5, 1] }) : null;
+      // ids sorted as 'updated' since the tab was shown: a card the platoon sergeant has just tapped
+      // (seen) keeps its place instead of jumping down the list
+      this.sticky = {};
     },
     unmount: function () {
       const self = this;
       Object.keys(this.cards || {}).forEach(function (id) { self.dropMap(self.cards[id]); });
-      Object.keys(this.seenTimers || {}).forEach(function (id) { clearTimeout(self.seenTimers[id]); });
-      this.seenTimers = {};
-      if (this.seenIo) this.seenIo.disconnect();
       this.cards = {};
       if (this.offTheme) this.offTheme();
       if (this.offScroll) this.offScroll();
     },
-    onHide: function () { psg.hideScroll(this); },
+    onHide: function () { psg.hideScroll(this); this.sticky = {}; },
     // Show this request's card the next time the tab is shown (after submit or edit).
     reveal: function (id) { this.revealId = id; },
     doReveal: function () {
@@ -380,7 +393,15 @@
             icon('plus'), state.profile ? 'New request' : 'Set up unit')))));
         return;
       }
-      const order = function (r) { const i = ACTIVE.indexOf(r.status); return i < 0 ? 100 : i; };
+      // a new plan starts the order afresh
+      const lp = livePlans(state)[0];
+      if ((lp && lp.id) !== this.stickyPlan) { this.sticky = {}; this.stickyPlan = lp && lp.id; }
+      const sticky = this.sticky;
+      const order = function (r) {
+        if (RANK[r.status] === undefined) return 100;
+        if (TRACKED.indexOf(r.status) >= 0 && RANK[r.status] > 2 && (sticky[r.id] || psg.updatedShown(state, r))) { sticky[r.id] = true; return 2; }
+        return RANK[r.status];
+      };
       const active = mine.filter(function (r) { return ACTIVE.indexOf(r.status) >= 0; })
         .sort(function (a, b) { return order(a) - order(b) || (b.createdAt || 0) - (a.createdAt || 0); });
       const done = mine.filter(function (r) { return ACTIVE.indexOf(r.status) < 0; });
@@ -392,6 +413,8 @@
       done.forEach(function (r) { frag.appendChild(self.card(r, state)); keep[r.id] = true; });
       Object.keys(this.cards).forEach(function (id) { if (!keep[id]) { self.dropMap(self.cards[id]); delete self.cards[id]; } });
       ui.clear(this.list).appendChild(frag);
+      // closed areas on the card maps follow the scenario
+      Object.keys(this.cards).forEach(function (id) { self.mapZones(self.cards[id], state); });
       this.tick(state);
     },
 
@@ -399,51 +422,22 @@
     card: function (r, state) {
       const info = TRACKED.indexOf(r.status) >= 0 || r.status === 'delayed' || r.status === 'delivered' ? planInfo(state, r) : { plan: null, entries: [], deferred: [] };
       const e = info.entries[0] || null;
-      const sig = JSON.stringify([r.status, r.urgency, r.updated, r.updatedChange || null, r.lines, r.nlt, r.deadline, r.eta, r.directOnly, r.desiredPickup, r.remarks, r.cancelledAt, r.deliveredAt,
+      const sig = JSON.stringify([r.status, r.urgency, updatedShown(r, info), r.updatedChange || null, r.lines, r.nlt, r.deadline, r.eta, r.directOnly, r.desiredPickup, r.remarks, r.cancelledAt, r.deliveredAt,
         info.plan && info.plan.id, info.entries.map(function (x) { return [x.truckId, x.stopIdx, x.eta, x.gridId, x.label, x.nodeKind]; }),
-        info.deferred.map(function (d) { return [d.reason, d.detail]; }), state.profile && state.profile.unitName]);
+        info.deferred.map(function (d) { return [d.reason, d.detail]; }), state.profile && state.profile.unitName,
+        !!e && (state.scenario.zones || []).some(function (z) { return z.kind === 'closed'; })]);   // the map key's 'Closed area'
       let c = this.cards[r.id];
       if (c && c.sig === sig) return c.el;
       const mapKey = e && TRACKED.indexOf(r.status) >= 0 && info.plan ? info.plan.id + '|' + e.truckId + '|' + e.stopIdx : null;
       if (c && c.mapKey !== mapKey) this.dropMap(c);
       c = Object.assign(c || {}, { id: r.id, sig: sig, mapKey: mapKey, info: info, entry: e });
       this.cards[r.id] = c;
-      this.unwatchSeen(c);
       c.el = this.renderCard(r, state, c);
-      this.watchSeen(c, r);
       return c.el;
     },
 
-    // ---- 'Updated' until seen: the note on screen for seenDwellMs, or a tap on the card -> request/seen
-    seenDwellMs: 4000,
-    watchSeen: function (c, r) {
-      if (!r.updated || r.status === 'cancelled') return;
-      const target = c.el.querySelector('.psg-change-note') || c.el.querySelector('.psg-updated');
-      if (!target) return;
-      target.setAttribute('data-seen-id', r.id);
-      c.seenTarget = target;
-      if (this.seenIo) this.seenIo.observe(target);
-    },
-    unwatchSeen: function (c) {
-      if (c.seenTarget && this.seenIo) this.seenIo.unobserve(c.seenTarget);
-      c.seenTarget = null;
-      if (this.seenTimers[c.id]) { clearTimeout(this.seenTimers[c.id]); delete this.seenTimers[c.id]; }
-    },
-    seenVisible: function (id, on) {
-      const self = this;
-      if (!id) return;
-      if (!on) { if (this.seenTimers[id]) { clearTimeout(this.seenTimers[id]); delete this.seenTimers[id]; } return; }
-      if (this.seenTimers[id]) return;
-      const wait = function () {
-        self.seenTimers[id] = setTimeout(function () {
-          delete self.seenTimers[id];
-          // a page in a background browser tab is not being read: wait until it is shown again
-          if (document.visibilityState === 'hidden') { wait(); return; }
-          self.markSeen(id);
-        }, self.seenDwellMs);
-      };
-      wait();
-    },
+    // 'Updated' until seen: a tap on the card (or its "Got it") -> request/seen. Never on a timer: a
+    // platoon sergeant who glances away would miss the change.
     markSeen: function (id) {
       if (!this.ctx) return;
       const r = (this.ctx.getState().requests || []).find(function (x) { return x.id === id; });
@@ -456,16 +450,17 @@
       const e = c.entry, info = c.info;
       const urg = r.urgency || r.urgencyRequested || 'Routine';
       const editable = psg.EDITABLE.indexOf(r.status) >= 0;
-      const card = h('article.card.psg-req' + (r.updated && r.status !== 'cancelled' ? '.is-updated' : '') + (r.status === 'cancelled' ? '.is-cancelled' : ''),
+      const upd = updatedShown(r, info);
+      const card = h('article.card.psg-req' + (upd ? '.is-updated' : '') + (r.status === 'cancelled' ? '.is-cancelled' : ''),
         { 'data-id': r.id, 'data-status': r.status, 'data-urgency': urg, 'aria-label': 'Request ' + r.id });
-      if (r.updated && r.status !== 'cancelled') card.addEventListener('click', function () { self.markSeen(r.id); });
+      if (upd) card.addEventListener('click', function () { self.markSeen(r.id); });
       // head
       card.appendChild(h('header.psg-req-head',
         h('div.psg-req-badges',
           h('span.psg-req-id.num', r.id),
           h('span.badge.st-' + r.status, psg.STATUS_LABEL[r.status] || r.status),
           h('span.badge.badge-urgency.urg-' + urg.toLowerCase(), urg),
-          r.updated && r.status !== 'cancelled' ? h('span.badge.badge-warn.psg-updated', icon('refresh'), 'Updated') : null),
+          upd ? h('span.badge.badge-warn.psg-updated', icon('refresh'), 'Updated') : null),
         h('div.psg-req-meta.small.muted.num', 'Sent ' + psg.time(r.createdAt, now) + ' · NLT ' + psg.time(r.nlt, now) +
           (urg === 'Immediate' && isNum(r.deadline) && r.deadline !== r.nlt ? ' · deadline ' + psg.time(r.deadline, now) : ''))));
       // lines
@@ -477,8 +472,9 @@
       card.appendChild(body);
       c.live = null;
       // what a re-plan changed, first thing in the card, until the platoon sergeant has seen it
-      const updNote = r.updated && r.status !== 'cancelled' && r.status !== 'delivered'
-        ? h('div.notice.notice-warn.psg-change-note', { role: 'status' }, icon('refresh'), h('div', h('strong', 'Updated: '), h('span.psg-updated-text', changeText(r, now))))
+      const updNote = upd
+        ? h('div.notice.notice-warn.psg-change-note', { role: 'status' }, icon('refresh'), h('div.grow', h('strong', 'Updated: '), h('span.psg-updated-text', changeText(r, now))),
+          h('button.btn.btn-sm.btn-ghost.psg-seen', { type: 'button', onClick: function (ev) { ev.stopPropagation(); self.markSeen(r.id); } }, 'Got it'))
         : null;
       if (r.status === 'submitted') {
         c.nextEl = h('strong.num', F().time24(psg.nextPlanAt(now)));
@@ -548,22 +544,59 @@
         h('span.psg-freq', h('span.caps', 'Freq'), ' ', h('span.num', truck.freq || 'n/a')));
       const before = isNum(e.stopsBefore) ? e.stopsBefore : Math.max(0, e.stopIdx);
       const stopsEl = h('div.psg-stops-before', icon('route'), h('span', before === 0 ? 'First stop: no stops before yours' : plural(before, 'stop') + ' before yours'));
+      const stopList = before > 0 ? this.stopList(c, e, now) : null;
       const also = this.alsoList(r, state, c, now);
       c.live = h('div.psg-live', { 'aria-live': 'polite' });
       c.bar = h('div.progress-bar');
       c.callsign = truck.id;
       c.hubName = hub ? hub.name : '';
       body.append(top, truckRow, stopsEl);
+      if (stopList) body.appendChild(stopList);
       if (also) body.appendChild(also);
       body.append(c.live, h('div.progress.psg-progress', { role: 'presentation' }, c.bar));
       // map
       if (!c.mapHost) {
-        c.mapHost = h('div.psg-map.psg-map-track', { role: 'region', 'aria-label': 'Map: truck ' + truck.id + ' route, your pickup point and your location' });
+        c.mapHost = h('div.psg-map.psg-map-track', { role: 'region', 'aria-label': 'Map: truck ' + truck.id + ' route, your stop, your pickup point and your location' });
       }
       body.appendChild(h('div.psg-map-wrap', c.mapHost));
+      body.appendChild(this.mapKeyLine(r, e, truck, color, hub, state));
       // the map is made once the card is on screen with a size (cards are built detached, and the
       // tab or the whole platoon sergeant column may be hidden when a plan is approved)
       if (!c.map && !c.mapWait) c.mapWait = psg.whenSized(c.mapHost, function () { c.mapWait = null; self.buildMap(c, r, plan, e, color, line); });
+    },
+
+    // Which stops come before theirs, in order, with arrival times (spec-answers: "the delivery schedule
+    // (which stops come before theirs)"): '1 Fengyuan 0853 · 2 Direct 1032 · 3 You 1128'. Other
+    // platoons' stops are named by the place only, a direct delivery as "Direct".
+    stopList: function (c, e, now) {
+      const stops = (e.route && e.route.stops) || [];
+      if (!(e.stopIdx > 0) || e.stopIdx >= stops.length) return null;
+      const mine = {};
+      (c.info.entries || []).forEach(function (x) { if (x.truckId === e.truckId && x.stopIdx >= 0) mine[x.stopIdx] = true; });
+      mine[e.stopIdx] = true;
+      c.stopItems = [];
+      return h('ol.psg-stop-list', { 'aria-label': 'Stops in order, with arrival times' }, stops.slice(0, e.stopIdx + 1).map(function (s, i) {
+        const you = !!mine[i];
+        const g = s.kind === 'direct' ? null : gridPoint(s.gridId);
+        const name = you ? 'You' : s.kind === 'direct' ? 'Direct' : (g ? psg.placeName(g) : String(s.label || '').replace(/\s*\(.*\)\s*$/, '')) || 'Drop point';
+        const li = h('li' + (you ? '.is-you' : ''), h('span.psg-stop-n.num', String(i + 1)), h('span.psg-stop-name', name), h('span.psg-stop-t.num', psg.time(s.arrive, now)));
+        if (!you) c.stopItems.push({ el: li, stop: s });
+        return li;
+      }));
+    },
+
+    // One-line key under the card map: your stop badge, you, the hub, the truck's route, closed areas.
+    mapKeyLine: function (r, e, truck, color, hub, state) {
+      const S = ui.symbols;
+      const sym = function (sidc) { try { const sp = h('span.psg-key-sym', { 'aria-hidden': 'true' }); sp.innerHTML = S.svg(sidc, { size: 13, infoFields: false }); return sp; } catch (err) { return null; } };
+      const fg = S && S.textOn ? S.textOn(color) : '#fff';
+      const closed = (state.scenario.zones || []).some(function (z) { return z.kind === 'closed'; });
+      return h('div.psg-map-key.small', { 'aria-hidden': 'true' },
+        h('span.psg-key-item', h('span.psg-key-stop.num', { style: { '--truck': color, '--truck-fg': fg } }, String(e.stopIdx + 1)), 'Your stop'),
+        h('span.psg-key-item', S ? sym(S.platoonSidc(r)) : null, 'You'),
+        hub ? h('span.psg-key-item', S ? sym(S.SIDC.hub) : null, hub.name) : null,
+        h('span.psg-key-item', h('span.truck-line', { style: { '--truck': color } }), truck.id + ' route'),
+        closed ? h('span.psg-key-item', h('span.psg-key-zone'), 'Closed area') : null);
     },
 
     // A delivery split over more than one stop or truck: the other parts, one line each
@@ -596,33 +629,57 @@
       c.geom = geom;
       const truck = geom.truck || {};
       const stops = e.route.stops || [];
-      if (geom.hub) m.setHubs([geom.hub]);
+      const mine = {};
+      (c.info.entries || []).forEach(function (x) { if (x.truckId === e.truckId && x.stopIdx >= 0) mine[x.stopIdx] = true; });
+      mine[e.stopIdx] = true;
+      // small map: no hub or designator text (the key under the map names them), the other stops as dots
+      if (geom.hub) m.setHubs([geom.hub], { labels: false });
+      c.zonesRef = undefined;
+      this.mapZones(c, state);
       m.setRoutes([{
         truckId: e.truckId, color: color, label: e.truckId,
         legs: geom.legs.map(function (L) { return { coords: L.coords }; }),
-        stops: stops.map(function (s, i) { return { lat: s.lat, lon: s.lon, seq: i + 1 }; })
-      }], { highlightTruckId: e.truckId });
+        stops: stops.map(function (s, i) { return { lat: s.lat, lon: s.lon, seq: i + 1, mine: !!mine[i] }; })
+      }], { highlightTruckId: e.truckId, stopLabels: 'mine' });
       if (e.nodeKind !== 'direct') {
         const radius = r.mobility === 'dismounted' && isNum(r.maxTravelMi) ? r.maxTravelMi : 0;
         m.setRally([{ id: e.gridId || 'pickup', gridId: e.gridId, lat: e.lat, lon: e.lon, label: String(e.label || '').length <= 3 ? e.label : '', name: pickupName(e), used: true, walkRingMi: radius }]);
       }
-      m.setPlatoons([{ id: r.id, lat: r.lat, lon: r.lon, unitName: r.unitName, designator: r.designator, mobility: r.mobility, urgency: r.urgency || r.urgencyRequested, directOnly: r.directOnly }]);
+      // the platoon symbol is drawn beside its pickup point (or its own stop, direct) when it would cover it
+      m.setPlatoons([{ id: r.id, lat: r.lat, lon: r.lon, unitName: r.unitName, designator: r.designator, mobility: r.mobility, urgency: r.urgency || r.urgencyRequested, directOnly: r.directOnly }],
+        { labels: false, clearOf: [{ lat: e.lat, lon: e.lon, rally: e.nodeKind !== 'direct' }] });
       if (line && root.L) {
         c.line = root.L.polyline(line.coords, { pane: 'sro-routes', color: lineColor(), weight: 3, opacity: 0.95, dashArray: line.mode === 'walk' ? '1 7' : '6 6', lineCap: 'round', interactive: false }).addTo(m.leaflet);
       }
       c.truckData = { id: e.truckId, color: color, type: truck.type, label: SRO.ui.symbols && SRO.ui.symbols.shortCallsign ? SRO.ui.symbols.shortCallsign(e.truckId) : e.truckId };
-      const pts = [];
-      geom.legs.forEach(function (L) { (L.coords || []).forEach(function (p) { pts.push(p); }); });
-      pts.push([r.lat, r.lon]);
-      c.fitPts = pts;
-      this.fitCard(c);
+      // a truck waiting at its hub is drawn beside the hub symbol, on the side away from the platoon
+      c.truckOpts = geom.hub ? { clearOf: [geom.hub, { lat: r.lat, lon: r.lon }] } : {};
+      // fit: hub, this stop, the platoon (and the truck, added when it is placed)
+      c.fitPts = [[e.lat, e.lon], [r.lat, r.lon]];
+      if (geom.hub) c.fitPts.push([geom.hub.lat, geom.hub.lon]);
+      // once the platoon sergeant zooms or pans, the map stays where they put it
+      c.userView = false;
+      ['pointerdown', 'wheel', 'keydown'].forEach(function (t) { c.mapHost.addEventListener(t, function () { c.userView = true; }, { passive: true }); });
       this.moveTruck(c, state.clock.simMin);
+      this.fitCard(c);
     },
     fitCard: function (c) {
       if (!c.map || !c.fitPts || !c.fitPts.length) return;
       const s = c.map.leaflet.getSize();
       if (!s.x || !s.y) return;
-      c.map.fitTo(c.fitPts, { maxZoom: 12, padding: [18, 18], animate: false });
+      const pts = c.fitPts.slice();
+      if (c.pos) pts.push([c.pos.lat, c.pos.lon]);
+      // room for the symbols on the points, below them for the truck's callsign chip and above them
+      // for a drop point symbol (it stands on its point)
+      c.map.fitTo(pts, { maxZoom: 12, padding: [14, 14], clearControls: true, iconPad: 30, padBottom: 12, padTop: 12, animate: false });
+    },
+    // closed areas on a card map (they explain an 'Updated' new route)
+    mapZones: function (c, state) {
+      if (!c || !c.map) return;
+      const zones = state.scenario.zones;
+      if (c.zonesRef === zones) return;
+      c.zonesRef = zones;
+      c.map.setZones((zones || []).filter(function (z) { return z.kind === 'closed'; }));
     },
     dropMap: function (c) {
       if (c && c.mapWait) { c.mapWait(); c.mapWait = null; }
@@ -639,8 +696,15 @@
       if (!c.map || !c.geom || !c.geom.legs.length) return null;
       const pos = ui.map.truckPosition({ legs: c.geom.legs }, simMin);
       if (!pos) return null;
-      c.map.setTrucks([Object.assign({}, c.truckData, { lat: pos.lat, lon: pos.lon, heading: pos.status === 'en-route' ? pos.heading : null, status: pos.status })]);
+      c.map.setTrucks([Object.assign({}, c.truckData, { lat: pos.lat, lon: pos.lon, heading: pos.status === 'en-route' ? pos.heading : null, status: pos.status })], c.truckOpts);
       c.pos = pos;
+      // the truck left the view: fit again with it (not once the platoon sergeant has moved the map)
+      if (!c.userView && c.fitPts) {
+        try {
+          const lm = c.map.leaflet, pt = lm.latLngToContainerPoint([pos.lat, pos.lon]), sz = lm.getSize();
+          if (sz.x && sz.y && (pt.x < 12 || pt.y < 12 || pt.x > sz.x - 12 || pt.y > sz.y - 24)) this.fitCard(c);
+        } catch (err) { /* map not laid out yet */ }
+      }
       return pos;
     },
 
@@ -657,6 +721,10 @@
         const e = c.entry;
         const txt = liveText(now, e, c.callsign, c.hubName);
         if (c.live.textContent !== txt) c.live.textContent = txt;
+        (c.stopItems || []).forEach(function (it) {
+          const done = now >= (isNum(it.stop.depart) ? it.stop.depart : it.stop.arrive);
+          if (it.el.classList.contains('is-done') !== done) it.el.classList.toggle('is-done', done);
+        });
         const dep = e.route && isNum(e.route.depart) ? e.route.depart : null;
         const frac = dep === null || !isNum(e.eta) || e.eta <= dep ? (now >= e.eta ? 1 : 0) : Math.max(0, Math.min(1, (sim - dep) / (e.eta - dep)));
         const w = (frac * 100).toFixed(1) + '%';

@@ -535,7 +535,8 @@ async function reviewChecks(browser, base, allBags) {
     const lr = await page.evaluate(() => {
       const mapW = document.getElementById('map').clientWidth;
       const zl = Array.from(document.querySelectorAll('#map .sro-zone-label')).map((e) => Math.round(e.getBoundingClientRect().width));
-      const hubTxt = Array.from(new Set(Array.from(document.querySelectorAll('#map .sro-icon-hub svg text')).map((t) => t.textContent).filter((t) => /FORWARD/.test(t))));   // milsymbol draws field text twice (outline + fill)
+      // hub names draw in their own pane above the platoon symbols (.sro-icon-hublabel); milsymbol draws field text twice (outline + fill)
+      const hubTxt = Array.from(new Set(Array.from(document.querySelectorAll('#map .sro-icon-hublabel svg text')).map((t) => t.textContent).filter((t) => /FORWARD/.test(t))));
       const pltTxt = Array.from(new Set(Array.from(document.querySelectorAll('#map .sro-icon-platoon svg text')).map((t) => t.textContent).filter((t) => /^HHC/.test(t))));
       const tl = Array.from(document.querySelectorAll('#map .sro-truck-label')).map((e) => Math.round(e.getBoundingClientRect().width));
       return { mapW, zl, hubTxt, pltTxt, tlMax: Math.max.apply(null, tl), sw: document.documentElement.scrollWidth };
@@ -561,6 +562,50 @@ async function reviewChecks(browser, base, allBags) {
     });
     check('mini map: route framed above the attribution, attribution opaque', fr.maxY < fr.attrTop - 8 && fr.minY > fr.mapTop + 8 && !/rgba\(.*,\s*0?\.\d+\)$/.test(fr.bg), fr);
     await page.screenshot({ path: path.join(OUT, 'phone-320-mini-dark.png') });
+
+    // R7. PSG card map (psg-lint 1): own stop badge above the drop point symbols, other stops as dots,
+    // no hub or designator text, the platoon drawn beside a pickup it would cover (leader line), the
+    // truck beside its hub, and the fitted points clear of the zoom buttons and the attribution
+    const card = await page.evaluate(() => {
+      const r = H.routes.find((x) => x.truckId === 'Alpha-2'), m = H.map, lm = m.leaflet;
+      const hub = H.hubs.find((x) => x.gridId === 'G-GRANITE') || H.hubs[0];
+      const own = r.stops[1];
+      m.setZones([]);
+      m.setHubs([hub], { labels: false });
+      m.setRally([{ id: 'own', lat: own.lat, lon: own.lon, used: true }]);
+      m.setRoutes([Object.assign({}, r, { stops: r.stops.map((s, i) => Object.assign({}, s, { mine: i === 1 })) })], { highlightTruckId: 'Alpha-2', stopLabels: 'mine' });
+      const plt = Object.assign({}, H.platoons[1], { lat: own.lat + 0.002, lon: own.lon + 0.002 });
+      m.setPlatoons([plt], { labels: false, clearOf: [{ lat: own.lat, lon: own.lon, rally: true }] });
+      m.setTrucks([{ id: 'Alpha-2', color: r.color, type: 'cargo', lat: hub.lat, lon: hub.lon }], { clearOf: [hub] });
+      m.fitTo([own, plt, hub], { maxZoom: 12, padding: [14, 14], clearControls: true, iconPad: 30 });
+      const mapR = document.getElementById('map').getBoundingClientRect();
+      const at = (p) => { const q = lm.latLngToContainerPoint([p.lat, p.lon]); return { x: mapR.left + q.x, y: mapR.top + q.y }; };
+      const mine = document.querySelectorAll('#map .sro-stop-mine'), dots = document.querySelectorAll('#map .sro-stop-dot');
+      const ring = document.querySelector('#map .sro-icon-platoon .sro-ring').getBoundingClientRect();
+      const tr = document.querySelector('#map .sro-truck-ring').getBoundingClientRect();
+      const ps = document.querySelector('#map .sro-icon-platoon svg:not(.sro-leader)').getBoundingClientRect(), rs = document.querySelector('#map .sro-icon-rally svg').getBoundingClientRect();
+      const pltOverRally = ps.left < rs.right - 2 && rs.left < ps.right - 2 && ps.top < rs.bottom - 2 && rs.top < ps.bottom - 2;
+      const zc = document.querySelector('#map .leaflet-control-zoom').getBoundingClientRect(), attr = document.querySelector('#map .leaflet-control-attribution').getBoundingClientRect();
+      const pts = [own, plt, hub].map(at), o = at(own), hb = at(hub);
+      const pc = { x: ring.left + ring.width / 2, y: ring.top + ring.height / 2 }, tc = { x: tr.left + tr.width / 2, y: tr.top + tr.height / 2 };
+      const pane = (n) => +getComputedStyle(document.querySelector('#map .sro-pane-' + n)).zIndex;
+      return {
+        mine: mine.length, mineText: mine[0] && mine[0].textContent, minePane: !!(mine[0] && mine[0].closest('.sro-pane-mystop')), dots: dots.length, dotText: Array.from(dots).map((d) => d.textContent).join(''),
+        paneOrder: pane('mystop') > pane('rally') && pane('mystop') > pane('hubs') && pane('hublabels') > pane('platoons'),
+        hubLabels: document.querySelectorAll('#map .sro-icon-hublabel').length, hubText: document.querySelectorAll('#map .sro-icon-hub svg text').length,
+        pltText: document.querySelectorAll('#map .sro-icon-platoon svg text').length, leader: document.querySelectorAll('#map .sro-icon-platoon .sro-leader').length,
+        pltGap: Math.round(Math.hypot(pc.x - o.x, pc.y - o.y)), pltOverRally, truckGap: Math.round(Math.hypot(tc.x - hb.x, tc.y - hb.y)),
+        clearOfZoom: pts.every((p) => p.x > zc.right + 20), aboveAttr: pts.every((p) => p.y < attr.top - 20), inside: pts.every((p) => p.x < mapR.right - 20 && p.y > mapR.top + 20)
+      };
+    });
+    check('card map: own stop badge (2) in its pane above the drop point and hub symbols; other stops as dots without numbers', card.mine === 1 && card.mineText === '2' && card.minePane && card.dots === 1 && card.dotText === '' && card.paneOrder, card);
+    check('card map: no hub name or designator text (labels: false)', card.hubLabels === 0 && card.hubText === 0 && card.pltText === 0, card);
+    check('card map: platoon beside the pickup it would cover (leader line), truck beside its hub', card.leader === 1 && card.pltGap >= 30 && !card.pltOverRally && card.truckGap >= 30, card);
+    check('card map: fitted points clear of the zoom buttons and above the attribution', card.clearOfZoom && card.aboveAttr && card.inside, card);
+    // hub names come back (in the hub-label pane) once labels are allowed again
+    const named = await page.evaluate(() => { H.map.setHubs(H.hubs, {}); H.map.leaflet.setZoom(10, { animate: false }); return document.querySelectorAll('#map .sro-pane-hublabels .sro-icon-hublabel').length; });
+    check('hub names draw in the hub-label pane when shown', named >= 1, named);
+    await page.screenshot({ path: path.join(OUT, 'phone-320-card-map-dark.png') });
     await ctx.close();
   }
 }
@@ -1022,13 +1067,17 @@ async function main() {
         const ic = S.platoon(H.platoons[0], { urgency: 'Urgent' }), sy = new ms.Symbol(S.platoonSidc(H.platoons[0]), { size: 24, uniqueDesignation: H.platoons[0].designator, fontfamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif', simpleStatusModifier: true, colorMode: 'Light', infoColor: '#e8ecef', infoOutlineColor: '#0b1014', infoOutlineWidth: 5, outlineColor: '#0b1014', outlineWidth: 0 });
         const a = sy.getAnchor();
         return { out, cached: before === after, icons, hubs, rally, trucks, imm, anchorOk: Math.abs(ic.options.iconAnchor[0] - a.x) < 1e-9 && Math.abs(ic.options.iconAnchor[1] - a.y) < 1e-9,
-          mech: S.platoonSidc({ mobility: 'mounted', designator: '1/A/5-86AR' }), mot: S.platoonSidc({ mobility: 'mounted', designator: '1/B/3-21IN' }), dis: S.platoonSidc({ mobility: 'dismounted' }), fix: S.platoonSidc({ mobility: 'fixed' }) };
+          mech: S.platoonSidc({ mobility: 'mounted', vehicle: 'tracked', designator: '1/B/3-21IN' }), mot: S.platoonSidc({ mobility: 'mounted', designator: '1/B/3-21IN' }), dis: S.platoonSidc({ mobility: 'dismounted' }), fix: S.platoonSidc({ mobility: 'fixed' }),
+          arm: S.platoonSidc({ mobility: 'mounted', designator: '1/A/5-86AR' }), cav: S.platoonSidc({ mobility: 'dismounted', unitName: '2nd PLT, B TRP, 4-98 CAV' }),
+          eng: S.platoonSidc({ mobility: 'mounted', designator: '3/C/2-12EN' }), fa: S.platoonSidc({ mobility: 'mounted', designator: '1/A/3-20FA' }) };
       });
       check('every SIDC valid and renders', Object.values(sym.out).every((x) => x.valid && x.svg), sym.out);
       check('SVG cache hit on repeat render', sym.cached);
       check('icons on map: 8 platoons, 4 hubs, 8 rally, 4 trucks, Immediate ring', sym.icons === 8 && sym.hubs === 4 && sym.rally === 8 && sym.trucks === 4 && sym.imm >= 1, sym);
       check('platoon iconAnchor = milsymbol getAnchor()', sym.anchorOk);
       check('platoon SIDC by mobility', sym.mech === '10031000141211020000' && sym.mot === '10031000141211040000' && sym.dis === '10031000141211000000' && sym.fix === '10031000141211000000', sym);
+      // the branch at the end of the designator picks the 2525D entity (armor, reconnaissance, engineer, field artillery)
+      check('platoon SIDC by branch', sym.arm === '10031000141205000000' && sym.cav === '10031000141213000000' && sym.eng === '10031000141407000000' && sym.fa === '10031000141303000000', sym);
 
       // route FOB Granite -> Base Lotus follows roads
       const rt = await page.evaluate(() => {
@@ -1157,6 +1206,22 @@ async function main() {
       });
       check('night theme recolors map (coast, casing, zones, background)', night.attr === 'night' && night.coastFill === '#0d0404' && night.casing === '#000000' && night.zoneStroke === '#c0302a' && night.bg === 'rgb(0, 0, 0)', night);
       check('night symbols drawn in dim red, no white', night.red && !night.whiteInSymbols, night);
+      // inline symbols (unit strip, unit card, card map key) are drawn again in the night style: an
+      // unfilled dim red frame, not the friendly blue fill filtered to red (red fill reads as hostile)
+      const inl = await page.evaluate(() => {
+        const S = SRO.ui.symbols;
+        const host = document.createElement('div');
+        host.innerHTML = S.svg(S.SIDC.mechanized, { size: 24, theme: 'dark' }) + S.svg(S.SIDC.armor, { size: 24, theme: 'dark' });
+        document.body.appendChild(host);
+        const fills = () => [...host.querySelectorAll('svg [fill]')].map((e) => e.getAttribute('fill').toLowerCase()).filter((f) => f !== 'none' && f !== 'transparent' && f !== '#000000' && f !== 'black');
+        const before = fills();
+        const n = S.refreshInline(host, 'night');
+        const after = fills();
+        const red = /#c23a32/i.test(host.innerHTML);
+        host.remove();
+        return { n, before: [...new Set(before)], after: [...new Set(after)], red };
+      });
+      check('inline symbols redrawn for night: dim red outline, no fill', inl.n === 2 && inl.before.length > 0 && inl.red && inl.after.every((f) => /#c23a32|#b8342d/.test(f)), inl);
       await page.screenshot({ path: path.join(OUT, 'desktop-night-offline.png') });
       await page.evaluate(() => { H.map.setTheme('light'); });
       await page.screenshot({ path: path.join(OUT, 'desktop-light-offline.png') });
