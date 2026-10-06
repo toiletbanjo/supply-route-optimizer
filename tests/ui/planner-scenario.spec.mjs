@@ -525,6 +525,15 @@ async function runCombo(browser, url, vp, theme, seed) {
         return { reasons: b && b.getAttribute('data-reasons'), review: rv ? rv.textContent.trim() : null, reviewPrimary: !!rv && rv.classList.contains('btn-primary'), again: rp ? rp.textContent.trim() : null, againPrimary: !!rp && rp.classList.contains('btn-primary') };
       });
       check(btns.review === 'Review re-plan' && btns.reviewPrimary && btns.again === 'Re-plan again' && !btns.againPrimary, 'banner offers Review re-plan as the main action for the stored draft, Re-plan again second', btns);
+      // the drop point counter says which plan it counts, and adds the re-plan under review when that
+      // uses a different number
+      await showScenario(page, 'rally');
+      const rc = await page.evaluate(({ a, b }) => {
+        const s = SRO.app.store.getState(), n = (p) => (p.windowStats && typeof p.windowStats.rallyPoints === 'number' ? p.windowStats.rallyPoints : (p.rallyPoints || []).length);
+        return { text: (document.querySelector('[data-testid="rally-counts"]') || {}).textContent || '', approved: n(s.plans.find((p) => p.id === a)), draft: n(s.plans.find((p) => p.id === b)), max: s.scenario.settings.maxRallyPoints };
+      }, { a: parent, b: replanId });
+      check(rc.text.indexOf(rc.approved + ' of ' + rc.max + ' used this window (approved plan)') >= 0, 'the drop point counter names the approved plan it counts', rc);
+      check(rc.draft === rc.approved ? !/in draft/.test(rc.text) : rc.text.indexOf('; ' + rc.draft + ' in draft ' + replanId) >= 0, 'the drop point counter adds the re-plan under review when its count differs', rc);
       await page.evaluate((id) => SRO.app.store.dispatch({ type: 'truck/markAvailable', truckId: id }), outTruck);
     });
   }

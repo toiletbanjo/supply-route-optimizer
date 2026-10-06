@@ -70,7 +70,8 @@
     const st = statusOf(p);
     // a stopped plan's name already says '(stopped)'
     const lab = st.key === 'cancelled' && /stopped/i.test(p.name || '') ? 'draft' : st.label.toLowerCase();
-    return (withId ? p.id + ' · ' : '') + (p.name || p.id) + ' · ' + (p.cost && k.isNum(p.cost.total) ? k.num(p.cost.total, 0) + ' pts' : 'no cost') + ' · ' + lab;
+    // the id last: a closed select cut short still shows the name, cost and status
+    return (p.name || p.id) + ' · ' + (p.cost && k.isNum(p.cost.total) ? k.num(p.cost.total, 0) + ' pts' : 'no cost') + ' · ' + lab + (withId ? ' · ' + p.id : '');
   }
   function stableKey(o) { try { return JSON.stringify(o); } catch (e) { return String(Math.random()); } }
   function openCount(state) {
@@ -92,7 +93,10 @@
       : plan.stopReason === 'error' ? 'error' : 'unknown';
     return { stopReason: sr, gap: g, dualBound: null, gapTarget: plan.params && k.isNum(plan.params.mipGap) ? plan.params.mipGap : null, exactModel: null };
   }
-  function pctText(g) { return g > 0 && g < 0.0005 ? 'under 0.1%' : (g * 100).toFixed(1) + '%'; }
+  // a proven gap as an upper bound ('within 0.1%' for anything smaller); a gap target with the
+  // decimals it was set with (0.01%)
+  function pctText(g) { return g > 0 && g < 0.0005 ? '0.1%' : (g * 100).toFixed(1) + '%'; }
+  function targetText(g) { return (+(g * 100).toFixed(2)) + '%'; }
   // One plain sentence (plus a caveat) for the notice under the plan name. The gap is measured against
   // the exact model's bound (the lowest cost the model could still prove possible), not against every
   // possible plan, and the model is exact only when there is one time-of-day period.
@@ -103,9 +107,11 @@
     const within = g !== null ? h('span', ' proven within ', h('strong.num', pctText(g)), ' of the exact model\'s bound.') : null;
     let lead;
     if (pr.stopReason === 'optimal') lead = h('span', 'Exact (MIP) proved this is the best plan its model can make (gap ', h('strong.num', '0%'), ').');
-    else if (pr.stopReason === 'gap') lead = h('span', 'Exact (MIP) stopped at your gap target' + (k.isNum(pr.gapTarget) ? ' of ' + pctText(pr.gapTarget) : '') + ':', within);
+    else if (pr.stopReason === 'gap') lead = h('span', 'Exact (MIP) stopped at your gap target' + (k.isNum(pr.gapTarget) ? ' of ' + targetText(pr.gapTarget) : '') + ':', within);
     else if (pr.stopReason === 'time') lead = within ? h('span', 'Exact (MIP) reached its time limit:', within) : h('span', 'Exact (MIP) reached its time limit before it could prove a gap.');
-    else if (pr.stopReason === 'cancel') lead = within ? h('span', 'Exact (MIP) was stopped with Cancel:', within) : h('span', 'Exact (MIP) was stopped with Cancel before it could prove a gap.');
+    // Cancel stops the solver worker, so a cancelled run keeps the plan but no proven gap (whatever the
+    // progress line showed while it ran)
+    else if (pr.stopReason === 'cancel') lead = within ? h('span', 'Exact (MIP) was stopped with Cancel:', within) : h('span', 'Exact (MIP) was stopped with Cancel, so this plan carries no proven gap.');
     else if (pr.stopReason === 'unknown') lead = within ? h('span', 'Exact (MIP):', within) : h('span', 'Exact (MIP) did not record what it proved for this plan.');
     else lead = h('span', 'Exact (MIP) hit a solver error, so this is the starting plan it was given; no gap is proven.');
     const notes = [];
@@ -642,6 +648,34 @@
         { label: 'Run time', get: function (p) { return p.stats && k.isNum(p.stats.runtimeSec) ? p.stats.runtimeSec : p.runtimeSec; }, fmt: function (v) { return k.secs(v); } },
         { label: 'Gap (MIP)', get: function (p) { return k.isNum(p.mipGap) ? p.mipGap : null; }, fmt: function (v) { return v === null ? '-' : (v * 100).toFixed(1) + '%'; } }
       ].filter(Boolean);
+      // each plan's parts rounded so that the shown parts add up to the shown total (largest remainder):
+      // rounding every row on its own can leave the sum a point off the total. Only a part with a
+      // fraction takes an extra point (a whole number stays as it is), and equal parts (fuel and
+      // distance often are) take it together or not at all, so they still read equal.
+      const partRows = rows.filter(function (row) { return row.part; });
+      const shown = plans.map(function (p) {
+        const vals = partRows.map(function (row) { const v = row.get(p); return k.isNum(v) ? Math.max(0, v) : 0; });
+        const out = vals.map(Math.floor);
+        const target = p.cost && k.isNum(p.cost.total) ? Math.round(p.cost.total) : null;
+        if (target === null) return vals.map(Math.round);
+        let diff = target - out.reduce(function (a, v) { return a + v; }, 0);
+        const frac = function (i) { return vals[i] - out[i]; };
+        const byFrac = vals.map(function (v, i) { return i; }).filter(function (i) { return frac(i) > 1e-9; })
+          .sort(function (a, b) { return frac(b) - frac(a) || a - b; });
+        const given = {};
+        const give = function (i) { out[i] += 1; given[i] = true; diff--; };
+        byFrac.forEach(function (i) {
+          if (diff <= 0 || given[i]) return;
+          const same = byFrac.filter(function (j) { return !given[j] && Math.abs(vals[j] - vals[i]) < 1e-9; });
+          if (same.length <= diff) same.forEach(give);
+        });
+        // still short: split a group of equal parts, then (a total with a part not shown) the largest part
+        byFrac.forEach(function (i) { if (diff > 0 && !given[i]) give(i); });
+        const big = vals.reduce(function (a, v, i) { return v > vals[a] ? i : a; }, 0);
+        if (diff > 0) out[big] += diff;
+        while (diff < 0 && out[big] > 0) { out[big] -= 1; diff++; }
+        return out;
+      });
       const head = h('tr', h('th', { scope: 'col' }, h('span.sr-only', 'Measure')), plans.map(function (p) {
         return h('th.num', { scope: 'col', class: { 'is-viewed': p === viewed } }, h('div.pp-cmp-m', k.methodLabel(p.method)),
           p === best ? h('div.pp-cmp-best', 'Lowest cost') : null, p.cancelled ? h('div.faint', 'stopped early') : null);
@@ -655,7 +689,7 @@
           return h('td.num', {
             class: { 'is-best': min !== null && v === min && nums.some(function (x) { return x !== min; }), 'text-danger': row.alert && v > 0, 'is-viewed': plans[i] === viewed },
             'data-col': plans[i].method, 'data-row': row.label
-          }, row.fmt(v));
+          }, row.part && v !== null ? n0(shown[i][partRows.indexOf(row)]) : row.fmt(v));
         }));
       });
       const keep = h('tr.pp-cmp-keep', h('th', { scope: 'row' }, h('span.sr-only', 'Keep')), plans.map(function (p) {
@@ -697,12 +731,24 @@
         h('span.badge.pp-status.is-' + stt.key, { 'data-testid': 'plan-status' }, stt.key === 'approved' ? ui.icon('check') : null, stt.label),
         h('span', k.methodLabel(plan.method)),
         win ? h('span.num', 'Window ' + k.windowLabel(win)) : null,
-        k.isNum(plan.createdAt) ? h('span.num', 'Made ' + k.dtg(plan.createdAt)) : null);
+        k.isNum(plan.createdAt) ? h('span.num', 'Made ' + k.dtg(plan.createdAt)) : null,
+        // id and total cost: tell apart two plans with the same name (the picker, closed, may cut its label)
+        h('span.num', { 'data-testid': 'plan-id' }, plan.id),
+        plan.cost && k.isNum(plan.cost.total) ? h('span.num', { 'data-testid': 'plan-cost' }, 'Cost ' + k.num(plan.cost.total, 0) + ' pts') : null);
       sec.appendChild(title);
       sec.appendChild(meta);
       const mn = mipNotice(plan);
       if (mn) sec.appendChild(mn);
       if (plan.cancelled) sec.appendChild(h('div.notice.notice-warn', ui.icon('alert'), h('div', 'Stopped early with Cancel: this is the best plan found before stopping.')));
+      // planning rules the plan breaks (plan.violations): seen before Approve, not only in its dialog
+      const viol = Array.isArray(plan.violations) ? plan.violations : [];
+      if (viol.length) {
+        sec.appendChild(h('div.notice.notice-error.pp-viol', { 'data-testid': 'plan-violations' }, ui.icon('alert'),
+          h('div', h('strong', 'This plan breaks ' + (viol.length === 1 ? 'a planning rule' : viol.length + ' planning rules') + ':'),
+            h('ul', viol.map(function (v) { return h('li', v.detail || v.code); })),
+            plan.approved || plan.superseded ? null
+              : h('div.small', 'Approve plan refuses it while another plan for this window meets every rule. Re-plan, or change the settings (Scenario), to fix it.'))));
+      }
       if (plan.superseded) {
         const by = (state.plans || []).find(function (p) { return p.id === plan.supersededBy; });
         sec.appendChild(h('div.notice.notice-info', ui.icon('info'), h('div', 'Replaced by ' + (by ? by.name : 'a newer approved plan') + '.')));
@@ -781,14 +827,16 @@
       if (ws) sec.appendChild(h('div.caps.pp-summary-cap', 'From now'));
       sec.appendChild(strip);
       if (ws) {
-        const wstat = function (key, label, value, display, unit) {
+        // note: a small line under the value ('3 made'), not a unit run on to it ('153 made')
+        const wstat = function (key, label, value, display, unit, note) {
           return h('div.stat', { 'data-wstat': key, 'data-value': k.isNum(value) ? String(value) : '' },
-            h('span.stat-label', label), h('span.stat-value', display, unit ? h('span.stat-unit', unit) : null));
+            h('span.stat-label', label), h('span.stat-value', display, unit ? h('span.stat-unit', unit) : null),
+            note ? h('span.pp-stat-note', note) : null);
         };
         sec.appendChild(h('div.caps.pp-summary-cap', 'This window (stops made + planned)'));
         sec.appendChild(h('div.summary.pp-summary.pp-summary-window', { role: 'group', 'aria-label': 'Whole window', 'data-testid': 'summary-window' },
           wstat('requests', 'Requests', ws.requests, k.num(ws.requests, 0)),
-          wstat('stops', 'Stops', ws.stops, k.num(ws.stops, 0), k.isNum(ws.stopsDone) && ws.stopsDone ? ws.stopsDone + ' made' : null),
+          wstat('stops', 'Stops', ws.stops, k.num(ws.stops, 0), null, k.isNum(ws.stopsDone) && ws.stopsDone ? ws.stopsDone + ' made' : null),
           wstat('trucks', 'Trucks used', ws.trucksUsed, k.num(ws.trucksUsed, 0)),
           wstat('miles', 'Miles', ws.miles, k.num(ws.miles, 0), 'mi'),
           wstat('gallons', 'Gallons', ws.gallons, k.num(ws.gallons, 0), 'gal'),
@@ -875,10 +923,17 @@
       const self = this, k = K();
       const now = self.ctx.getState().clock.simMin;
       const routes = k.activeRoutes(plan);
-      // a re-plan made after trucks left: those carry on with the new plan; only the others still leave
-      const leave = routes.filter(function (r) { return !(k.isNum(r.depart) && r.depart <= now); });
-      const onRoad = routes.filter(function (r) { return leave.indexOf(r) < 0 && !(k.isNum(r.returnAt) && r.returnAt <= now); });
-      const first = leave.reduce(function (a, r) { return k.isNum(r.depart) && (a === null || r.depart < a) ? r.depart : a; }, null);
+      // Only a re-plan has trucks already on the road: those that left before it was made carry on
+      // with it. Any other departure time already past (a plan approved after its trucks were due to
+      // leave) is a late start, never a truck on the road.
+      const made = plan.parentPlanId ? (k.isNum(plan.createdAt) ? Math.min(plan.createdAt, now) : now) : null;
+      const left = function (r) { return made !== null && k.isNum(r.depart) && r.depart <= made; };
+      const due = function (r) { return k.isNum(r.depart) && r.depart <= now; };
+      const onRoad = routes.filter(function (r) { return left(r) && !(k.isNum(r.returnAt) && r.returnAt <= now); });
+      const late = routes.filter(function (r) { return !left(r) && due(r); });
+      const leave = routes.filter(function (r) { return !left(r) && !due(r); });
+      const firstOf = function (list) { return list.reduce(function (a, r) { return k.isNum(r.depart) && (a === null || r.depart < a) ? r.depart : a; }, null); };
+      const first = firstOf(leave), firstLate = firstOf(late);
       const win = k.planWindow(plan);
       const delayed = (plan.stats && plan.stats.delayed) || 0;
       const viol = Array.isArray(plan.violations) ? plan.violations : [];
@@ -888,10 +943,15 @@
         viol.length ? h('div.notice.notice-error.pp-confirm-viol', { 'data-testid': 'approve-violations' }, ui.icon('alert'),
           h('div', h('strong', 'This plan breaks ' + (viol.length === 1 ? 'a planning rule' : viol.length + ' planning rules') + ':'),
             h('ul', viol.map(function (v) { return h('li', v.detail || v.code); })))) : null,
+        late.length ? h('div.notice.notice-warn.pp-confirm-late', { 'data-testid': 'approve-late' }, ui.icon('clock'),
+          h('div', h('strong', 'Departure ' + (late.length === 1 ? 'time' : 'times') + ' already past. '),
+            h('span', (late.length === 1 ? late[0].truckId + ' was due to leave at ' : late.length + ' trucks (' + ids(late) + ') were due to leave from ') + k.dtg(firstLate) +
+              '; it is now ' + k.dtg(now) + '. Approved as it is, ' + (late.length === 1 ? 'it starts' : 'they start') +
+              ' behind this schedule. For times that start now, press Plan now again and approve the new plan.'))) : null,
         h('ul.pp-confirm-list',
           onRoad.length ? h('li', onRoad.length + (onRoad.length === 1 ? ' truck already on the road carries' : ' trucks already on the road carry') + ' on with the new plan: ' + ids(onRoad) + '.') : null,
           leave.length ? h('li', leave.length + (leave.length === 1 ? ' truck leaves' : ' trucks leave') + ' at the planned times' + (first !== null ? ' (first at ' + k.dtg(first) + ')' : '') + ': ' + ids(leave) + '.')
-            : !onRoad.length ? h('li', 'No truck drives in this plan.') : null,
+            : !onRoad.length && !late.length ? h('li', 'No truck drives in this plan.') : null,
           h('li', 'Platoon sergeants see their pickup point and ETA, and the truck callsign and frequency.'),
           delayed ? h('li', delayed === 1 ? 'The platoon sergeant of the 1 delayed request is told it is not in this window' : 'The platoon sergeants of the ' + delayed + ' delayed requests are told they are not in this window',
             (win ? '; the next plan starts at ' + k.dtg(win.end) : ''), '.') : null,

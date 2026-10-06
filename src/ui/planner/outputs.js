@@ -158,8 +158,11 @@
     let opt = '';
     if (it.freeText) opt = line.option ? String(line.option) : '';
     else if (it.options.length > 1) { const op = H.optionById(line.itemId, line.option); opt = op ? op.label : ''; }
+    // the option only when it adds something (the same rule as plannerKit.itemName): 'Diesel / JP-8'
+    // already says JP-8, and an option that contains the name ('AT4 (84 mm)') stands for both
     const nl = it.name.toLowerCase(), ol = opt.toLowerCase();
-    return opt && ol !== nl && !(ol.length >= 3 && nl.indexOf(ol) >= 0) ? it.name + ', ' + opt : it.name;
+    if (!ol || ol === nl || (ol.length >= 3 && nl.indexOf(ol) >= 0)) return it.name;
+    return nl.length >= 2 && ol.indexOf(nl) >= 0 ? opt : it.name + ', ' + opt;
   }
   // One delivery (or deferred line) -> display parts. Works with lineIdx (number or array) or without.
   function deliveryInfo(st, d) {

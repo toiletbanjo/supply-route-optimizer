@@ -777,12 +777,39 @@ async function runViewport(browser, fileUrl, vp, label) {
   const snaps1 = await page.evaluate(() => (SRO.app.store.getState().snapshots || []).length);
   check(snaps1 === snaps0 + 1, 'Save snapshot stores a snapshot', [snaps0, snaps1]);
 
+  // ---------------------------------------------------------------- approve after the departure times
+  // A first plan approved after its trucks were due to leave: no truck is on the road (nothing was
+  // approved), so the dialog says the departure times are past instead. The clock goes back after.
+  section(label + ': late approve of a first plan');
+  const late = await page.evaluate(() => {
+    const K = SRO.ui.plannerKit, S = SRO.app.store, st = S.getState(), p = K.viewedPlan(st);
+    const deps = K.activeRoutes(p).map((r) => r.depart).filter((d) => typeof d === 'number');
+    return { was: st.clock.simMin, first: deps.length ? Math.min.apply(null, deps) : null, n: deps.length, parent: p.parentPlanId || null, approved: S.getState().plans.some((x) => x.approved) };
+  });
+  check(late.first !== null && !late.parent && !late.approved, 'the first plan has departures and nothing is approved yet', late);
+  if (late.first !== null) {
+    await page.evaluate((t) => SRO.app.store.dispatch({ type: 'clock/tick', simMin: t }), late.first + 30);
+    await page.click('[data-testid="approve"]');
+    await page.waitForSelector('.modal');
+    const la = await page.evaluate(() => { const m = document.querySelector('.modal'), n = m.querySelector('[data-testid="approve-late"]'); return { text: m.innerText.replace(/\s+/g, ' '), notice: n ? n.innerText.replace(/\s+/g, ' ') : '' }; });
+    check(!/on the road/.test(la.text), 'a first plan approved late says no truck is on the road', la.text.slice(0, 300));
+    check(/already past/.test(la.notice) && /Plan now/.test(la.notice), 'a first plan approved late warns that its departure times are past and offers to plan again', la.notice);
+    const firstTruck = await page.evaluate((t) => { const K = SRO.ui.plannerKit; return K.activeRoutes(K.viewedPlan(SRO.app.store.getState())).find((r) => r.depart === t).truckId; }, late.first);
+    check(la.notice.indexOf(firstTruck) >= 0, 'the late-departure notice names the trucks that are late to leave', [firstTruck, la.notice]);
+    await shot(page, label + '-dark-approve-late');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(200);
+    await page.evaluate((t) => SRO.app.store.dispatch({ type: 'clock/tick', simMin: t }), late.was);
+    check(await page.evaluate(() => !SRO.app.store.getState().plans.some((x) => x.approved)), 'Escape leaves the plan unapproved');
+  }
+
   // ---------------------------------------------------------------- approve
   section(label + ': approve');
   await page.click('[data-testid="approve"]');
   await page.waitForSelector('.modal');
   const confirmText = await page.locator('.modal').last().innerText();
   check(/pickup point and ETA/.test(confirmText), 'the confirm says platoon sergeants see their pickup point and ETA', confirmText.replace(/\s+/g, ' ').slice(0, 200));
+  check(!/already past|on the road/.test(confirmText) && /leave at the planned times/.test(confirmText), 'approved in time, the confirm lists the trucks that leave and no late or on-the-road line', confirmText.replace(/\s+/g, ' ').slice(0, 300));
   await page.waitForTimeout(400);
   await shot(page, label + '-dark-approve');
   await page.click('.modal [data-action="approve"]');
@@ -790,6 +817,8 @@ async function runViewport(browser, fileUrl, vp, label) {
   plan = await viewedPlan(page);
   check(plan.approved, 'the plan is approved');
   check(/Approved/.test(await page.locator('[data-testid="plan-status"]').innerText()), 'status badge says Approved');
+  const nViol = await page.evaluate(() => { const p = SRO.ui.plannerKit.viewedPlan(SRO.app.store.getState()); return (p.violations || []).length; });
+  check(await page.locator('[data-testid="plan-violations"]').count() === (nViol ? 1 : 0), 'the plan head shows the rule-break notice only for a plan with violations', nViol);
   const approvedId = plan.id;
   const reqStatus = await page.evaluate((id) => {
     const st = SRO.app.store.getState(), p = st.plans.find((x) => x.id === id);
@@ -839,7 +868,7 @@ async function runViewport(browser, fileUrl, vp, label) {
   check(ct.overflow <= 1, 'the comparison table fits the panel without sideways scrolling (' + cmpMethods.length + ' methods)', ct.overflow);
   ['Total cost', 'Fuel', 'Distance', 'Risk', 'Simplicity', 'Platoon travel', 'Late penalty', 'Delay penalty', 'Late', 'Delayed', 'Run time', 'Gap (MIP)']
     .forEach((r) => check(ct.rows.indexOf(r) >= 0, 'comparison row ' + r));
-  // the indented part rows add up to the total of each column (each cell is rounded)
+  // the indented part rows add up exactly to the total of each column (parts rounded to match it)
   const sums = await page.evaluate(() => {
     const t = document.querySelector('[data-testid="compare-table"]'), out = {};
     const num = (e) => Number(e.innerText.replace(/,/g, ''));
@@ -847,7 +876,21 @@ async function runViewport(browser, fileUrl, vp, label) {
     t.querySelectorAll('tr.pp-cmp-part td[data-col]').forEach((e) => { const o = out[e.getAttribute('data-col')]; o.parts += num(e); o.n++; });
     return out;
   });
-  Object.keys(sums).forEach((m) => { const o = sums[m]; check(Math.abs(o.parts - o.total) <= 0.5 * o.n + 0.5, 'the ' + m + ' cost rows add up to its total', o); });
+  Object.keys(sums).forEach((m) => { const o = sums[m]; check(o.parts === o.total, 'the ' + m + ' cost rows add up to its total', o); });
+  // and every shown part is within a point of the plan's own cost part
+  const partErr = await page.evaluate(() => {
+    const t = document.querySelector('[data-testid="compare-table"]'), keys = { Fuel: 'fuel', Distance: 'distance', Risk: 'risk', Simplicity: 'simplicity', 'Platoon travel': 'platoon', 'Late penalty': 'lateness', 'Delay penalty': 'deferral', 'ETA changes': 'stability' };
+    const plans = SRO.app.store.getState().plans, bad = [];
+    t.querySelectorAll('tr.pp-cmp-part td[data-col]').forEach((e) => {
+      const key = keys[e.getAttribute('data-row')]; if (!key) return;
+      const p = plans.slice().reverse().find((x) => x.method === e.getAttribute('data-col') && x.cost);
+      if (!p) return;
+      const v = Number(e.innerText.replace(/,/g, '')), want = p.cost[key] || 0;
+      if (Math.abs(v - want) >= 1) bad.push([e.getAttribute('data-col'), key, v, want]);
+    });
+    return bad;
+  });
+  check(!partErr.length, 'every shown cost part is within a point of the plan cost part', partErr);
   const cmpPlans = await page.evaluate((n) => SRO.app.store.getState().plans.slice(-n).map((p) => ({ id: p.id, method: p.method, total: p.cost.total, mipGap: p.mipGap, compareId: p.compareId || null })), cmpMethods.length);
   cmpPlans.forEach((p) => {
     const cell = ct.cells.find((c) => c.m === p.method);
@@ -911,7 +954,9 @@ async function runViewport(browser, fileUrl, vp, label) {
   await page.waitForTimeout(300);
   const pair = await page.evaluate(() => SRO.app.store.getState().plans.slice(-2).map((p) => ({ id: p.id, method: p.method, total: p.cost.total, name: p.name })));
   check(pair[1].method === 'aco', 'Ant colony is the last plan stored', pair.map((p) => p.method));
-  if (pair[1].total <= pair[0].total) note('the weak Ant colony plan was not the more expensive one here: ' + pair.map((p) => Math.round(p.total)).join(' / '));
+  // the case only tests B1 when the last plan stored costs more: one ant, one round, no local search
+  // against Tabu search on 12 or more requests does
+  check(pair[1].total > pair[0].total, 'the weak Ant colony plan (stored last) costs more than Tabu search', pair.map((p) => Math.round(p.total)));
   const low = pair[0].total <= pair[1].total ? pair[0] : pair[1];
   const shown2 = await viewedPlan(page);
   check(shown2 && shown2.id === low.id, 'with the last method the more expensive one, Compare still shows the lowest-cost plan', [shown2 && shown2.id, pair]);
@@ -942,7 +987,14 @@ async function runViewport(browser, fileUrl, vp, label) {
   await page.locator('[data-testid="cmp-sa"]').check();
   // picker labels name each plan once
   const pick = await page.locator('[data-testid="plan-picker"] option, select.pp-picker option').evaluateAll((os) => os.map((o) => o.textContent));
-  if (pick.length) check(new Set(pick).size === pick.length, 'plan picker labels are unique', pick);
+  if (pick.length) {
+    check(new Set(pick).size === pick.length, 'plan picker labels are unique', pick);
+    // the name first, then cost and status; the id (only for plans that share a name) last, so a
+    // closed select cut short still shows what tells them apart
+    check(pick.every((l) => !/^P-\d+ ·/.test(l) && /· [\d,]+ pts ·|· no cost ·/.test(l)), 'plan picker labels start with the plan name and give the cost', pick);
+    const hc = await page.evaluate(() => { const p = SRO.ui.plannerKit.viewedPlan(SRO.app.store.getState()); return { id: p.id, total: Math.round(p.cost.total), shownId: (document.querySelector('[data-testid="plan-id"]') || {}).textContent, cost: (document.querySelector('[data-testid="plan-cost"]') || {}).textContent }; });
+    check(hc.shownId === hc.id && hc.cost === 'Cost ' + hc.total.toLocaleString('en-US') + ' pts', 'the plan head gives the plan id and total cost', hc);
+  }
   else note('no plan picker found');
 
   // ---------------------------------------------------------------- cancel
@@ -1084,27 +1136,41 @@ async function runViewport(browser, fileUrl, vp, label) {
     // "this window" stats next to the "from now" ones, straight from plan.windowStats
     const ws = await page.evaluate(() => {
       const p = SRO.ui.plannerKit.viewedPlan(SRO.app.store.getState());
-      const cells = Array.from(document.querySelectorAll('[data-testid="summary-window"] [data-wstat]')).map((e) => ({ k: e.getAttribute('data-wstat'), v: e.getAttribute('data-value'), text: e.innerText.replace(/\s+/g, ' ') }));
+      const cells = Array.from(document.querySelectorAll('[data-testid="summary-window"] [data-wstat]')).map((e) => {
+        const n = e.querySelector('.pp-stat-note'), v = e.querySelector('.stat-value');
+        return { k: e.getAttribute('data-wstat'), v: e.getAttribute('data-value'), text: e.innerText.replace(/\s+/g, ' ').trim(), made: n ? n.textContent : null,
+          madeBelow: !!(n && v && n.getBoundingClientRect().top >= v.getBoundingClientRect().bottom - 1 && n.scrollWidth <= n.clientWidth + 1) };
+      });
       return { want: p.windowStats || null, cells };
     });
     if (ws.want) {
       const map = { requests: 'requests', stops: 'stops', trucks: 'trucksUsed', miles: 'miles', gallons: 'gallons', risk: 'riskUnits', delayed: 'delayed', rally: 'rallyPoints' };
       check(ws.cells.length >= 6, 'a re-plan shows the "this window" stats strip', ws.cells.length);
+      const sc = ws.cells.find((c) => c.k === 'stops');
+      if (ws.want.stopsDone) check(sc && new RegExp('^STOPS ' + ws.want.stops + ' ' + ws.want.stopsDone + ' made$', 'i').test(sc.text) && sc.made === ws.want.stopsDone + ' made' && sc.madeBelow, 'the window stops cell gives the stops made on a line under the stop count', sc);
       ws.cells.forEach((c) => { if (map[c.k] && c.v != null) check(Math.abs(Number(c.v) - Number(ws.want[map[c.k]])) < 1e-6, 'window ' + c.k + ' equals plan.windowStats', [c.v, ws.want[map[c.k]]]); });
     } else note('this re-plan has no windowStats (stub engine), so the window strip is not checked');
-    // approve dialog: trucks already on the road carry on; no past departure is listed
+    // approve dialog: trucks that left before the re-plan was made carry on; the first departure it
+    // lists is the earliest one still to come
     await page.click('[data-testid="approve"]');
     await page.waitForSelector('.modal');
     const ad = await page.locator('.modal').last().innerText();
     const firstAt = /first at (\d{6}[A-Z] [A-Z]{3} \d{2})/.exec(ad);
-    const nowDtg = await page.evaluate(() => SRO.core.format.dtg(SRO.app.store.getState().clock.simMin));
-    const onRoad = await page.evaluate(() => {
-      const K = SRO.ui.plannerKit, st = SRO.app.store.getState(), now = st.clock.simMin;
-      return K.activeRoutes(K.viewedPlan(st)).filter((r) => r.depart <= now && !(r.returnAt <= now)).length;
+    const dep = await page.evaluate(() => {
+      const K = SRO.ui.plannerKit, st = SRO.app.store.getState(), now = st.clock.simMin, p = K.viewedPlan(st);
+      const made = Math.min(typeof p.createdAt === 'number' ? p.createdAt : now, now);
+      const routes = K.activeRoutes(p);
+      const future = routes.map((r) => r.depart).filter((d) => typeof d === 'number' && d > now);
+      const first = future.length ? Math.min.apply(null, future) : null;
+      return { now, first, firstDtg: first === null ? null : SRO.core.format.dtg(first),
+        onRoad: routes.filter((r) => r.depart <= made && !(r.returnAt <= now)).length,
+        late: routes.filter((r) => r.depart > made && r.depart <= now).length,
+        lateNotice: !!document.querySelector('.modal [data-testid="approve-late"]') };
     });
-    if (!onRoad) note('no truck of this re-plan has left yet, so the dialog has no on-the-road line');
+    if (!dep.onRoad) note('no truck of this re-plan has left yet, so the dialog has no on-the-road line');
     else check(/already on the road carr/.test(ad), 'the approve dialog of a mid-route re-plan names the trucks already on the road', ad.replace(/\s+/g, ' ').slice(0, 240));
-    if (firstAt) check(firstAt[1] >= nowDtg || firstAt[1].slice(-6) !== nowDtg.slice(-6), 'the approve dialog lists no departure in the past', [firstAt[1], nowDtg]);
+    check(firstAt ? dep.first !== null && firstAt[1] === dep.firstDtg : dep.first === null, 'the first departure the approve dialog lists is the earliest one still to come', [firstAt && firstAt[1], dep]);
+    check(dep.lateNotice === dep.late > 0, 'the approve dialog warns of past departures only when a truck that had not left is due before now', dep);
     await page.keyboard.press('Escape');
     await page.waitForTimeout(250);
     const vr = mv.routes.find((r) => r.truckId === mid.truckId);
@@ -1136,6 +1202,9 @@ async function runViewport(browser, fileUrl, vp, label) {
       ret: /Back \d{6}H/.test((document.querySelector('[data-testid="stop-list"]') || {}).innerText || '') }));
     check(od.stopped && od.end && !od.ret, 'Route detail of the stopped truck ends at its last done stop (no return time)', od);
     check(od.stops === vr.stops && od.delayed, 'Route detail of the stopped truck lists its stops and the delayed card', [od.stops, vr && vr.stops, od.delayed]);
+    // P5: nothing left to cost reads as one line, not a split of zeros
+    const oc = await page.evaluate(() => { const c = document.querySelector('[data-testid="cost-split"]'); return c ? { empty: c.getAttribute('data-empty'), rows: c.querySelectorAll('.pr-cost-row').length, text: c.innerText.replace(/\s+/g, ' ') } : null; });
+    check(oc && oc.empty === 'out' && oc.rows === 0 && /Out of service/.test(oc.text), 'the cost split of the truck marked out is one line, not a split of zeros', oc);
     await shot(page, label + '-dark-route-out');
     await page.click('[data-testid="route-back"]');
   }
@@ -1249,6 +1318,9 @@ async function runViewport(browser, fileUrl, vp, label) {
   });
   await showTab(page, 'plan');
   await page.waitForTimeout(300);
+  // the plan head says so before Approve (not only the dialog)
+  const hv = await page.locator('[data-testid="plan-violations"]').innerText().catch(() => '');
+  check(/breaks a planning rule/.test(hv) && /Check rule/.test(hv), 'the plan head lists the rules the plan breaks before Approve', hv);
   await page.click('[data-testid="approve"]');
   await page.waitForSelector('.modal');
   const vl = await page.locator('[data-testid="approve-violations"]').innerText().catch(() => '');
@@ -1267,6 +1339,33 @@ async function runViewport(browser, fileUrl, vp, label) {
     note('no other plan of this window meets every rule, so the store approved with a warning or refused without alternatives');
     await page.keyboard.press('Escape');
   }
+
+  // ---------------------------------------------------------------- wording: MIP notice, item text
+  section(label + ': MIP notice and item wording');
+  const mipTexts = {};
+  const baseId = (await viewedPlan(page)).id;
+  for (const [k, proof] of [['tiny', { stopReason: 'gap', gap: 0.0001, dualBound: 1, gapTarget: 0.0001, exactModel: true }],
+    ['cancel', { stopReason: 'cancel', gap: null, dualBound: null, gapTarget: null, exactModel: null }]]) {
+    await page.evaluate(({ k, proof, baseId }) => {
+      const S = SRO.app.store, K = SRO.ui.plannerKit;
+      const p = JSON.parse(JSON.stringify(S.getState().plans.find((x) => x.id === baseId)));
+      delete p.id;
+      Object.assign(p, { name: 'MIP wording ' + k, method: 'mip', mipProof: proof, mipGap: proof.gap, parentPlanId: null, approved: false, superseded: false, violations: [], stats: Object.assign({}, p.stats, { violations: 0 }) });
+      const r = S.dispatch({ type: 'plan/store', plan: p });
+      if (r.ok) K.showPlan(r.id);
+    }, { k, proof, baseId });
+    await showTab(page, 'plan');
+    await page.waitForTimeout(300);
+    mipTexts[k] = (await page.locator('[data-testid="mip-notice"]').innerText().catch(() => '')).replace(/\s+/g, ' ');
+  }
+  Object.assign(mipTexts, await page.evaluate(() => {
+    const line = (itemId, option, qty) => SRO.ui.plannerKit.lineText({ itemId, option, qty, unit: null });
+    return { at4: line('at4', 'at4-84', 8), fuel: line('diesel', 'JP-8', 500), df2: line('diesel', 'DF-2', 500) };
+  }));
+  check(/proven within 0\.1% of the exact model's bound/.test(mipTexts.tiny) && !/under/.test(mipTexts.tiny) && /gap target of 0\.01%/.test(mipTexts.tiny), 'a tiny proven gap reads "within 0.1%" and the target keeps its decimals', mipTexts.tiny);
+  check(/stopped with Cancel/.test(mipTexts.cancel) && !/before it could prove/.test(mipTexts.cancel), 'a cancelled MIP plan does not claim no gap was proven', mipTexts.cancel);
+  check(mipTexts.at4 === 'AT4: 8 each', 'an item with one option is named once (AT4, not "AT4, AT4 (84 mm)")', mipTexts.at4);
+  check(/^Diesel \/ JP-8: 500/.test(mipTexts.fuel) && /^Diesel \/ JP-8, Diesel \(DF-2\): 500/.test(mipTexts.df2), 'an option is added only when it says more than the item name', [mipTexts.fuel, mipTexts.df2]);
 
   // ---------------------------------------------------------------- console
   section(label + ': console');

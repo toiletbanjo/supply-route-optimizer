@@ -494,10 +494,23 @@
     const p = activePlan(st) || (st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) : null);
     return (p && p.rallyPoints) || [];
   }
-  function usedRallyCount(st) {
-    const p = activePlan(st) || (st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) : null);
+  function rallyCountOf(p) {
     if (p && p.windowStats && isNum(p.windowStats.rallyPoints)) return p.windowStats.rallyPoints;
-    return usedRally(st).length;
+    return ((p && p.rallyPoints) || []).length;
+  }
+  // ', 8 of 8 used this window (approved plan); 7 in draft P-0004': says which plan it counts, and adds
+  // the newest draft for the same window (a re-plan under review) when it uses a different number
+  function rallyUsedText(st, max) {
+    const ap = activePlan(st);
+    const last = st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) || null : null;
+    const p = ap || last;
+    if (!p) return '';
+    const n = rallyCountOf(p);
+    const draft = ap && last && last !== ap && !last.approved && !last.superseded && last.windowId === ap.windowId ? last : null;
+    const dn = draft ? rallyCountOf(draft) : null;
+    if (!n && !dn) return '';
+    return ', ' + n + ' of ' + max + ' used this window (' + (p.approved ? 'approved plan' : 'draft ' + p.id) + ')' +
+      (draft && dn !== n ? '; ' + dn + ' in draft ' + draft.id : '');
   }
   function rallyMapPoints(st, used) {
     const r = st.scenario.rally || {};
@@ -1055,7 +1068,7 @@
       (r.pinned || []).length > max ? h('div.notice.notice-warn', icon('alert'), 'More points are pinned (' + r.pinned.length + ') than the maximum (' + max + '). Unpin some or raise the maximum.') : null,
       h('div.hstack.wrap.spread',
         h('span.small.muted', { 'data-testid': 'rally-counts' }, (r.pinned || []).length + ' pinned, ' + (r.banned || []).length + ' banned, ' + all.length + ' candidates' +
-          (usedRallyCount(st) ? ', ' + usedRallyCount(st) + ' of ' + max + ' used this window' : '')),
+          rallyUsedText(st, max)),
         ((r.pinned || []).length || (r.banned || []).length) ? h('button.btn.btn-sm.btn-ghost', { type: 'button', onClick: function () { act({ type: 'rally/clear' }, 'All pins and bans cleared.'); } }, 'Clear all') : null));
     const chips = h('div.chip-group.sc-rally-filter', { role: 'group', 'aria-label': 'Filter drop points' }, filters.map(function (f) {
       return h('button.chip', { type: 'button', 'aria-pressed': String(rallyFilter === f[0]), onClick: function () { rallyFilter = f[0]; blocks.rally.render(getState(), true); } }, f[1]);

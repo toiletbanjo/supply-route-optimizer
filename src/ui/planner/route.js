@@ -141,12 +141,16 @@
       const parts = COSTS.map(function (x) { return { key: x.key, label: x.label, v: k.isNum(c[x.key]) ? Math.max(0, c[x.key]) : 0 }; })
         .filter(function (x) { return !ONLY_WHEN_SET[x.key] || x.v > 0; });
       const total = parts.reduce(function (a, x) { return a + x.v; }, 0);
-      // a truck of a re-plan whose stops are all made (driving home or back already) has nothing left
-      // to cost: one line instead of a split of zeros
+      // nothing left to cost in a re-plan (a truck out of service or cut off does not drive on; a truck
+      // whose stops are all made is driving home or back already): one line instead of a split of zeros
       const stops = rt.stops || [];
-      if (!(total > 0) && !k.isStoppedRoute(rt) && stops.length && stops.every(function (st) { return st.done; })) {
-        return h('div.card.pr-cost.pr-cost-done', { 'data-testid': 'cost-split' },
-          h('div.card-header', h('div', h('h3.card-title', 'Cost split'), h('div.card-sub', 'Trip finished: every stop is made, so nothing is left to cost in this re-plan.'))));
+      const finished = stops.length && stops.every(function (st) { return st.done; });
+      if (!(total > 0) && (k.isStoppedRoute(rt) || finished)) {
+        const why = rt.out ? 'Out of service: the truck does not drive on, so nothing is left to cost in this re-plan.'
+          : rt.cutOff ? 'Cut off by a closed road: the truck does not drive on in this plan, so nothing is left to cost.'
+            : 'Trip finished: every stop is made, so nothing is left to cost in this re-plan.';
+        return h('div.card.pr-cost.pr-cost-done', { 'data-testid': 'cost-split', 'data-empty': rt.out ? 'out' : rt.cutOff ? 'cut-off' : 'done' },
+          h('div.card-header', h('div', h('h3.card-title', 'Cost split'), h('div.card-sub', why))));
       }
       const bar = h('div.pr-costbar', { role: 'img', 'aria-label': 'Cost split: ' + parts.map(function (x) { return x.label + ' ' + k.num(x.v, 0); }).join(', ') });
       parts.forEach(function (x) {

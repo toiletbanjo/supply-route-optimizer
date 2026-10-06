@@ -2358,7 +2358,6 @@ html[data-theme="night"] {
 .pp-key-notes > div { min-width: 0; overflow-wrap: break-word; }
 /* re-plan summary: 'From now' and 'This window' strips */
 .pp-summary-cap { color: var(--text-muted); font-size: 0.7rem; margin-bottom: -4px; }
-.pp-summary-window .stat { background: var(--surface-2); }
 .pp-summary-window .stat-unit { white-space: nowrap; }
 /* truck card: the stops in order, in plain words */
 .pp-truck-stops { color: var(--text); font-size: 0.8667rem; line-height: 1.35; overflow-wrap: anywhere; }
@@ -2372,9 +2371,21 @@ html[data-theme="night"] {
 .pr-cost-done .card-header { margin-bottom: 0; }
 /* planner map: where a truck turned back from a closed road */
 .pm-turn-icon { background: none; border: 0; }
+.pm-turn-callout { position: relative; width: 44px; height: 44px; --stalk: var(--truck, var(--warn)); }
+.pm-turn-stalk { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.pm-turn-stalk path { stroke: var(--stalk); stroke-width: 2; fill: none; }
+.pm-turn-stalk circle { fill: var(--stalk); stroke: var(--bg); stroke-width: 1.5; }
+.pm-turn-callout > .pm-turn { position: absolute; right: 0; top: 0; }
 .pm-turn {
   display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; box-sizing: border-box;
   border: 2px solid var(--truck, var(--warn)); border-radius: 50%; background: var(--surface); color: var(--warn);
   box-shadow: 0 0 0 2px var(--bg); cursor: pointer;
 }
 .pm-turn.pm-turn-sm { width: 16px; height: 16px; border-width: 1.5px; box-shadow: none; cursor: default; color: var(--warn); }
+/* plan head: planning rules the plan breaks; approve dialog: departures already past */
+.pp-viol ul { margin: 2px 0 4px; padding-left: 1.1em; display: flex; flex-direction: column; gap: 3px; }
+.pp-viol > div, .pp-confirm-late > div { min-width: 0; overflow-wrap: break-word; }
+/* plan picker: the label above the select, so the select gets the panel width for name, cost and status */
+.pp-picker-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+/* 'This window' strip: stops already made, on a line under the stop count */
+.pp-stat-note { display: block; font-size: 0.75rem; line-height: 1.2; color: var(--text-muted); white-space: nowrap; }

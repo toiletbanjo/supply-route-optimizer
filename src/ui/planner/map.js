@@ -196,13 +196,20 @@
     const name = it ? it.name : (line.itemId || 'Item');
     let opt = '';
     if (it && it.freeText) opt = line.option || '';
-    else if (it) { const o = CH.optionById(line.itemId, line.option); opt = o ? o.label : (line.option || ''); }
+    else if (it && (it.options || []).length > 1) { const o = CH.optionById(line.itemId, line.option); opt = o ? o.label : (line.option || ''); }
+    else if (!it) opt = line.option || '';
     const q = qtyOverride !== undefined ? qtyOverride : line.qty;
     const unit = CH && CH.unitLabel ? CH.unitLabel(line.unit || (it && it.unit), q) : (line.unit || '');
-    // the option only when it adds something ('Diesel / JP-8' already says JP-8)
-    const nl = name.toLowerCase(), ol = opt.toLowerCase();
-    const optText = opt && ol !== nl && !(ol.length >= 3 && nl.indexOf(ol) >= 0) ? ', ' + opt : '';
-    return name + optText + ': ' + K.qty(q, unit);
+    return K.itemName(name, opt) + ': ' + K.qty(q, unit);
+  };
+  // Item name and option in one, the option only when it adds something: an item with one option
+  // shows its name alone (the caller passes no option), 'Diesel / JP-8' already says JP-8, and an
+  // option that contains the name ('AT4 (84 mm)') stands for both.
+  K.itemName = function (name, opt) {
+    const nl = String(name || '').toLowerCase(), ol = String(opt || '').toLowerCase();
+    if (!ol || ol === nl || (ol.length >= 3 && nl.indexOf(ol) >= 0)) return name;
+    if (nl.length >= 2 && ol.indexOf(nl) >= 0) return opt;
+    return name + ', ' + opt;
   };
   K.lineUnit = function (line, qty) {
     const CH = SRO.data.catalogHelpers;
@@ -735,8 +742,11 @@
     },
 
     // A truck of a re-plan that drove into a newly closed road: its route shows the part it drove
-    // (the turn-back leg, solid like any driven road) ending at a marker where it turned and was
-    // routed on from. The marker sits in the map's stop pane, in the truck's colour.
+    // (the turn-back leg, solid like any driven road: a dashed line on this map means an approximate
+    // road, and the map moves lines into lanes, so an overlay would not stay on it) ending at a marker
+    // where it turned and was routed on from. The marker is a callout, a dot on the turn point and the
+    // turn-back badge up and to the right, so the truck symbol, which sits on that point at the moment
+    // of the re-plan, does not hide it. It is in the map's stop pane, in the truck's colour.
     drawTurnBacks: function (state, plan) {
       const L = root.L, lm = this.m && this.m.leaflet;
       if (!L || !lm) return;
@@ -751,9 +761,11 @@
           (tb.nextStop ? ' to ' + (tb.nextStop.label || 'its next stop') : '') + '.';
         const mk = L.marker([tb.lat, tb.lon], {
           pane: 'sro-stops', keyboard: false, zIndexOffset: 1200, title: tipText, alt: tipText,
-          icon: L.divIcon({ className: 'pm-turn-icon', iconSize: [24, 24], iconAnchor: [12, 12],
-            html: '<div class="pm-turn" style="--truck:' + color + '" data-truck="' + String(rt.truckId).replace(/[^\w-]/g, '') + '">' +
-              '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>' })
+          icon: L.divIcon({ className: 'pm-turn-icon', iconSize: [44, 44], iconAnchor: [5, 39],
+            html: '<div class="pm-turn-callout" style="--truck:' + color + '">' +
+              '<svg class="pm-turn-stalk" viewBox="0 0 44 44" width="44" height="44" aria-hidden="true"><path d="M5 39L24 20"/><circle cx="5" cy="39" r="3.5"/></svg>' +
+              '<div class="pm-turn" data-truck="' + String(rt.truckId).replace(/[^\w-]/g, '') + '">' +
+              '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div></div>' })
         }).addTo(self.turnLayer);
         mk.on('click', function () { self.openRoute(rt.truckId); });
       });
