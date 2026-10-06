@@ -237,7 +237,7 @@
   K.planStatus = function (plan) {
     if (!plan) return { key: 'none', label: 'No plan' };
     if (plan.approved) return { key: 'approved', label: 'Approved' };
-    if (plan.superseded) return { key: 'superseded', label: 'Superseded' };
+    if (plan.superseded) return { key: 'superseded', label: 'Replaced' };
     if (plan.cancelled) return { key: 'cancelled', label: 'Draft (stopped early)' };
     return { key: 'draft', label: 'Draft' };
   };
