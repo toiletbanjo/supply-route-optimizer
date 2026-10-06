@@ -3,9 +3,12 @@
 // Stop list in order with arrive / depart DTG, location name + MGRS, deliveries per request with class
 // labels and quantities, pickup by the platoon vs direct delivery, the leg before each stop with its
 // miles, drive time and time-of-day period; the cost split of the route (fuel, distance, risk,
-// simplicity, platoon travel, plus lateness when there is any) as a small bar; near-miss deadlines
+// simplicity, platoon travel, plus lateness and ETA changes (a re-plan's cost.stability) when there
+// are any) as a small bar, or one line for a truck whose trip is already over; near-miss deadlines
 // (arrival within 30 minutes of a deadline) and late arrivals flagged; and for delayed requests the
-// blocking reason in plain words (plan.deferred reason / note, from explainDeferred).
+// blocking reason in plain words (plan.deferred reason / note, from explainDeferred). A truck of a
+// re-plan that drove into a newly closed road shows the leg it drove, a 'Turned back' point where it
+// turned (the 'pos:<truck>' node of the engine) and the leg it is re-routed on from there.
 // Opened from a route or truck on the map, a truck card or timeline row in Plan (K.sel.truckId).
 (function (root) {
   'use strict';
@@ -21,8 +24,10 @@
     { key: 'risk', label: 'Risk' },
     { key: 'simplicity', label: 'Simplicity' },
     { key: 'platoon', label: 'Platoon travel' },
-    { key: 'lateness', label: 'Late arrival' }
+    { key: 'lateness', label: 'Late arrival' },
+    { key: 'stability', label: 'ETA changes' }
   ];
+  const ONLY_WHEN_SET = { lateness: true, stability: true };
 
   const RouteView = {
     label: 'Route detail', icon: 'route', region: 'right', order: 35, hidden: true, parent: 'plan',
@@ -104,7 +109,7 @@
       (rt.legs || []).forEach(function (l) { if (k.isNum(l.arrive) && k.isNum(l.depart)) driveMin += Math.max(0, l.arrive - l.depart); });
       fact('Drive time', k.duration(driveMin));
       fact('Fuel used', k.gallons(trip.gallons));
-      fact('Load', load.pct + '% (' + k.num(load.used, load.unit === 'gal' ? 0 : 1) + ' of ' + k.num(load.capacity, 0) + ' ' + load.unit + ')');
+      fact('Load', load.pct + '% · ' + k.num(load.used, load.unit === 'gal' ? 0 : 1) + '/' + k.num(load.capacity, 0) + ' ' + load.unit);
       fact('Risk', k.num(rt.riskUnits, 1));
       el.appendChild(kv);
 
@@ -134,8 +139,19 @@
       const k = K();
       const c = rt.cost || {};
       const parts = COSTS.map(function (x) { return { key: x.key, label: x.label, v: k.isNum(c[x.key]) ? Math.max(0, c[x.key]) : 0 }; })
-        .filter(function (x) { return x.key !== 'lateness' || x.v > 0; });
+        .filter(function (x) { return !ONLY_WHEN_SET[x.key] || x.v > 0; });
       const total = parts.reduce(function (a, x) { return a + x.v; }, 0);
+      // nothing left to cost in a re-plan (a truck out of service or cut off does not drive on; a truck
+      // whose stops are all made is driving home or back already): one line instead of a split of zeros
+      const stops = rt.stops || [];
+      const finished = stops.length && stops.every(function (st) { return st.done; });
+      if (!(total > 0) && (k.isStoppedRoute(rt) || finished)) {
+        const why = rt.out ? 'Out of service: the truck does not drive on, so nothing is left to cost in this re-plan.'
+          : rt.cutOff ? 'Cut off by a closed road: the truck does not drive on in this plan, so nothing is left to cost.'
+            : 'Trip finished: every stop is made, so nothing is left to cost in this re-plan.';
+        return h('div.card.pr-cost.pr-cost-done', { 'data-testid': 'cost-split', 'data-empty': rt.out ? 'out' : rt.cutOff ? 'cut-off' : 'done' },
+          h('div.card-header', h('div', h('h3.card-title', 'Cost split'), h('div.card-sub', why))));
+      }
       const bar = h('div.pr-costbar', { role: 'img', 'aria-label': 'Cost split: ' + parts.map(function (x) { return x.label + ' ' + k.num(x.v, 0); }).join(', ') });
       parts.forEach(function (x) {
         if (total > 0 && x.v > 0) bar.appendChild(h('span.pr-cost-seg.pr-c-' + x.key, { style: { width: (x.v / total * 100).toFixed(2) + '%' }, title: x.label + ' ' + k.num(x.v, 0) }));
@@ -217,8 +233,17 @@
       }
       // a leg can be missing (a re-plan keeps only the driven legs of a truck that stopped)
       const add = function (node) { if (node) list.appendChild(node); };
+      // a turn-back: the leg driven towards the closed road, the point it turned at, then the leg on
+      // from there (before[] holds that last one for the next stop)
+      const tb = k.turnBack(rt);
+      const tbBefore = tb ? k.legStops(rt).slice(tb.legIndex + 1).find(function (x) { return x >= 0; }) : undefined;
       stops.forEach(function (st, i) {
-        add(legRow(before[i], i === 0 ? hubName : (stops[i - 1].label || 'previous stop'), st.label || 'stop'));
+        const from = i === 0 ? hubName : (stops[i - 1].label || 'previous stop');
+        if (tb && tbBefore === i) {
+          add(legRow(tb.leg, from, 'the turn-back point'));
+          add(RouteView.turnRow(rt, tb, color));
+          add(legRow(before[i], 'the turn-back point', st.label || 'stop'));
+        } else add(legRow(before[i], from, st.label || 'stop'));
         add(RouteView.stopRow(state, plan, rt, st, i, color, settings));
       });
       if (k.isStoppedRoute(rt)) {
@@ -236,6 +261,18 @@
           h('div.pr-stop-title', hubName, h('span.badge', 'Return')),
           h('div.small.num', 'Back ' + k.dtg(rt.returnAt)))));
       return list;
+    },
+
+    turnRow: function (rt, tb, color) {
+      const k = K();
+      return h('li.pr-stop.pr-turn', { 'data-testid': 'route-turnback' },
+        h('span.pr-marker.pr-turn-marker', { style: { '--truck': color } }, ui.icon('refresh', { size: 14 })),
+        h('div.pr-stop-main',
+          h('div.pr-stop-title', h('span', 'Turned back'), h('span.badge.badge-warn', 'Road closed ahead')),
+          k.isNum(tb.lat) ? h('div.small.faint.num', k.mgrs(tb.lat, tb.lon) || '') : null,
+          h('div.small.num.pr-times', 'Turned ' + k.dtg(tb.at)),
+          h('div.small.muted', rt.truckId + ' was driving into a road the re-plan found closed' + (k.isNum(tb.leg.miles) ? ', after ' + k.miles(tb.leg.miles) + ' of the leg' : '') +
+            '. It turned where it was and is routed on from this point' + (tb.nextStop ? ' to ' + (tb.nextStop.label || 'its next stop') : '') + '.')));
     },
 
     stopRow: function (state, plan, rt, st, i, color, settings) {

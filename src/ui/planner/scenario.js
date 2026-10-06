@@ -1,7 +1,8 @@
 // Planner Scenario tab (right panel): fleet per hub (add / remove trucks, mark out / back), closed and
 // risk zones drawn on the planner map, drop points (max count, pin / ban), the visible settings, the
-// Advanced section (travel factors, time-of-day table, risk ratings, mobility radii, daily use rates and
-// SOLVER TUNING built from SRO.solver.PARAMS) and the "Re-plan now" banner after a contingency.
+// Advanced section (travel factors, the re-plan ETA-change cost, time-of-day table, risk ratings,
+// mobility radii, daily use rates, the sample seed and SOLVER
+// TUNING built from SRO.solver.PARAMS) and the "Re-plan now" banner after a contingency.
 // Sources: spec-answers.md Sections 3-5 (Fleet, Road network, Risk, Time of day, Rally points,
 // Contingency, Planner settings, Solver tuning); DESIGN.md sections 3, 7 (Method parameters), 8, 8b.
 //
@@ -44,10 +45,11 @@
     { key: 'simplicity', label: 'Simplicity', help: 'Fewer stops per truck and fewer trucks on the road. Raise it for simpler plans.' }
   ];
   const METHOD_HELP = {
-    tabu: 'Balanced. Usually 5-30 s on a full window.',
-    sa: 'Thorough. Usually 1-3 min on a full window.',
-    aco: 'Ant colony. Builds many trial plans and learns from the best ones.',
-    mip: 'Exact model. Starts from a quick heuristic plan, runs up to the time limit and reports how close to the best possible plan it is.'
+    // no fixed run times: the Plan tab measures this window and shows an estimate before each run
+    tabu: 'Balanced. Quick; the Plan tab shows the expected run time before you press Plan now.',
+    sa: 'Thorough. Explores more widely and usually takes a little longer than Tabu search; the Plan tab shows the expected run time.',
+    aco: 'Ant colony. Builds many trial plans and learns from the best ones; the Plan tab shows the expected run time.',
+    mip: 'Exact model. Starts from a quick heuristic plan, runs up to the time limit (or until it proves its gap target) and reports its proven gap to the exact model\'s bound.'
   };
   const METHOD_SHORT = { tabu: 'Tabu', sa: 'Annealing', aco: 'Ant colony', mip: 'MIP' };
   const OUT_REASONS = [
@@ -65,7 +67,8 @@
     { id: 'settings', label: 'Settings', icon: 'sliders' }
   ];
   // settings changes that do not call for a re-plan of an approved plan
-  const NON_CONTINGENCY_SETTINGS = ['method', 'methodParams', 'timeLimitSec', 'sampleSeed', 'maxStops'];
+  // (etaSlipPerMin only prices a re-plan's ETA changes)
+  const NON_CONTINGENCY_SETTINGS = ['method', 'methodParams', 'timeLimitSec', 'sampleSeed', 'maxStops', 'etaSlipPerMin'];
 
   // ==== small helpers ==============================================================================
   function F() { return SRO.core.format; }
@@ -484,9 +487,30 @@
 
   // ==== drop points ===============================================================================
   function rallyCandidates() { return grid().filter(function (g) { return g.rallyCandidate; }); }
+  // Rally points of the current plan. A re-plan's plan.rallyPoints cover the whole window (the
+  // points of stops already made too), as does plan.windowStats.rallyPoints: both count toward the
+  // window's maxRallyPoints.
   function usedRally(st) {
     const p = activePlan(st) || (st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) : null);
     return (p && p.rallyPoints) || [];
+  }
+  function rallyCountOf(p) {
+    if (p && p.windowStats && isNum(p.windowStats.rallyPoints)) return p.windowStats.rallyPoints;
+    return ((p && p.rallyPoints) || []).length;
+  }
+  // ', 8 of 8 used this window (approved plan); 7 in draft P-0004': says which plan it counts, and adds
+  // the newest draft for the same window (a re-plan under review) when it uses a different number
+  function rallyUsedText(st, max) {
+    const ap = activePlan(st);
+    const last = st.ui.lastPlanId ? st.plans.find(function (x) { return x.id === st.ui.lastPlanId; }) || null : null;
+    const p = ap || last;
+    if (!p) return '';
+    const n = rallyCountOf(p);
+    const draft = ap && last && last !== ap && !last.approved && !last.superseded && last.windowId === ap.windowId ? last : null;
+    const dn = draft ? rallyCountOf(draft) : null;
+    if (!n && !dn) return '';
+    return ', ' + n + ' of ' + max + ' used this window (' + (p.approved ? 'approved plan' : 'draft ' + p.id) + ')' +
+      (draft && dn !== n ? '; ' + dn + ' in draft ' + draft.id : '');
   }
   function rallyMapPoints(st, used) {
     const r = st.scenario.rally || {};
@@ -504,7 +528,10 @@
     const name = g ? shortName(g.name) : id;
     if (what === 'pin') act({ type: 'rally/pin', gridId: id }, name + ' pinned: the optimizer will use it.');
     else if (what === 'ban') act({ type: 'rally/ban', gridId: id }, name + ' banned: the optimizer will not use it.');
-    else act({ type: 'rally/clear', gridId: id }, name + ': the optimizer decides again.');
+    else {
+      const was = getState() ? rallyState(getState(), id) : 'open';
+      act({ type: 'rally/clear', gridId: id }, name + (was === 'banned' ? ' unbanned' : ' unpinned') + ': the optimizer may use it or not.');
+    }
   }
   // Pin / Ban / Clear dialog for one point (used by map clicks).
   function rallyDialog(id) {
@@ -831,8 +858,9 @@
       replanning = false;
       rerender();
       if (plan && plan.id) {
-        ui.toast('Re-plan ready: review and approve it in the Plan tab.', 'success', { action: { label: 'Open Plan', onClick: function () { ui.plannerTabs.show('plan'); } } });
+        // the Plan tab opens on the re-plan, so the toast needs no button to get there
         ui.plannerTabs.show('plan');
+        ui.toast('Re-plan ready. Review the changes, then approve.', 'success');
       }
     }, function (err) {
       replanning = false;
@@ -1039,7 +1067,8 @@
       h('p.field-help', 'The optimizer picks which candidate points become drop points each window and which platoons use them, within each platoon\'s mobility radius. Pinned points are always used and count toward the maximum; banned points are never used.'),
       (r.pinned || []).length > max ? h('div.notice.notice-warn', icon('alert'), 'More points are pinned (' + r.pinned.length + ') than the maximum (' + max + '). Unpin some or raise the maximum.') : null,
       h('div.hstack.wrap.spread',
-        h('span.small.muted', (r.pinned || []).length + ' pinned, ' + (r.banned || []).length + ' banned, ' + all.length + ' candidates' + (used.length ? ', ' + used.length + ' used in the current plan' : '')),
+        h('span.small.muted', { 'data-testid': 'rally-counts' }, (r.pinned || []).length + ' pinned, ' + (r.banned || []).length + ' banned, ' + all.length + ' candidates' +
+          rallyUsedText(st, max)),
         ((r.pinned || []).length || (r.banned || []).length) ? h('button.btn.btn-sm.btn-ghost', { type: 'button', onClick: function () { act({ type: 'rally/clear' }, 'All pins and bans cleared.'); } }, 'Clear all') : null));
     const chips = h('div.chip-group.sc-rally-filter', { role: 'group', 'aria-label': 'Filter drop points' }, filters.map(function (f) {
       return h('button.chip', { type: 'button', 'aria-pressed': String(rallyFilter === f[0]), onClick: function () { rallyFilter = f[0]; blocks.rally.render(getState(), true); } }, f[1]);
@@ -1130,6 +1159,25 @@
       numField({ fk: 'mpg', label: 'Fuel burn', unit: 'mpg', value: s.mpg, def: d.mpg, min: 0.5, max: 10, step: 0.1, help: 'Miles per gallon per truck; gallons = miles / mpg.', onCommit: function (v) { updateSettings({ mpg: v }); } }),
       numField({ fk: 'service', label: 'Stop service time', unit: 'min', value: s.serviceMin, def: d.serviceMin, min: 0, max: 120, step: 1, int: true, help: 'Time spent at each stop to hand over supplies.', onCommit: function (v) { updateSettings({ serviceMin: v }); } }),
       numField({ fk: 'load', label: 'Hub load time', unit: 'min', value: s.loadMin, def: d.loadMin, min: 0, max: 240, step: 1, int: true, help: 'Time to load a truck at its hub before it leaves.', onCommit: function (v) { updateSettings({ loadMin: v }); } })));
+  }
+  // Re-plans: what an ETA change costs (settings.etaSlipPerMin; the engine's default when unset).
+  function buildReplanCost(st) {
+    const s = st.scenario.settings, d = scenarioDefaults();
+    const E = engine();
+    const dflt = isNum(d.etaSlipPerMin) ? d.etaSlipPerMin : (E && isNum(E.DEFAULT_ETA_SLIP_PER_MIN) ? E.DEFAULT_ETA_SLIP_PER_MIN : 1);
+    const v = isNum(s.etaSlipPerMin) ? s.etaSlipPerMin : dflt;
+    return advCard('Re-plans', null, h('div.form-grid',
+      numField({ fk: 'etaSlip', label: 'Cost of a later ETA', unit: 'points per minute', value: v, def: dflt, min: 0, max: 100, step: 0.5,
+        help: 'After a contingency, a re-plan that makes a load arrive later than the time the approved plan gave its platoon pays this for every minute later (on top of any late penalty). Higher keeps the times platoons were told; 0 lets a re-plan move them freely.',
+        onCommit: function (x) { updateSettings({ etaSlipPerMin: x }); } })));
+  }
+  // Demo data: the seed of the sample requests (spec: fixed seed, changeable).
+  function buildDemoData(st) {
+    const s = st.scenario.settings, d = scenarioDefaults();
+    return advCard('Demo data', null, h('div.form-grid',
+      numField({ fk: 'sampleSeed', label: 'Sample seed', value: s.sampleSeed, def: d.sampleSeed, min: 1, max: 999999999, step: 1, int: true,
+        help: 'Load sample requests (Queue) uses this number to pick and place the 19 sample requests. The same seed always gives the same set; change it for a different one. Takes effect the next time samples are loaded.',
+        onCommit: function (x) { updateSettings({ sampleSeed: x }); } })));
   }
   function periodBar(rows, v) {
     const colors = ['--sc-p0', '--sc-p1', '--sc-p2', '--sc-p3', '--sc-p4', '--sc-p5'];
@@ -1311,6 +1359,10 @@
           const raw = input.value.trim();
           if (raw === '' || !isFinite(Number(raw))) { err.hidden = false; err.textContent = 'Enter a number from ' + showVal(e.min) + ' to ' + showVal(e.max) + '.'; return; }
           err.hidden = true;
+          // one commit (and one 'kept within' toast) per value: a second change event for the same
+          // text before the panel redraws (Enter then blur) changes nothing
+          if (input.getAttribute('data-committed') === raw) return;
+          input.setAttribute('data-committed', raw);
           commitKnob(method, e.key, Number(raw));
         }
       });
@@ -1385,6 +1437,8 @@
     blocks.counts = block('sc-b-counts', function (st) { return [st.scenario.fleet, st.scenario.hubs]; }, buildFleetShortcut);
     blocks.rallyMax = block('sc-b-rmax', function (st) { return [settingsOf(st).maxRallyPoints]; }, buildRallyShortcut);
     blocks.travel = block('sc-b-travel', function (st) { const s = settingsOf(st); return [s.convoyFactor, s.mpg, s.serviceMin, s.loadMin]; }, buildTravel);
+    blocks.replanCost = block('sc-b-replan', function (st) { return [settingsOf(st).etaSlipPerMin]; }, buildReplanCost);
+    blocks.demoData = block('sc-b-demo', function (st) { return [settingsOf(st).sampleSeed]; }, buildDemoData);
     blocks.periods = block('sc-b-periods', function (st) { return [settingsOf(st).periods]; }, buildPeriods);
     blocks.risk = block('sc-b-risk', function (st) { return [settingsOf(st).riskRatings]; }, buildRisk);
     blocks.mobility = block('sc-b-mob', function (st) { return [settingsOf(st).mobility]; }, buildMobility);
@@ -1397,7 +1451,7 @@
     rally: ['rally'],
     settings: ['optimizer', 'weights', 'counts', 'rallyMax']
   };
-  const ADV_BLOCKS = ['travel', 'periods', 'risk', 'mobility', 'dailyUse', 'tuning'];
+  const ADV_BLOCKS = ['travel', 'replanCost', 'periods', 'risk', 'mobility', 'dailyUse', 'tuning', 'demoData'];
   let panels = {};
   let tabBtns = {};
   let advEl = null;

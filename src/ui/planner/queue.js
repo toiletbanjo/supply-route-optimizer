@@ -223,7 +223,7 @@
       add('Location', h('span.num', k.mgrs(r.lat, r.lon) || 'n/a'));
       add('NLT', h('span.num', k.dtg(r.nlt)));
       if (k.isNum(r.deadline) && r.deadline !== r.nlt) add('Deadline', h('span.num.text-danger', k.dtg(r.deadline) + ' (supply runs out)'));
-      add('Mobility', (k.MOBILITY_LABELS[r.mobility] || r.mobility) + (k.isNum(r.maxTravelMi) && r.mobility !== 'fixed' ? ', up to ' + k.miles(r.maxTravelMi) + ' to a pickup point' : ''));
+      add('Mobility', (k.MOBILITY_LABELS[r.mobility] || r.mobility) + (k.isNum(r.maxTravelMi) && r.mobility !== 'fixed' ? ', up to ' + k.radius(r.maxTravelMi) + ' to a pickup point' : ''));
       add('Pickup', k.pickupText(state, r));
       if (r.directOnly && r.directReason) add('Direct because', r.directReasonText || String(r.directReason).replace(/-/g, ' '));
       const x = idx.byRequest[r.id];

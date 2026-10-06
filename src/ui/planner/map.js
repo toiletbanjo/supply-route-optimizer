@@ -70,8 +70,13 @@
     selFns.push(fn);
     return function () { const i = selFns.indexOf(fn); if (i >= 0) selFns.splice(i, 1); };
   };
-  // show a plan in the planner views and tell the others (Outputs listens to 'planner:plan-selected')
+  // show a plan in the planner views and tell the others (Outputs listens to 'planner:plan-selected').
+  // The planner's pick wins over a plan stored just before it (Compare stores one plan per method, the
+  // last of them not the cheapest): the current ui.lastPlanId counts as seen, so the next
+  // K.viewedPlan does not hand the view to that stored plan.
   K.showPlan = function (planId) {
+    const st = SRO.app && SRO.app.store && SRO.app.store.getState();
+    if (planId && st) K._seenLastPlanId = (st.ui || {}).lastPlanId;
     const changed = K.select({ planId: planId || null });
     if (planId && ui.emit) ui.emit('planner:plan-selected', { planId: planId, source: 'plan' });
     return changed;
@@ -88,6 +93,8 @@
   K.gallons = function (x) { return F().gallons(x); };
   K.num = function (x, d) { return F().number(x, d || 0); };
   K.qty = function (q, unit) { return F().qty(q, unit); };
+  // a radius or travel limit: '50 mi', '12.5 mi' (no '.0' on whole miles)
+  K.radius = function (x) { return K.isNum(x) ? F().qty(Math.round(x * 10) / 10, 'mi') : F().NA; };
   K.classLabel = function (c) { return F().classLabel(c); };
   K.mgrs = function (lat, lon) { return F().mgrs(lat, lon, 5); };
   K.duration = function (min) { return F().duration(min); };
@@ -95,6 +102,7 @@
   // run times are seconds, which format.duration (whole minutes) cannot show
   K.secs = function (s) {
     if (typeof s !== 'number' || !isFinite(s)) return 'n/a';
+    if (s > 0 && s < 0.05) return '<0.1 s';
     if (s < 10) return (Math.round(s * 10) / 10).toFixed(1) + ' s';
     if (s < 90) return Math.round(s) + ' s';
     const m = Math.floor(Math.round(s) / 60), r = Math.round(s) % 60;
@@ -181,18 +189,27 @@
     (r.lines || []).forEach(function (l) { if (l && l.classId) seen[l.classId] = true; });
     return order.filter(function (c) { return seen[c]; }).concat(Object.keys(seen).filter(function (c) { return order.indexOf(c) < 0; }));
   };
-  // 'Diesel / JP-8, JP-8: 500 gal'
+  // 'MREs, Mixed menus: 32 cases'; 'Diesel / JP-8: 500 gal' (option JP-8 left out: the name says it)
   K.lineText = function (line, qtyOverride) {
     const CH = SRO.data.catalogHelpers;
     const it = CH && CH.itemById(line.itemId);
     const name = it ? it.name : (line.itemId || 'Item');
     let opt = '';
     if (it && it.freeText) opt = line.option || '';
-    else if (it) { const o = CH.optionById(line.itemId, line.option); opt = o ? o.label : (line.option || ''); }
+    else if (it && (it.options || []).length > 1) { const o = CH.optionById(line.itemId, line.option); opt = o ? o.label : (line.option || ''); }
+    else if (!it) opt = line.option || '';
     const q = qtyOverride !== undefined ? qtyOverride : line.qty;
     const unit = CH && CH.unitLabel ? CH.unitLabel(line.unit || (it && it.unit), q) : (line.unit || '');
-    const optText = opt && opt.toLowerCase() !== name.toLowerCase() ? ', ' + opt : '';
-    return name + optText + ': ' + K.qty(q, unit);
+    return K.itemName(name, opt) + ': ' + K.qty(q, unit);
+  };
+  // Item name and option in one, the option only when it adds something: an item with one option
+  // shows its name alone (the caller passes no option), 'Diesel / JP-8' already says JP-8, and an
+  // option that contains the name ('AT4 (84 mm)') stands for both.
+  K.itemName = function (name, opt) {
+    const nl = String(name || '').toLowerCase(), ol = String(opt || '').toLowerCase();
+    if (!ol || ol === nl || (ol.length >= 3 && nl.indexOf(ol) >= 0)) return name;
+    if (nl.length >= 2 && ol.indexOf(nl) >= 0) return opt;
+    return name + ', ' + opt;
   };
   K.lineUnit = function (line, qty) {
     const CH = SRO.data.catalogHelpers;
@@ -258,6 +275,37 @@
     const miles = legs.reduce(function (a, l) { return a + (K.isNum(l.miles) ? l.miles : 0); }, 0);
     const mpg = (state && state.scenario && state.scenario.settings && state.scenario.settings.mpg) || 2;
     return { miles: miles, gallons: miles / mpg, replannedMiles: K.isNum(route.miles) ? route.miles : null };
+  };
+
+  // For each leg of a route, the index of the stop it arrives at, or -1 (the drive back to the hub, or
+  // a re-plan's turn-back leg to a 'pos:<truck>' point). Legs and stops are in time order and match
+  // by node key (leg.toKey = stop.nodeKey); legs without keys pair up with stops by position.
+  K.legStops = function (route) {
+    const legs = (route && route.legs) || [], stops = (route && route.stops) || [];
+    const keyed = legs.every(function (l) { return l && l.toKey; }) && stops.every(function (st) { return st && st.nodeKey; });
+    if (!keyed) return legs.map(function (l, i) { return i < stops.length ? i : -1; });
+    let s = 0;
+    return legs.map(function (l) {
+      if (s < stops.length && l.toKey === stops[s].nodeKey && !l.turnedBack) return s++;
+      return -1;
+    });
+  };
+  // The turn-back of a re-plan: a truck driving into a newly closed road turned where it was and
+  // was routed on from that point. -> null or { legIndex, leg, lat, lon, at, nextStop }
+  K.turnBack = function (route) {
+    const legs = (route && route.legs) || [];
+    const i = legs.findIndex(function (l) { return l && l.turnedBack; });
+    if (i < 0) return null;
+    const leg = legs[i];
+    let pt = null;
+    try {
+      const c = typeof leg.path === 'string' && leg.path ? SRO.core.geo.decodePolyline(leg.path, 5) : Array.isArray(leg.coords) ? leg.coords : null;
+      if (c && c.length) pt = c[c.length - 1];
+    } catch (e) { pt = null; }
+    const ix = K.legStops(route);
+    let next = null;
+    for (let j = i + 1; j < legs.length; j++) if (ix[j] >= 0) { next = route.stops[ix[j]]; break; }
+    return { legIndex: i, leg: leg, lat: pt ? pt[0] : null, lon: pt ? pt[1] : null, at: leg.arrive, nextStop: next };
   };
 
   const indexCache = new WeakMap();
@@ -354,7 +402,11 @@
     if (hub) pts.push({ lat: hub.lat, lon: hub.lon, label: hub.name });
     stops.forEach(function (s) { pts.push({ lat: s.lat, lon: s.lon, label: s.label }); });
     if (hub) pts.push({ lat: hub.lat, lon: hub.lon, label: hub.name });
-    let legs = (route.legs || []).map(function (l, i) {
+    // a leg with no path is drawn between the points it joins: by stop when the legs carry node keys
+    // (a re-plan's turn-back leg is not one leg per stop), else by position
+    const ix = K.legStops(route);
+    let legs = (route.legs || []).map(function (l, i0) {
+      const i = ix[i0] >= 0 ? ix[i0] : (i0 === (route.legs || []).length - 1 ? stops.length : i0);
       let coords = null, approx = false, source = l.source || null;
       if (Array.isArray(l.coords) && l.coords.length >= 2) coords = l.coords;
       else if (typeof l.path === 'string' && l.path) { try { coords = geo.decodePolyline(l.path, 5); } catch (e) { coords = null; } }
@@ -499,7 +551,8 @@
         truckId: rt.truckId, color: K.truckColor(state, rt.truckId, rt), legs: legs,
         label: rt.truckId + ' (' + K.truckTypeLabel(rt.type || (t && t.type)) + ')',
         summary: (rt.stops || []).length + ' stops, ' + K.miles(K.routeTrip(rt, state).miles) +
-          (K.isStoppedRoute(rt) ? ', ' + (rt.out ? 'out of service' : 'cut off by a closed road') : ', back ' + K.dtg(rt.returnAt)),
+          (K.isStoppedRoute(rt) ? ', ' + (rt.out ? 'out of service' : 'cut off by a closed road') : ', back ' + K.dtg(rt.returnAt)) +
+          (K.turnBack(rt) ? '; turned back from a closed road at ' + K.time(K.turnBack(rt).at) : ''),
         stops: (rt.stops || []).map(function (s, i) { return { lat: s.lat, lon: s.lon, seq: s.seq !== undefined ? s.seq : i + 1, label: s.label }; })
       };
     });
@@ -527,10 +580,15 @@
       const t = K.truck(state, id) || {};
       let status = pos.status === 'en-route' ? 'En route' : 'At stop';
       const stops = rt.stops || [];
-      const nextIdx = pos.status === 'en-route' ? pos.legIndex : pos.legIndex + 1;
+      // legIndex counts legs, not stops (a re-plan's turn-back leg ends at no stop)
+      const ix = K.legStops(rt);
+      const stopAfter = function (li) { for (let j = Math.max(0, li); j < ix.length; j++) if (ix[j] >= 0) return ix[j]; return stops.length; };
+      const nextIdx = pos.status === 'en-route' ? stopAfter(pos.legIndex) : stopAfter(pos.legIndex + 1);
+      const atIdx = pos.legIndex >= 0 ? ix[pos.legIndex] : -1;
       if (pos.status === 'en-route' && nextIdx < stops.length) status += ' to stop ' + (nextIdx + 1) + ', ETA ' + K.dtg(stops[nextIdx].arrive);
       else if (pos.status === 'en-route') status += ' back to hub, ETA ' + K.dtg(rt.returnAt);
-      else if (pos.legIndex >= 0 && stops[pos.legIndex]) status = 'At stop ' + (pos.legIndex + 1) + ' (' + (stops[pos.legIndex].label || '') + ')';
+      else if (atIdx >= 0 && stops[atIdx]) status = 'At stop ' + (atIdx + 1) + ' (' + (stops[atIdx].label || '') + ')';
+      else if (pos.legIndex >= 0 && rt.legs[pos.legIndex] && rt.legs[pos.legIndex].turnedBack) status = 'Turned back from a closed road';
       out.push({ id: id, color: K.truckColor(state, id, rt), type: rt.type || t.type, lat: pos.lat, lon: pos.lon, heading: pos.status === 'en-route' ? pos.heading : null, status: status });
     });
     return out;
@@ -664,6 +722,7 @@
         const routeKey = [plan && plan.routes, sc.zones, sc.fleet, hi];
         if (!same(routeKey, last.routeKey)) {
           m.setRoutes(routesFor(state, plan), { highlightTruckId: hi });
+          this.drawTurnBacks(state, plan);
           last.routeKey = routeKey;
         }
         const legendKey = [plan && plan.routes, sc.fleet];
@@ -680,6 +739,36 @@
           if (!m.leaflet.getBounds().pad(-0.12).contains(ll)) m.leaflet.panTo(ll, { animate: true });
         }
       } else if (K.sel.focusSeq !== last.focusSeq && K.sel.source !== 'queue') last.focusSeq = K.sel.focusSeq;
+    },
+
+    // A truck of a re-plan that drove into a newly closed road: its route shows the part it drove
+    // (the turn-back leg, solid like any driven road: a dashed line on this map means an approximate
+    // road, and the map moves lines into lanes, so an overlay would not stay on it) ending at a marker
+    // where it turned and was routed on from. The marker is a callout, a dot on the turn point and the
+    // turn-back badge up and to the right, so the truck symbol, which sits on that point at the moment
+    // of the re-plan, does not hide it. It is in the map's stop pane, in the truck's colour.
+    drawTurnBacks: function (state, plan) {
+      const L = root.L, lm = this.m && this.m.leaflet;
+      if (!L || !lm) return;
+      if (!this.turnLayer) this.turnLayer = L.layerGroup().addTo(lm);
+      this.turnLayer.clearLayers();
+      const self = this;
+      K.usedRoutes(plan).forEach(function (rt) {
+        const tb = K.turnBack(rt);
+        if (!tb || !K.isNum(tb.lat) || !K.isNum(tb.lon)) return;
+        const color = K.truckColor(state, rt.truckId, rt);
+        const tipText = rt.truckId + ' turned back here at ' + K.dtg(tb.at) + ': the road ahead is closed. Re-routed from this point' +
+          (tb.nextStop ? ' to ' + (tb.nextStop.label || 'its next stop') : '') + '.';
+        const mk = L.marker([tb.lat, tb.lon], {
+          pane: 'sro-stops', keyboard: false, zIndexOffset: 1200, title: tipText, alt: tipText,
+          icon: L.divIcon({ className: 'pm-turn-icon', iconSize: [44, 44], iconAnchor: [5, 39],
+            html: '<div class="pm-turn-callout" style="--truck:' + color + '">' +
+              '<svg class="pm-turn-stalk" viewBox="0 0 44 44" width="44" height="44" aria-hidden="true"><path d="M5 39L24 20"/><circle cx="5" cy="39" r="3.5"/></svg>' +
+              '<div class="pm-turn" data-truck="' + String(rt.truckId).replace(/[^\w-]/g, '') + '">' +
+              '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div></div>' })
+        }).addTo(self.turnLayer);
+        mk.on('click', function () { self.openRoute(rt.truckId); });
+      });
     },
 
     // ---- legend (Leaflet control, bottom right: open sea east of Taiwan) ----------------------------------------------------
@@ -760,7 +849,10 @@
           sym(S.SIDC.hub, 'Hub', { infoFields: false }),
           sym(S.SIDC.rally, 'Rally point', { infoFields: false }),
           h('div.pm-legend-row', h('span.pm-legend-zone.is-closed'), h('span', 'Closed zone')),
-          h('div.pm-legend-row', h('span.pm-legend-zone.is-risk'), h('span', 'Risk zone'))),
+          h('div.pm-legend-row', h('span.pm-legend-zone.is-risk'), h('span', 'Risk zone')),
+          routes.some(function (rt) { return K.turnBack(rt); })
+            ? h('div.pm-legend-row', { 'data-testid': 'legend-turnback' }, h('span.pm-turn.pm-turn-sm', { html: '<svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' }), h('span', 'Turned back (road closed ahead)'))
+            : null),
         h('div.pm-legend-hint', 'Faint rally points are candidates the plan does not use.')));
     }
   };
