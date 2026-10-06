@@ -269,6 +269,8 @@ async function openPage(browser, url, { viewport, touch = false, tileMode = 'blo
       }
     });
   }
+  // the harness opens from file://, where the app skips OSM tiles; let it exercise the hosted tile logic
+  if (tileMode !== 'file') await ctx.addInitScript(() => { window.__sroFileTiles = true; });
   const page = await ctx.newPage();
   const bag = { errors: [], tiles: 0, external: [], blockedTiles: tileMode === 'block' };
   watchConsole(page, bag);
@@ -1333,6 +1335,16 @@ async function main() {
       await ctx.close();
     }
 
+    // 2b. opened from a file: OSM tiles are never requested (they would all be 403 policy images) --
+    {
+      const { ctx, page, bag } = await openPage(browser, base + '?theme=dark', { viewport: { width: 1000, height: 700 }, tileMode: 'file' });
+      allBags.push(['file-no-tiles', bag]);
+      await page.waitForTimeout(800);
+      const st = await page.evaluate(() => H.map.status());
+      check('file:// page skips OSM tiles and shows the outline map', st.tiles === 'off' && st.reason === 'file' && st.roads === true && bag.tiles === 0, { st, tileReqs: bag.tiles });
+      await ctx.close();
+    }
+
     // 3. tiles served (simulated OSM), dark + night filters -------------------------------------------
     {
       const { ctx, page, bag } = await openPage(browser, base + '?theme=dark', { viewport: { width: 1440, height: 900 }, tileMode: 'serve' });
@@ -1356,6 +1368,7 @@ async function main() {
     // 4. blocked with a 403 image body: tileload fires, the fetch probe must catch it --------------------
     {
       const ctx = await browser.newContext({ viewport: { width: 800, height: 600 } });
+      await ctx.addInitScript(() => { window.__sroFileTiles = true; });   // exercise the hosted tile logic from file://
       const page = await ctx.newPage();
       const bag = { errors: [], tiles: 0, external: [], blockedTiles: true };
       watchConsole(page, bag); allBags.push(['tiles-403-png', bag]);

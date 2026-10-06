@@ -55,6 +55,7 @@
   MAP.TAIWAN_BOUNDS = [[21.88, 120.02], [25.32, 122.02]];
   MAP.MAX_BOUNDS = [[20.6, 118.2], [26.6, 123.4]];
   MAP.OSM_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+  MAP.FILE_TILES = !!root.__sroFileTiles;   // test harness only: allow tiles on a file:// page
   MAP.OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
   MAP.ROADS_ATTRIBUTION = 'Road data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors (ODbL), via <a href="https://overturemaps.org">Overture Maps Foundation</a>';
   MAP.COAST_ATTRIBUTION = 'Coastline: <a href="https://www.naturalearthdata.com">Natural Earth</a>';
@@ -447,6 +448,9 @@
       if (destroyed) return;
       if (!tiles.wanted) { tiles.state = 'off'; tiles.reason = 'disabled'; syncBase(); return; }
       if (root.navigator && root.navigator.onLine === false) { fallback('offline'); return; }
+      // A page opened from a file sends no Referer, and OSM answers every tile with a 403
+      // "tile usage policy" image (DESIGN section 6), so skip tiles there.
+      if (root.location && root.location.protocol === 'file:' && !MAP.FILE_TILES) { fallback('file'); return; }
       tiles.state = 'loading'; tiles.reason = null; tiles.loads = 0; tiles.errors = 0;
       const layer = tilesLayer();
       if (!map.hasLayer(layer)) map.addLayer(layer);
