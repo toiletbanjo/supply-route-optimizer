@@ -254,7 +254,7 @@
     }
     const chR = new I32(nCh), chV = new I32(nCh), chC = new I32(nCh);
     const viR = new I32(nVis), viV = new I32(nVis);
-    const routesFuel = [], routesCargo = [], multi = [], nonEmpty = [];
+    const routesFuel = [], routesCargo = [], openFuel = [], openCargo = [], multi = [], nonEmpty = [];
     let k = 0, kv = 0;
     for (let r = 0; r < nR; r++) {
       const v = routes[r].vehicle;
@@ -263,6 +263,7 @@
       if (ok) {
         if (routeOfVeh[v] < 0) routeOfVeh[v] = r;
         (P.vFuel[v] ? routesFuel : routesCargo).push(r);
+        if (!P.vPre[v]) (P.vFuel[v] ? openFuel : openCargo).push(r);   // routes an unlocked job may use
       }
       const vs = routes[r].visits;
       if (vs.length >= 2) multi.push(r);
@@ -285,7 +286,7 @@
       instance: instance, P: P, sol: sol, routes: routes, nR: nR, veh: veh, load: load, delivered: delivered,
       rallyUse: rallyUse, rallyDistinct: rallyDistinct, routeOfVeh: routeOfVeh,
       nCh: nCh, chR: chR, chV: chV, chC: chC, nVis: nVis, viR: viR, viV: viV,
-      routesFuel: routesFuel, routesCargo: routesCargo, multi: multi, nonEmpty: nonEmpty, deferredJobs: deferredJobs,
+      routesFuel: routesFuel, routesCargo: routesCargo, openFuel: openFuel, openCargo: openCargo, multi: multi, nonEmpty: nonEmpty, deferredJobs: deferredJobs,
       lockLists: Object.create(null)
     };
   };
@@ -304,13 +305,15 @@
       }
       return l;
     }
-    return P.jFuel[j] ? ctx.routesFuel : ctx.routesCargo;
+    return P.jFuel[j] ? ctx.openFuel : ctx.openCargo;
   }
-  function vehOK(ctx, j, r) {   // job j may ride on route r's vehicle (type + lock)
+  // job j may ride on route r's vehicle (type + lock; a preloaded en-route truck carries only the jobs
+  // locked to it, so an unlocked job never goes on one)
+  function vehOK(ctx, j, r) {
     const P = ctx.P, v = ctx.veh[r];
     if (v < 0 || P.vFuel[v] !== P.jFuel[j]) return false;
     const lk = P.jLockV[j];
-    return lk === -1 || lk === v;
+    return lk === -1 ? !P.vPre[v] : lk === v;
   }
   function freeCap(ctx, r) { const v = ctx.veh[r]; return v < 0 ? 0 : ctx.P.vCap[v] - ctx.load[r]; }
   function capEps(ctx, r) { const v = ctx.veh[r]; return 1e-9 * mmax(1, v < 0 ? 1 : ctx.P.vCap[v]); }

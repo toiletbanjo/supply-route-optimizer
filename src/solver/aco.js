@@ -231,6 +231,7 @@
     const hasPeriods = P.nP > 0, legArrive = S.legArrive, legOut = new F64(2);
     const isRally = P.isRally, candCost = P.candCost, jReq = P.jReq;
     const jDeadline = P.jDeadline, jLateW = P.jLateW, jLateCap = P.jLateCap, jInvQty = P.jInvQty, jEps = P.jEps;
+    const jPrevEta = P.jPrevEta, jSlipW = P.jSlipW;
     const vT0 = P.vT0, vStart = P.vStart, vHub = P.vHub, vCap = P.vCap, vFuel = P.vFuel;
     const pinNode = new U8(nN);
     for (let i = 0; i < P.pinNodes.length; i++) pinNode[P.pinNodes[i]] = 1;
@@ -255,11 +256,12 @@
       legOut[0] = 1; return t + base;
     }
     function legCost(a, b, rf) { const k = a * nN + b; return cm * MI[k] + wR * RK[k] * rf; }
-    // lateness cost of the whole job j delivered at minute a (the caller scales it by the chunk share)
+    // lateness + ETA slip cost of the whole job j delivered at minute a, within the lateness cap (as
+    // evaluate charges lateness + stability; the caller scales it by the chunk share)
     function lateCost(j, a) {
-      const l = a - jDeadline[j];
-      if (!(l > 0)) return 0;
-      const x = l * jLateW[j];
+      const l = a - jDeadline[j], e = a - jPrevEta[j];
+      if (!(l > 0) && !(e > 0 && jSlipW[j] > 0)) return 0;
+      const x = (l > 0 ? l * jLateW[j] : 0) + (e > 0 ? e * jSlipW[j] : 0);
       return x > jLateCap[j] ? jLateCap[j] : x;
     }
     // exact schedule of route v from visit s0 on (arrivals, leg costs, return leg), as evaluate() runs it
@@ -325,7 +327,7 @@
       const gainW = P.jDeferW[j] * jInvQty[j];
       for (let v = 0; v < nV; v++) {
         if (vFuel[v] !== P.jFuel[j]) continue;
-        if (lk !== -1 && lk !== v) continue;
+        if (lk === -1 ? P.vPre[v] : lk !== v) continue;     // lock; en-route trucks carry only their own loads
         const free = vCap[v] - load[v];
         if (free <= jEps[j]) continue;
         const q = r < free ? r : free;

@@ -414,6 +414,42 @@ test('contingency re-plan: approving a child plan supersedes the parent and flag
   assert.equal(s.windows[0].approvedPlanId, 'P-0002');
 });
 
+test('plan/approve refuses a plan that breaks planning rules while a draft for the same window and parent meets them all', () => {
+  // Before the fix a re-plan with 4 rally points over a limit of 3 (cost 10,029,840.88) was approved.
+  const stats = (violations) => ({ ...samplePlan().stats, violations, feasible: !violations });
+  const broken = (id) => samplePlan({ id, parentPlanId: 'P-0001', name: 'Re-plan, over the limit', stats: stats(1),
+    violations: [{ code: 'too-many-rally', detail: 'The plan uses 4 rally points; the limit is 3.' }] });
+  const st = storeWithThreeRequests();
+  st.dispatch({ type: 'plan/store', plan: samplePlan({ stats: stats(0) }) });
+  assert.equal(st.dispatch({ type: 'plan/approve', planId: 'P-0001' }).ok, true);
+  st.dispatch({ type: 'plan/store', plan: broken('P-0002') });
+  st.dispatch({ type: 'plan/store', plan: samplePlan({ id: 'P-0003', parentPlanId: 'P-0001', name: 'Re-plan', stats: stats(0) }) });
+  st.dispatch({ type: 'plan/store', plan: samplePlan({ id: 'P-0004', windowId: 'W-D1-1200', name: 'Other window' }) });
+  const res = st.dispatch({ type: 'plan/approve', planId: 'P-0002' });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'infeasible-plan');
+  assert.equal(res.violations, 1);
+  assert.deepEqual(Array.from(res.alternativeIds), ['P-0003'], 'only a draft of the same window and parent counts');
+  assert.equal(res.error, 'Plan P-0002 breaks 1 planning rule (The plan uses 4 rally points; the limit is 3.), and plan P-0003 meets them all. Approve that plan instead, or re-plan.');
+  let s = st.getState();
+  assert.equal(s.plans.find((p) => p.id === 'P-0001').approved, true, 'the parent stays in force');
+  assert.equal(s.plans.find((p) => p.id === 'P-0002').approved, false);
+  // with no rule-abiding draft for that window and parent it is approved, with a warning to show
+  const st2 = storeWithThreeRequests();
+  st2.dispatch({ type: 'plan/store', plan: samplePlan({ stats: stats(0) }) });
+  st2.dispatch({ type: 'plan/approve', planId: 'P-0001' });
+  st2.dispatch({ type: 'plan/store', plan: broken('P-0002') });
+  const res2 = st2.dispatch({ type: 'plan/approve', planId: 'P-0002' });
+  assert.equal(res2.ok, true);
+  assert.equal(res2.supersededPlanId, 'P-0001');
+  assert.equal(res2.violations, 1);
+  assert.match(res2.warning, /^Plan P-0002 breaks 1 planning rule \(.*\)\. No other plan for this window meets every rule/);
+  s = st2.getState();
+  assert.equal(s.plans.find((p) => p.id === 'P-0002').approved, true);
+  // plans without violation counts (older saves) approve as before
+  assert.equal(st.dispatch({ type: 'plan/approve', planId: 'P-0004' }).warning, undefined);
+});
+
 test('plan/rename and snapshot/save', () => {
   const st = storeWithThreeRequests();
   assert.equal(st.dispatch({ type: 'snapshot/save', name: 'none yet' }).ok, false);

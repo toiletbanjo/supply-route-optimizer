@@ -16,8 +16,22 @@
 // falls back to DEFAULT_PENALTIES on its own (SRO.solver.resolvePenalties shows the merged values).
 // Prepared per job: jLateW = latePerMin[tier], jDeferW = defer[tier] x classFactor[classRank],
 // jLateCap = lateCapShare x jDeferW (lateness cap per job, scaled by the chunk share like lateness).
+// ETA stability (contingency re-plans): a job may carry prevEta (the minute the approved plan gave
+// its platoon) and slipPerMin (>= 0); jPrevEta / jSlipW. Each minute a chunk arrives after prevEta
+// costs slipPerMin; lateness + slip share the lateness cap (evaluate cost.stability).
 // pinNodes = pinned rally nodes that are a candidate of at least one job (each costs pinUnused when it
 // receives no delivered quantity).
+//
+// En-route trucks (contingency re-plans): a vehicle with preloaded: true is already on the road and
+// carries only what is on board, so it may deliver only jobs locked to it (lockedTruck = its id).
+// P.vPre marks them; vehicleCompatible, every move and construct path, ACO, the MIP model and
+// evaluate (violation 'not-on-board') all apply the rule, so no search builds a plan that puts a pool
+// load on a truck that has already left the hub.
+//
+// Rally points already open: a rally node with rallyDone: true was used by a stop already made in
+// this window (contingency re-plans). It does not count toward params.maxRallyPoints again (the
+// engine lowers maxRallyPoints by the done ones), so P.isRally is 0 for it; it is still a valid
+// pickup point.
 //
 // Travel time (FIFO): SRO.solver.legArrive(P, depart, baseMinutes, out) integrates a leg across the
 // time-of-day periods: in each period the truck covers base minutes at period.speed per clock minute.
@@ -144,7 +158,7 @@
     };
     // nodes
     P.isRally = new U8(nN); P.banned = new U8(nN); P.pinned = new U8(nN);
-    for (let i = 0; i < nN; i++) if (nodes[i] && nodes[i].kind === 'rally') P.isRally[i] = 1;
+    for (let i = 0; i < nN; i++) if (nodes[i] && nodes[i].kind === 'rally' && !nodes[i].rallyDone) P.isRally[i] = 1;
     (pa.bannedRally || []).forEach(function (n) { if (isInt(n) && n >= 0 && n < nN) P.banned[n] = 1; });
     (pa.pinnedRally || []).forEach(function (n) { if (isInt(n) && n >= 0 && n < nN) P.pinned[n] = 1; });
     // periods
@@ -180,11 +194,12 @@
     P.legOut = new F64(2);                          // scratch for legArrive (risk factor, departure period)
     // vehicles
     P.vFuel = new U8(nV); P.vCap = new F64(nV); P.vHub = new I32(nV); P.vStart = new I32(nV);
-    P.vT0 = new F64(nV); P.vLoadStart = new F64(nV);
+    P.vT0 = new F64(nV); P.vLoadStart = new F64(nV); P.vPre = new U8(nV);
     P.vehIndex = Object.create(null);
     for (let v = 0; v < nV; v++) {
       const ve = vehicles[v] || {};
       P.vFuel[v] = ve.type === 'tanker' ? 1 : 0;
+      P.vPre[v] = ve.preloaded ? 1 : 0;              // en route: only jobs locked to it
       P.vCap[v] = num(ve.capacity, 0);
       const hub = isInt(ve.hubNode) && ve.hubNode >= 0 && ve.hubNode < nN ? ve.hubNode : 0;
       P.vHub[v] = hub;
@@ -198,6 +213,7 @@
     P.jFuel = new U8(nJ); P.jQty = new F64(nJ); P.jInvQty = new F64(nJ); P.jEps = new F64(nJ);
     P.jTier = new I32(nJ); P.jClass = new I32(nJ); P.jDeadline = new F64(nJ); P.jHard = new U8(nJ);
     P.jLateW = new F64(nJ); P.jDeferW = new F64(nJ); P.jLateCap = new F64(nJ); P.jReq = new I32(nJ); P.jLockV = new I32(nJ);
+    P.jPrevEta = new F64(nJ); P.jSlipW = new F64(nJ);
     P.cand = new I32(nJ * nN).fill(-1); P.candCost = new F64(nJ * nN);
     P.jCandNodes = new Array(nJ);
     const reqIndex = Object.create(null); let nReq = 0;
@@ -217,6 +233,9 @@
       P.jDeferW[j] = num(defer[tier], 0) * num(cf[cr], 1);
       // lateness cap: lateCapShare x the job's deferral cost (Infinity share = no cap)
       P.jLateCap[j] = capShare === INF ? INF : capShare * P.jDeferW[j];
+      // ETA stability: minutes after the approved plan's ETA cost slipPerMin (0 without a prevEta)
+      const pe = typeof jb.prevEta === 'number' && isFinite(jb.prevEta) ? jb.prevEta : INF;
+      P.jPrevEta[j] = pe; P.jSlipW[j] = pe < INF ? mmax(0, num(jb.slipPerMin, 0)) : 0;
       const rk = jb.requestId != null ? String(jb.requestId) : '\u0000job' + j;
       if (!(rk in reqIndex)) reqIndex[rk] = nReq++;
       P.jReq[j] = reqIndex[rk];
@@ -427,9 +446,10 @@
   S.typeCompatible = function (vehicle, job) {
     return !!vehicle && !!job && S.GROUP_TYPE[job.group] === vehicle.type;
   };
-  // Right vehicle type for the job's load group and, if the job is locked, the locked truck.
+  // Right vehicle type for the job's load group and, if the job is locked, the locked truck. A truck
+  // already on the road (preloaded) takes only the jobs locked to it (what it has on board).
   S.vehicleCompatible = function (vehicle, job) {
-    return S.typeCompatible(vehicle, job) && (job.lockedTruck == null || job.lockedTruck === vehicle.id);
+    return S.typeCompatible(vehicle, job) && (job.lockedTruck == null ? !vehicle.preloaded : job.lockedTruck === vehicle.id);
   };
   S.jobsByGroup = function (instance) {
     const out = { fuel: [], cargo: [] };
@@ -441,7 +461,7 @@
     (instance.vehicles || []).forEach(function (v, i) { (out[v.type] || (out[v.type] = [])).push(i); });
     return out;
   };
-  // Vehicle indexes that may carry job j (type + lock).
+  // Vehicle indexes that may carry job j (type + lock + en-route rule).
   S.compatibleVehicles = function (instance, j) {
     const job = instance.jobs[j], out = [];
     (instance.vehicles || []).forEach(function (v, i) { if (S.vehicleCompatible(v, job)) out.push(i); });
@@ -622,6 +642,8 @@
       if (!isInt(jb.tier) || jb.tier < 0 || jb.tier >= late.length) out.push(name + ' tier must be 0-' + (late.length - 1) + '.');
       if (!isInt(jb.classRank) || jb.classRank < 0 || jb.classRank >= cf.length) out.push(name + ' classRank must be 0-' + (cf.length - 1) + '.');
       if (jb.deadline != null && typeof jb.deadline !== 'number') out.push(name + ' deadline must be a minute number.');
+      if (jb.prevEta != null && !(typeof jb.prevEta === 'number' && isFinite(jb.prevEta))) out.push(name + ' prevEta must be a minute number.');
+      if (jb.slipPerMin != null && !(typeof jb.slipPerMin === 'number' && jb.slipPerMin >= 0 && isFinite(jb.slipPerMin))) out.push(name + ' slipPerMin must be 0 or more.');
       if (!isArray(jb.candidates)) out.push(name + ' needs a candidates list.');
       else jb.candidates.forEach(function (c) {
         if (!c || !isInt(c.node) || c.node < 0 || c.node >= nN) out.push(name + ' has a candidate that is not a node index.');

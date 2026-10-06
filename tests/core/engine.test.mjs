@@ -398,6 +398,66 @@ test('fixPreloaded: en-route trucks carry only what is on board', () => {
   assert.equal(E.fixPreloaded(b, start), start);
 });
 
+// ---- fix review (2026-10-06): en-route trucks, rally limit, warm start, infeasible approve ----------
+test('fixPreloaded: an onboard load goes back on its truck only within maxRallyPoints, else it waits with a note', () => {
+  // Before the fix the repair re-inserted onboard loads at any rally point, so a plan at the limit came
+  // out with one more (too-many-rally, 1e7 per violation): on a loaded machine the banned-rally test
+  // below failed that way (tabu cut short -> pool jobs on the en-route truck -> repair over the limit).
+  const { st, parent } = contingencyFixture();
+  const b = E.buildInstance(st.getState(), { contingency: true });
+  b.parentPlan = parent;
+  const inst = b.instance;
+  const start = E.contingencyStart(b);
+  const P = Sv.prepare(inst);
+  let capped = 0;
+  inst.vehicles.forEach((v, vi) => {
+    if (!v.preloaded) return;
+    // the truck's onboard loads left out; the rest of the plan uses exactly the rally points allowed
+    const bad = { routes: start.routes.filter((r) => r.vehicle !== vi && r.visits.length) };
+    const used = new Set(bad.routes.flatMap((r) => r.visits.map((x) => x.node)).filter((n) => P.isRally[n]));
+    const keep = inst.params.maxRallyPoints;
+    inst.params.maxRallyPoints = used.size;
+    try {
+      const notes = [];
+      const fixed = E.fixPreloaded(b, bad, notes);
+      const ev = Sv.evaluate(inst, fixed);
+      assert.deepEqual(Array.from(ev.violations, (x) => x.code), [], v.id + ': within the limit');
+      const got = {};
+      for (const r of fixed.routes) for (const vs of r.visits) for (const c of vs.jobs) got[c.job] = (got[c.job] || 0) + c.qty;
+      inst.jobs.forEach((j, i) => {
+        if (b.maps.jobs[i].origin !== 'onboard' || j.lockedTruck !== v.id) return;
+        if (Math.abs((got[i] || 0) - j.qty) < 1e-6) return;
+        capped++;
+        assert.ok(notes.some((n) => n.startsWith(j.requestId + ': the load on board ' + v.id + ' has no pickup point left within the limit of ' + (used.size + b.maps.doneRally) + ' rally points')), j.id + ' named in a note');
+      });
+    } finally { inst.params.maxRallyPoints = keep; }
+  });
+  assert.ok(capped >= 1, 'the limit kept at least one onboard load on its truck');
+});
+
+test('decodePlan: a re-plan keeps the warm start when the solver plan is worse, and says so', () => {
+  const { st, parent } = contingencyFixture();
+  const b = E.buildInstance(st.getState(), { contingency: true });
+  b.parentPlan = parent;
+  const start = E.contingencyStart(b);
+  const startTotal = Sv.evaluate(b.instance, start, { costOnly: true }).total;
+  const empty = { routes: [] };                                 // everything deferred: far worse
+  const kept = E.decodePlan(b, { solution: empty }, { method: 'tabu', start });
+  assert.ok(Math.abs(kept.cost.total - startTotal) < 0.01, kept.cost.total + ' vs start ' + startTotal);
+  assert.ok(kept.warnings.some((w) => /nothing better than the current plan/.test(w)));
+  assert.equal(kept.stats.violations, 0);
+  assert.deepEqual(Array.from(kept.violations), []);
+  // without a start the solver plan is decoded as it is
+  const raw = E.decodePlan(b, { solution: empty }, { method: 'tabu' });
+  assert.ok(raw.cost.total > startTotal);
+  assert.ok(!raw.warnings.some((w) => /nothing better/.test(w)));
+  // a better solver plan wins over the start
+  const better = Sv.localSearch(b.instance, start, { seed: 3, timeLimitMs: 2000 });
+  const betterTotal = Sv.evaluate(b.instance, better, { costOnly: true }).total;
+  const got = E.decodePlan(b, { solution: better }, { method: 'tabu', start });
+  assert.ok(Math.abs(got.cost.total - Math.min(betterTotal, startTotal)) < 0.01);
+});
+
 test('planChanges: moved, eta, delayed, restored, added, dropped', () => {
   const e = (truckId, nodeKey, eta, status = 'planned') => ({ truckId, gridId: nodeKey, label: nodeKey, eta, status, stops: truckId ? [{ truckId, nodeKey, eta }] : [] });
   const before = { byRequest: { A: e('T1', 'n1', 100), B: e('T1', 'n2', 200), C: e('T2', 'n3', 300), D: e(null, null, null, 'deferred'), F: e('T3', 'n4', 50), G: e('T3', 'n5', 60) } };
@@ -514,8 +574,11 @@ test('contingency: an en-route truck cut off by a closure keeps its done stops; 
   const now = Math.ceil(rt.stops[0].arrive + 1);
   assert.ok(now < rt.stops[1].arrive);
   st.dispatch({ type: 'clock/tick', simMin: now });
-  const next = rt.stops[1];
-  assert.ok(st.dispatch({ type: 'zone/add', zone: { kind: 'closed', lat: next.lat, lon: next.lon, radiusMi: 3, label: 'Cut' } }).ok);
+  // the closure is around the stop the truck is at (it has not left yet). This test closed the next
+  // stop before 2026-10-06; that truck now turns back where it is instead (next test), since it is
+  // outside the closure and has a road home.
+  const here = rt.stops[0];
+  assert.ok(st.dispatch({ type: 'zone/add', zone: { kind: 'closed', lat: here.lat, lon: here.lon, radiusMi: 3, label: 'Cut' } }).ok);
   const bc = E.buildInstance(st.getState(), { contingency: true });
   assert.deepEqual(problems(bc.instance), []);
   assert.ok(bc.warnings.some((w) => w.includes('Truck ' + rt.truckId + ' is cut off')), 'cut off: ' + bc.warnings.join(' | '));
@@ -546,6 +609,63 @@ test('contingency: an en-route truck cut off by a closure keeps its done stops; 
   assert.equal(st.getState().scenario.fleet.find((t) => t.id === rt.truckId).availableAt, before);
 });
 
+test('contingency: a closure on the road ahead of an en-route truck turns it back where it is', () => {
+  // psg-lint roadlate: before the fix the truck kept its next stop and old ETA, driving through the
+  // closure, and the platoons it serves were not told (updated stayed false).
+  const st = demoStore();
+  const b = E.buildInstance(st.getState(), {});
+  const id = st.dispatch({ type: 'plan/store', plan: E.decodePlan(b, quickSolve(b), { method: 'tabu' }) }).id;
+  assert.ok(st.dispatch({ type: 'plan/approve', planId: id }).ok);
+  const ap = st.getState().plans.find((p) => p.id === id);
+  // the truck with the longest first leg, 40 % of the way along it; the road closed at 75 %
+  const rt = ap.routes.filter((r) => r.stops.length && r.legs.length).sort((a, c) => (c.legs[0].arrive - c.legs[0].depart) - (a.legs[0].arrive - a.legs[0].depart))[0];
+  const leg = rt.legs[0], co = E.legCoords(leg);
+  const now = Math.ceil(leg.depart + 0.4 * (leg.arrive - leg.depart));
+  const zp = SRO.core.geo.interpolateAlong(co, 0.75);
+  const zone = { kind: 'closed', lat: zp.lat, lon: zp.lon, radiusMi: 1, label: 'Bridge out' };
+  st.dispatch({ type: 'clock/tick', simMin: now });
+  assert.ok(st.dispatch({ type: 'zone/add', zone }).ok);
+  const bc = E.buildInstance(st.getState(), { contingency: true });
+  assert.deepEqual(problems(bc.instance), []);
+  bc.parentPlan = ap;
+  const v = bc.instance.vehicles.find((x) => x.id === rt.truckId);
+  assert.ok(v && v.preloaded);
+  const startNode = bc.instance.nodes[v.startNode];
+  assert.equal(startNode.key, 'pos:' + rt.truckId, 'starts where it is, not at its next stop');
+  assert.equal(v.availableAt, now);
+  assert.ok(SRO.core.geo.haversineMi(startNode, zone) > zone.radiusMi, 'outside the closure');
+  assert.ok(SRO.core.geo.haversineMi(startNode, SRO.core.geo.interpolateAlong(co, 0.4)) < 0.5, 'where the map shows the truck');
+  assert.ok(bc.warnings.includes('Truck ' + rt.truckId + ' is driving into a closed road (Bridge out) on its way to ' + rt.stops[0].label +
+    '; it turns back where it is and is re-routed from there.'));
+  assert.ok(E.contingencyStart(bc), 'warm start from the turn-back point');
+  const p2 = E.decodePlan(bc, quickSolve(bc), { method: 'tabu', start: E.contingencyStart(bc) });
+  assert.equal(p2.stats.violations, 0);
+  const r2 = p2.routes.find((r) => r.truckId === rt.truckId);
+  // the leg driven so far ends at the turn-back point now; every leg from there avoids the closure
+  assert.deepEqual([r2.legs[0].fromKey, r2.legs[0].toKey, r2.legs[0].turnedBack, r2.legs[0].arrive], [leg.fromKey, 'pos:' + rt.truckId, true, now]);
+  assert.ok(r2.legs[0].miles > 0 && r2.legs[0].miles < leg.miles);
+  for (const l of r2.legs) if (!l.turnedBack) assert.ok(!SRO.core.geo.polylineIntersectsCircle(E.legCoords(l), zone), l.fromKey + ' -> ' + l.toKey + ' avoids the closure');
+  assert.equal(r2.legs[1].fromKey, 'pos:' + rt.truckId);
+  assert.equal(r2.legs[1].depart, now);
+  // approving tells the platoons of that truck whose pickup or ETA changed
+  const old = new Set(rt.stops.flatMap((s) => s.deliveries.map((d) => d.requestId)));
+  assert.ok(st.dispatch({ type: 'plan/approve', planId: st.dispatch({ type: 'plan/store', plan: p2 }).id }).ok);
+  const upd = st.getState().requests.filter((r) => old.has(r.id) && r.updated);
+  assert.ok(upd.length >= 1, 'a platoon of ' + rt.truckId + ' is told');
+  // a later re-plan keeps the turn-back leg and the legs to the stops made since
+  const p2s = st.getState().plans.find((p) => p.approved);
+  const r2s = p2s.routes.find((r) => r.truckId === rt.truckId);
+  const next = r2s.stops.find((s) => !s.done);
+  const later = Math.ceil(next.arrive + 1);
+  st.dispatch({ type: 'clock/tick', simMin: later });
+  const b3 = E.buildInstance(st.getState(), { contingency: true });
+  const pre = b3.maps.prefix[rt.truckId];
+  assert.ok(pre.legs[0].turnedBack);
+  const doneKeys = pre.stops.map((s) => s.nodeKey);
+  assert.deepEqual(doneKeys, r2s.stops.filter((s) => s.arrive <= later).map((s) => s.nodeKey));
+  for (const s of pre.stops) assert.ok(pre.legs.some((l) => l.toKey === s.nodeKey && Math.abs(l.arrive - s.arrive) < 0.01), 'a leg to ' + s.nodeKey);   // leg times are rounded to 0.01 min
+});
+
 test('contingency: the rally point an en-route truck is driving to gets banned', () => {
   const st = demoStore();
   const b = E.buildInstance(st.getState(), {});
@@ -566,6 +686,91 @@ test('contingency: the rally point an en-route truck is driving to gets banned',
   const plan = E.decodePlan(bc, quickSolve(bc), { method: 'tabu' });
   assert.equal(plan.stats.violations, 0);
   assert.ok(!plan.routes.some((r) => r.stops.some((s) => !s.done && s.nodeKey === rt.stops[1].nodeKey)), 'no new stop at the banned point');
+});
+
+test('contingency: rally points of stops already made count toward the limit; windowStats cover the whole window', () => {
+  // Before the fix the truck-lost re-plan used 9 rally points in the window (3 done + 6 new), limit 8,
+  // and its stats (14 requests, 603 mi) read as if they were the window's.
+  const { st, parent, now } = contingencyFixture();
+  const b = E.buildInstance(st.getState(), { contingency: true });
+  const cap = st.getState().scenario.settings.maxRallyPoints;
+  const doneRally = new Set(parent.routes.flatMap((r) => r.stops.filter((s) => r.depart <= now && s.arrive <= now && s.nodeKey.startsWith('rally:')).map((s) => s.nodeKey)));
+  assert.ok(doneRally.size >= 1, 'stops already made at rally points');
+  assert.equal(b.maps.doneRally, doneRally.size);
+  assert.equal(b.instance.params.maxRallyPoints, cap - doneRally.size);
+  for (const n of b.instance.nodes) assert.equal(!!n.rallyDone, n.kind === 'rally' && doneRally.has(n.key), n.key);
+  // a node already open does not count again; a new one does
+  const P = Sv.prepare(b.instance);
+  for (let n = 0; n < b.instance.nodes.length; n++) assert.equal(P.isRally[n], b.instance.nodes[n].kind === 'rally' && !b.instance.nodes[n].rallyDone ? 1 : 0);
+  b.parentPlan = parent;
+  const plan = E.decodePlan(b, quickSolve(b), { method: 'tabu', start: E.contingencyStart(b) });
+  assert.equal(plan.stats.violations, 0);
+  const all = new Set(plan.routes.flatMap((r) => r.stops.filter((s) => s.nodeKey.startsWith('rally:')).map((s) => s.gridId)));
+  assert.ok(all.size <= cap, all.size + ' rally points in the window, limit ' + cap);
+  assert.deepEqual(new Set(plan.rallyPoints), all);
+  assert.equal(plan.stats.rallyPoints, all.size);
+  // whole window (done + planned) next to the from-now-on stats
+  const ws = plan.windowStats;
+  const stops = plan.routes.reduce((a, r) => a + r.stops.length, 0), done = plan.routes.reduce((a, r) => a + r.stops.filter((s) => s.done).length, 0);
+  assert.deepEqual([ws.stops, ws.stopsDone, ws.stops - ws.stopsDone], [stops, done, plan.stats.stops]);
+  assert.ok(ws.stopsDone >= 1);
+  assert.equal(ws.trucksUsed, plan.routes.filter((r) => r.stops.length).length);
+  assert.ok(ws.trucksUsed >= plan.stats.trucksUsed);
+  assert.equal(ws.requests, Object.keys(plan.byRequest).length);
+  assert.ok(ws.requests > plan.stats.requests, 'requests done before the re-plan count too');
+  const legMiles = plan.routes.reduce((a, r) => a + r.legs.reduce((x, l) => x + l.miles, 0), 0);
+  assert.ok(Math.abs(ws.miles - legMiles) < 0.01 && ws.miles > plan.stats.miles);
+  assert.ok(Math.abs(ws.gallons - ws.miles / 2) < 0.01);
+  assert.equal(ws.delayed, plan.stats.delayed);
+  assert.equal(ws.rallyPoints, all.size);
+  // a first plan: the window figures are its own
+  const p0 = E.decodePlan(B, quickSolve(B), { method: 'tabu' });
+  assert.deepEqual([p0.windowStats.stops, p0.windowStats.stopsDone, p0.windowStats.trucksUsed, p0.windowStats.requests, p0.windowStats.delayed],
+    [p0.stats.stops, 0, p0.stats.trucksUsed, p0.stats.requests, p0.stats.delayed]);
+  assert.ok(Math.abs(p0.windowStats.miles - p0.stats.miles) < 0.01 * p0.routes.length + 1e-9);
+});
+
+test('contingency: re-planned loads carry the approved ETA (prevEta) and settings.etaSlipPerMin; 0 turns it off', () => {
+  const { st, parent, now } = contingencyFixture();
+  assert.equal(st.getState().scenario.settings.etaSlipPerMin, 1, 'default');
+  const b = E.buildInstance(st.getState(), { contingency: true });
+  let carried = 0;
+  b.instance.jobs.forEach((job, j) => {
+    const jm = b.maps.jobs[j];
+    // the earliest stop still ahead in the approved plan for that load (on its truck when on board)
+    const ahead = parent.routes.filter((r) => jm.origin !== 'onboard' || r.truckId === jm.lockedTruck)
+      .flatMap((r) => r.stops.filter((s) => !(r.depart <= now && s.arrive <= now) && s.deliveries.some((d) => d.requestId === job.requestId && d.group === job.group && d.loadQty > 0)))
+      .map((s) => s.arrive);
+    if (ahead.length) { carried++; assert.deepEqual([job.prevEta, job.slipPerMin], [Math.min(...ahead), 1], job.id); }
+    else assert.equal(job.prevEta, undefined, job.id);
+  });
+  assert.ok(carried >= 3, carried + ' loads carry an approved ETA');
+  assert.deepEqual(problems(b.instance), []);
+  b.parentPlan = parent;
+  const plan = E.decodePlan(b, quickSolve(b), { method: 'tabu', start: E.contingencyStart(b) });
+  assert.ok(plan.cost.stability >= 0);
+  assert.ok(st.dispatch({ type: 'settings/update', path: 'etaSlipPerMin', value: 0 }).ok);
+  const b0 = E.buildInstance(st.getState(), { contingency: true });
+  assert.ok(b0.instance.jobs.every((j) => j.prevEta === undefined && j.slipPerMin === undefined));
+});
+
+test('a pinned rally point no platoon can reach is not passed as pinned, with a warning', () => {
+  // Before the fix such a pin stayed unused with no cost and no word to the planner.
+  const st = demoStore();
+  const inInst = new Set(B.instance.nodes.filter((n) => n.kind === 'rally').map((n) => n.gridId));
+  const far = SRO.data.grid.find((g) => g.rallyCandidate && g.kind !== 'hub' && !inInst.has(g.id));
+  const near = B.instance.nodes.find((n, i) => n.kind === 'rally' && B.instance.jobs.some((j) => j.candidates.some((c) => c.node === i)));
+  assert.ok(far && near);
+  assert.ok(st.dispatch({ type: 'rally/pin', gridId: far.id }).ok);
+  assert.ok(st.dispatch({ type: 'rally/pin', gridId: near.gridId }).ok);
+  const b = E.buildInstance(st.getState(), {});
+  assert.deepEqual(problems(b.instance), []);
+  assert.deepEqual(b.instance.params.pinnedRally.map((n) => b.instance.nodes[n].gridId), [near.gridId]);
+  const msg = 'Pinned rally point ' + (far.name || far.id) + ' is out of reach of every platoon in this plan (beyond their travel radius by road), so it is not used.';
+  assert.ok(b.warnings.includes(msg), b.warnings.join(' | '));
+  assert.ok(!b.warnings.some((w) => w.includes('Pinned rally point ' + (near.label || near.gridId))));
+  const plan = E.decodePlan(b, quickSolve(b), { method: 'tabu' });
+  assert.ok(plan.warnings.includes(msg));
 });
 
 test('a lock to a truck already on the road applies to its onboard load only', () => {
@@ -711,4 +916,41 @@ test('replan after a truck is marked out and a road is closed: stored with paren
   }
   assert.ok(st.dispatch({ type: 'plan/approve', planId: p2.id }).ok);
   assert.equal(st.getState().plans.find((p) => p.id === p1.id).superseded, true);
+});
+
+test('replan (tabu, SA, ACO): never worse than its warm start or the live best; en-route trucks deliver only what is on board', async () => {
+  // Before the fix the search loaded pool jobs on en-route trucks; the repair then undid that, so the
+  // stored re-plan (29,796.8) was worse than the live best (17,034.7) and than its warm start (29,781.0).
+  const { ctx, st, eng } = freshEngine();
+  const p1 = await eng.run({ method: 'tabu', params: FAST.tabu });
+  st.dispatch({ type: 'plan/approve', planId: p1.id });
+  const ap = st.getState().plans.find((p) => p.id === p1.id);
+  const firsts = ap.routes.filter((r) => r.stops.length).map((r) => r.stops[0].arrive).sort((a, b) => a - b);
+  const now = Math.ceil(firsts[3] + 1);
+  st.dispatch({ type: 'clock/tick', simMin: now });
+  const out = ap.routes.find((r) => r.stops.some((s) => s.arrive > now) && r.stops.some((s) => s.arrive <= now));
+  st.dispatch({ type: 'truck/markOut', truckId: out.truckId, reason: 'Blown tire' });
+  const b = ctx.core.engine.buildInstance(st.getState(), { contingency: true });
+  b.parentPlan = ap;
+  const start = ctx.core.engine.contingencyStart(b);
+  assert.ok(start, 'warm start');
+  const startTotal = ctx.solver.evaluate(b.instance, start, { costOnly: true }).total;
+  const onboard = new Set(b.maps.jobs.filter((j) => j.origin === 'onboard').map((j) => j.lockedTruck + '|' + j.requestId + '|' + j.group));
+  for (const method of ['tabu', 'sa', 'aco']) {
+    const p2 = await eng.replan({ method, params: FAST[method], reason: 'Truck out' });
+    assert.equal(p2.parentPlanId, p1.id);
+    assert.equal(p2.stats.violations, 0, method);
+    assert.ok(p2.cost.total <= startTotal + 0.01, method + ': ' + p2.cost.total + ' <= warm start ' + startTotal);
+    const live = eng.status().bestCost;
+    if (typeof live === 'number') assert.ok(p2.cost.total <= live + 0.01, method + ': stored ' + p2.cost.total + ' <= live best ' + live);
+    assert.ok(!p2.warnings.some((w) => /already on the road/.test(w)), method + ': nothing to move off en-route trucks');
+    let enroute = 0;
+    for (const r of p2.routes.filter((x) => x.preloaded)) {
+      enroute++;
+      for (const s of r.stops.filter((x) => !x.done)) for (const d of s.deliveries) {
+        assert.ok(onboard.has(r.truckId + '|' + d.requestId + '|' + d.group), method + ': ' + r.truckId + ' delivers ' + d.requestId + ' ' + d.group + ' from its own load');
+      }
+    }
+    assert.ok(enroute >= 1, 'a truck is en route');
+  }
 });

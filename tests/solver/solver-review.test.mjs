@@ -83,7 +83,8 @@ function refEvaluate(inst, sol) {
         if (!job || !Number.isInteger(ch.job)) { nViol++; continue; }
         if (typeof ch.qty !== 'number' || !(ch.qty >= 0) || ch.qty === Infinity) { nViol++; continue; }
         if (S.GROUP_TYPE[job.group] !== veh.type) nViol++;
-        if (job.lockedTruck != null && job.lockedTruck !== veh.id) nViol++;
+        // a preloaded (en-route) truck carries only the jobs locked to it (contract of 2026-10-06)
+        if (job.lockedTruck != null ? job.lockedTruck !== veh.id : !!veh.preloaded) nViol++;
         const banned = (pa.bannedRally || []).includes(vi.node);
         const cand = banned ? null : (job.candidates || []).find((c) => c.node === vi.node);
         if (!cand) nViol++;

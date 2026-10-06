@@ -27,14 +27,16 @@
 //            distinct (requestId, node) that receives a positive quantity (a zero-quantity chunk
 //            brings no platoon to the node); lateness per chunk = min(max(0, arrive - deadline) x
 //            latePerMin[tier], lateCapShare x defer[tier] x classFactor[classRank]) x qty/job.qty;
+//            stability per chunk (re-plans: job.prevEta, job.slipPerMin) = what max(0, arrive -
+//            prevEta) x slipPerMin adds on top of that lateness within the same cap, x qty/job.qty;
 //            deferral per job = deferred/job.qty x defer[tier] x classFactor[classRank]; pinned =
 //            pinUnused per pinned rally node that is a candidate of some job but receives no positive
 //            quantity; total = sum + 1e7 per violation. Missing penalties fields use DEFAULT_PENALTIES.
 //
-// Full result notes: cost = { fuel, distance, risk, simplicity, platoon, lateness, deferral, pinned };
-// routes lists only routes with stops (routeIdx = index in solution.routes; extra fields vehicleId,
-// loadStart, load, capacity) and route.cost has the per-route terms only (fuel, distance, risk,
-// simplicity, platoon, lateness, total): deferral and pinned are plan-level, route-independent terms.
+// Full result notes: cost = { fuel, distance, risk, simplicity, platoon, lateness, stability, deferral,
+// pinned }; routes lists only routes with stops (routeIdx = index in solution.routes; extra fields
+// vehicleId, loadStart, load, capacity) and route.cost has the per-route terms only (fuel, distance,
+// risk, simplicity, platoon, lateness, stability, total): deferral and pinned are plan-level terms.
 // pinnedUnused lists the pinned nodes charged. stop.periodIdx is the period of the arrival minute,
 // leg.periodIdx the period of the departure minute (display only); leg.riskUnits already includes
 // the mean period factor, leg.riskFactor is that factor. late has one entry per job (its largest
@@ -42,8 +44,9 @@
 // gallons, riskUnits, stops, trucksUsed, rallyPoints, pinnedUnused }.
 //
 // Violation codes: wrong-type, over-capacity, not-candidate (incl. banned rally nodes), too-many-rally,
-// unreachable, vehicle-reused (a vehicle in more than one route that has stops), locked-truck, over-qty,
-// plus bad-index / bad-qty for malformed solutions (index out of range; qty negative, non-finite or not
+// unreachable, vehicle-reused (a vehicle in more than one route that has stops), locked-truck,
+// not-on-board (a job not locked to it on a preloaded, en-route truck: it carries only what is on
+// board), over-qty, plus bad-index / bad-qty for malformed solutions (index out of range; qty negative, non-finite or not
 // a number). Quantities use a relative tolerance of 1e-9 (capacity, over-qty, deferred remainder).
 // hardLate lists late jobs whose deadline is hard: every Immediate (tier 3) job, plus any job with
 // hardDeadline: true (urgency.js sets it for Urgent too).
@@ -58,7 +61,7 @@
   const V = S.VIOLATION_CODES = {
     WRONG_TYPE: 'wrong-type', OVER_CAPACITY: 'over-capacity', NOT_CANDIDATE: 'not-candidate',
     TOO_MANY_RALLY: 'too-many-rally', UNREACHABLE: 'unreachable', VEHICLE_REUSED: 'vehicle-reused',
-    LOCKED_TRUCK: 'locked-truck', OVER_QTY: 'over-qty', BAD_INDEX: 'bad-index', BAD_QTY: 'bad-qty'
+    LOCKED_TRUCK: 'locked-truck', NOT_ON_BOARD: 'not-on-board', OVER_QTY: 'over-qty', BAD_INDEX: 'bad-index', BAD_QTY: 'bad-qty'
   };
   const EMPTY = [];
 
@@ -78,12 +81,13 @@
     const vehStamp = P.vehStamp, rallyStamp = P.rallyStamp, pairStamp = P.pairStamp, nodeStamp = P.nodeStamp, isRally = P.isRally;
     const jFuel = P.jFuel, jLockV = P.jLockV, cand = P.cand, candCost = P.candCost, jReq = P.jReq;
     const jDeadline = P.jDeadline, jLateW = P.jLateW, jLateCap = P.jLateCap, jInvQty = P.jInvQty;
+    const jPrevEta = P.jPrevEta, jSlipW = P.jSlipW;
     const serviceMin = P.serviceMin;
     const hasPeriods = P.nP > 0, legArrive = S.legArrive, legOut = P.legOut;
 
     let nViol = 0;
     const violations = full ? [] : null;
-    let miles = 0, risk = 0, nStops = 0, nTrucks = 0, platoon = 0, lateness = 0, nRally = 0;
+    let miles = 0, risk = 0, nStops = 0, nTrucks = 0, platoon = 0, lateness = 0, stability = 0, nRally = 0;
     const routesOut = full ? [] : null;
     const lateMax = full ? new F64(nJ) : null;
     const routes = (sol && sol.routes) || EMPTY;
@@ -104,9 +108,9 @@
       }
       vehStamp[v] = epoch;
       nTrucks++;
-      const fuelV = P.vFuel[v];
+      const fuelV = P.vFuel[v], preV = P.vPre[v];
       const t0 = P.vT0[v];
-      let t = t0, cur = P.vStart[v], load = 0, rMiles = 0, rRisk = 0, rPlatoon = 0, rLate = 0, rStops = 0;
+      let t = t0, cur = P.vStart[v], load = 0, rMiles = 0, rRisk = 0, rPlatoon = 0, rLate = 0, rSlip = 0, rStops = 0;
       const stopsOut = full ? [] : null, legsOut = full ? [] : null;
 
       for (let s = 0; s < visits.length; s++) {
@@ -158,6 +162,9 @@
           if (lk !== -1 && lk !== v) {
             nViol++;
             if (full) violations.push({ code: V.LOCKED_TRUCK, route: r, visit: s, job: j, vehicle: v, detail: jobName(inst, j) + ' is locked to truck ' + inst.jobs[j].lockedTruck + ' but rides on ' + vehName(inst, v) + '.' });
+          } else if (lk === -1 && preV) {
+            nViol++;
+            if (full) violations.push({ code: V.NOT_ON_BOARD, route: r, visit: s, job: j, vehicle: v, detail: jobName(inst, j) + ' is not on board ' + vehName(inst, v) + ', which is already on the road and can only deliver what it carries.' });
           }
           const ck = j * nN + node;
           if (cand[ck] < 0) {
@@ -172,13 +179,18 @@
           delivered[j] += q;
           if (q > 0) {
             nodeStamp[node] = epoch;                     // the node received a delivery (pinned rule)
-            const late = arrive - jDeadline[j];
+            const late = arrive - jDeadline[j], slip = arrive - jPrevEta[j];
             if (late > 0) {
               // capped at lateCapShare x the job's deferral cost, then scaled by the chunk's share
               let lp = late * jLateW[j];
               if (lp > jLateCap[j]) lp = jLateCap[j];
               rLate += lp * q * jInvQty[j];
               if (full && late > lateMax[j]) lateMax[j] = late;
+            }
+            if (slip > 0 && jSlipW[j] > 0) {
+              // ETA slip against the approved plan: on top of the lateness, within the same cap
+              const lp = late > 0 ? late * jLateW[j] : 0, cap = jLateCap[j];
+              if (lp < cap) { const sp = slip * jSlipW[j]; rSlip += (lp + sp > cap ? cap - lp : sp) * q * jInvQty[j]; }
             }
           }
         }
@@ -211,14 +223,14 @@
         nViol++;
         if (full) violations.push({ code: V.OVER_CAPACITY, route: r, vehicle: v, detail: 'Truck ' + vehName(inst, v) + ' carries ' + load + ' but holds ' + cap + '.' });
       }
-      miles += rMiles; risk += rRisk; nStops += rStops; platoon += rPlatoon; lateness += rLate;
+      miles += rMiles; risk += rRisk; nStops += rStops; platoon += rPlatoon; lateness += rLate; stability += rSlip;
       if (full) {
         const gal = rMiles * P.invMpg;
         const rc = {
           fuel: P.wF * gal, distance: P.wD * 0.5 * rMiles, risk: P.wR * rRisk,
-          simplicity: P.wS * (5 * rStops + 25), platoon: P.wD * rPlatoon, lateness: rLate
+          simplicity: P.wS * (5 * rStops + 25), platoon: P.wD * rPlatoon, lateness: rLate, stability: rSlip
         };
-        rc.total = rc.fuel + rc.distance + rc.risk + rc.simplicity + rc.platoon + rc.lateness;
+        rc.total = rc.fuel + rc.distance + rc.risk + rc.simplicity + rc.platoon + rc.lateness + rc.stability;
         routesOut.push({
           vehicle: v, routeIdx: r, vehicleId: inst.vehicles[v].id,
           loadStart: P.vLoadStart[v], depart: t0, returnAt: returnAt,
@@ -257,7 +269,7 @@
     const gallons = miles * P.invMpg;
     const cFuel = P.wF * gallons, cDist = P.wD * 0.5 * miles, cRisk = P.wR * risk;
     const cSimp = P.wS * (5 * nStops + 25 * nTrucks), cPlat = P.wD * platoon, cPin = P.pinUnused * nPinUnused;
-    const total = cFuel + cDist + cRisk + cSimp + cPlat + lateness + deferral + cPin + S.VIOLATION_PENALTY * nViol;
+    const total = cFuel + cDist + cRisk + cSimp + cPlat + lateness + stability + deferral + cPin + S.VIOLATION_PENALTY * nViol;
     if (!full) return { total: total, feasible: nViol === 0, nViolations: nViol };
 
     const late = [], hardLate = [], rallyNodes = [];
@@ -271,7 +283,7 @@
     return {
       total: total,
       feasible: nViol === 0,
-      cost: { fuel: cFuel, distance: cDist, risk: cRisk, simplicity: cSimp, platoon: cPlat, lateness: lateness, deferral: deferral, pinned: cPin },
+      cost: { fuel: cFuel, distance: cDist, risk: cRisk, simplicity: cSimp, platoon: cPlat, lateness: lateness, stability: stability, deferral: deferral, pinned: cPin },
       routes: routesOut,
       delivered: Array.from(delivered),
       deferred: deferredOut,
@@ -319,7 +331,7 @@
       const vs = [];
       for (let v = 0; v < P.nV; v++) {
         if (P.vFuel[v] !== P.jFuel[j]) continue;
-        if (P.jLockV[j] !== -1 && P.jLockV[j] !== v) continue;
+        if (P.jLockV[j] === -1 ? P.vPre[v] : P.jLockV[j] !== v) continue;   // lock; en-route trucks carry only their own loads
         vs.push(v);
       }
       if (!vs.length) {

@@ -9,7 +9,7 @@
 // Jobs are taken locked-first, then tier (Immediate first), deadline (earliest first), class rank
 // (III first). For each job the cheapest insertion is chosen over: joining an existing visit at one of
 // its candidate nodes, or a new visit at any candidate node and any position of any compatible truck
-// (type, lock, free capacity). A job larger than the free room goes in capacity-sized chunks, repeatedly,
+// (type, lock, free capacity; a preloaded en-route truck only for the jobs locked to it). A job larger than the free room goes in capacity-sized chunks, repeatedly,
 // until it is all placed or nothing helps. Each option is scored with evaluate() (total cost, so lateness
 // downstream, platoon trips and deferral all count) and kept only when it lowers the total and leaves
 // the plan violation-free; otherwise the remainder stays deferred. Ties prefer joining an existing visit
@@ -116,7 +116,7 @@
         for (let r = 0; r < routes.length; r++) {
           const v = routes[r].vehicle;
           if (!(v >= 0 && v < P.nV) || P.vFuel[v] !== P.jFuel[j]) continue;
-          if (P.jLockV[j] !== -1 && P.jLockV[j] !== v) continue;
+          if (P.jLockV[j] === -1 ? P.vPre[v] : P.jLockV[j] !== v) continue;   // lock; en-route trucks: own loads only
           const free = P.vCap[v] - load[v];
           if (free <= P.jEps[j]) continue;
           const q = mmin(remaining, free);

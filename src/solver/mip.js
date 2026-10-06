@@ -36,8 +36,9 @@
 //                     cost = miles x (wF / mpg + 0.5 wD) + wR x riskUnits x riskFactor (+ 5 wS via W)
 //   z_c_v_n  binary   chunk c delivered by v at n         u_c     [0,1]    chunk c deferred (defer share)
 //   T_v_n    cont.    arrival minute of v at n            L_c     >= 0     minutes chunk c is late
-//   b_c      binary   lateness of c capped (cost = lateCapShare x its deferral cost x share); only when
-//                     the cap can bind (the latest possible arrival is past cap / latePerMin)
+//   S_c      >= 0     minutes chunk c arrives after its job's prevEta (re-plans; cost slipPerMin x share)
+//   b_c      binary   lateness (+ slip) of c capped (cost = lateCapShare x its deferral cost x share);
+//                     only when the cap can bind (the latest possible arrival costs more than the cap)
 //   w_q_n    [0,1]    platoon of request q comes to node n (wD x platoonCost)
 //   r_n      binary   rally node n used (only when maxRallyPoints can bind)
 //   p_n      [0,1]    pinned rally node n receives nothing (pinUnused);   one = 1 carries constant costs
@@ -47,11 +48,12 @@
 // order o_b >= o_a + 1 - K(1 - x_ab), 0 <= o <= K - 1, on inner arcs that take under a minute (service 0
 // and co-located nodes), where the time rows alone would allow a free closed loop beside the route;
 // lateness L_c >= T_v_n - deadline - M(1 - z) - M' b_c per option and L_c + M' b_c >= sum (minT -
-// deadline)+ z; platoon w_q_n >= sum_v z_c_v_n per chunk of the request; rally y_v_n <= r_n, x via a rally
+// deadline)+ z; slip S_c >= T_v_n - prevEta - M(1 - z) - M' b_c per option; platoon w_q_n >= sum_v z_c_v_n per chunk of the request; rally y_v_n <= r_n, x via a rally
 // waypoint <= r_w, sum r <= maxRallyPoints; pinned p_n + sum z_.._n >= 1; identical vehicles (same type,
 // capacity, hub, start node, start time, no locked jobs) are used in index order (k_v >= k_v').
 //
-// Exact pruning only: options/arcs for the wrong vehicle type or lock, banned or unreachable nodes, rally
+// Exact pruning only: options/arcs for the wrong vehicle type or lock (or an unlocked job on a preloaded
+// en-route truck, which carries only its own loads), banned or unreachable nodes, rally
 // nodes when maxRallyPoints = 0, rally -> rally arcs when it is 1, arcs a -> b with no two distinct chunks
 // (one at a, one at b) that fit the vehicle together, and (v, n) pairs no route can reach within the
 // number of stops the capacity allows. Time never prunes (lateness is soft).
@@ -232,7 +234,7 @@
       const byKey = Object.create(null);
       for (let v = 0; v < nV; v++) {
         if (lockedTo[v]) continue;
-        const key = P.vFuel[v] + '|' + P.vCap[v] + '|' + P.vHub[v] + '|' + P.vStart[v] + '|' + P.vT0[v];
+        const key = P.vFuel[v] + '|' + P.vCap[v] + '|' + P.vHub[v] + '|' + P.vStart[v] + '|' + P.vT0[v] + '|' + P.vPre[v];
         if (!(key in byKey)) { byKey[key] = groups.length; groups.push([]); }
         groupOf[v] = byKey[key]; groups[byKey[key]].push(v);
       }
@@ -257,7 +259,7 @@
       let mc = INF;
       for (let v = 0; v < nV; v++) {
         if (P.vFuel[v] !== P.jFuel[j]) continue;
-        if (P.jLockV[j] !== -1 && P.jLockV[j] !== v) continue;
+        if (P.jLockV[j] === -1 ? P.vPre[v] : P.jLockV[j] !== v) continue;   // lock; en-route trucks: own loads only
         if (!(P.vCap[v] > 0)) continue;
         vs.push(v); if (P.vCap[v] < mc) mc = P.vCap[v];
       }
@@ -479,7 +481,7 @@
       });
     }
     // chunk columns
-    const uCol = new I32(nC).fill(-1), LCol = new I32(nC).fill(-1), bCol = new I32(nC).fill(-1);
+    const uCol = new I32(nC).fill(-1), LCol = new I32(nC).fill(-1), SCol = new I32(nC).fill(-1), bCol = new I32(nC).fill(-1);
     for (let c = 0; c < nC; c++) {
       const ch = chunks[c], j = ch.job;
       const list = [];
@@ -552,19 +554,26 @@
         });
       });
     }
-    // lateness columns
-    const maxLateOf = new F64(nC), capMinOf = new F64(nC);
+    // lateness and ETA-slip columns (one cap binary covers both, as evaluate caps lateness + stability)
+    const maxLateOf = new F64(nC), maxSlipOf = new F64(nC), capMinOf = new F64(nC);
     for (let c = 0; c < nC; c++) {
-      const ch = chunks[c], j = ch.job, d = P.jDeadline[j];
-      if (!zc[c].length || !(d < INF)) continue;
-      let maxLate = 0;
-      zc[c].forEach(function (o) { const V = veh[o[0]]; maxLate = mmax(maxLate, V.H - d); });
-      maxLateOf[c] = maxLate;
-      if (!(maxLate > 0) || !(P.jLateW[j] > 0)) continue;
-      LCol[c] = col('L' + c, 0, INF, false, P.jLateW[j] * ch.share);
+      const ch = chunks[c], j = ch.job, d = P.jDeadline[j], e = P.jPrevEta[j], ws = P.jSlipW[j];
+      if (!zc[c].length || (!(d < INF) && !(e < INF && ws > 0))) continue;
+      let maxLate = 0, maxSlip = 0;
+      zc[c].forEach(function (o) {
+        const V = veh[o[0]];
+        if (d < INF) maxLate = mmax(maxLate, V.H - d);
+        if (e < INF && ws > 0) maxSlip = mmax(maxSlip, V.H - e);
+      });
+      maxLateOf[c] = maxLate; maxSlipOf[c] = maxSlip;
+      const hasL = maxLate > 0 && P.jLateW[j] > 0, hasS = maxSlip > 0;
+      if (hasL) LCol[c] = col('L' + c, 0, INF, false, P.jLateW[j] * ch.share);
+      if (hasS) SCol[c] = col('S' + c, 0, INF, false, ws * ch.share);
+      if (!hasL && !hasS) continue;
       const cap = lateCap(j);
-      capMinOf[c] = cap < INF ? cap / P.jLateW[j] : INF;
-      const wantCap = capMode === true || (capMode === 'auto' && capMinOf[c] < maxLate);
+      capMinOf[c] = cap < INF && hasL ? cap / P.jLateW[j] : INF;
+      const wantCap = capMode === true || (capMode === 'auto' &&
+        (hasS ? cap < (hasL ? maxLate * P.jLateW[j] : 0) + maxSlip * ws : capMinOf[c] < maxLate));
       if (wantCap && cap < INF) bCol[c] = col('b' + c, 0, 1, true, cap * ch.share);
     }
     // platoon columns: (request, node) pairs with a positive platoon cost
@@ -686,6 +695,20 @@
       });
       if (aggIdx.length > (b >= 0 ? 2 : 1)) row('la' + c, aggIdx, aggVal, 'G', 0);
     }
+    // ETA slip (as lateness, against prevEta)
+    for (let c = 0; c < nC; c++) {
+      if (SCol[c] < 0) continue;
+      const j = chunks[c].job, e = P.jPrevEta[j], Sc = SCol[c], b = bCol[c];
+      const Mb = maxSlipOf[c];
+      zc[c].forEach(function (o) {
+        const v = o[0], n = o[1], z = o[2], V = veh[v];
+        const maxT = mmax(V.minT.get(n), V.H), Mz = maxT - e;
+        if (!(Mz > 0)) return;                     // never after prevEta through this option
+        const idx = [Sc, tCol[v].get(n), z], val = [1, -1, -Mz];
+        if (b >= 0) { idx.push(b); val.push(Mb); }
+        row('st' + c + '_' + v + '_' + n, idx, val, 'G', -e - Mz);
+      });
+    }
     // platoon
     for (let c = 0; c < nC; c++) {
       const j = chunks[c].job;
@@ -728,7 +751,7 @@
     for (let i = 0; i < cInt.length; i++) nBin += cInt[i];
     const model = {
       instance: instance, P: P, factors: factors, chunks: chunks, zc: zc, veh: veh, arcs: arcs,
-      kCol: kCol, yCol: yCol, tCol: tCol, oCol: oCol, zAt: zAt, uCol: uCol, LCol: LCol, bCol: bCol, wCol: wCol, rCol: rCol, pCol: pCol,
+      kCol: kCol, yCol: yCol, tCol: tCol, oCol: oCol, zAt: zAt, uCol: uCol, LCol: LCol, SCol: SCol, bCol: bCol, wCol: wCol, rCol: rCol, pCol: pCol,
       oneCol: oneCol, constObj: constObj, groups: groups,
       cols: { name: cName, lb: cLb, ub: cUb, int: cInt, obj: cObj }, colIndex: colIndex, rows: rows,
       stats: {
@@ -820,14 +843,15 @@
     for (let v = 0; v < nV; v++) model.tCol[v].forEach(function (col, n) { if (!arrive.has(v * nN + n)) x[col] = model.cols.lb[col]; });
     for (let c = 0; c < nC; c++) {
       if (model.uCol[c] >= 0 && !delivered[c]) x[model.uCol[c]] = 1;
-      if (model.LCol[c] < 0 || !delivered[c]) continue;
+      const Lc = model.LCol[c], Sc = model.SCol ? model.SCol[c] : -1;
+      if ((Lc < 0 && Sc < 0) || !delivered[c]) continue;
       const ch = chunks[c], j = ch.job, d = P.jDeadline[j];
       const T = arrive.get(ch.sv * nN + ch.sn);
-      const late = T - d;
-      if (!(late > 0)) continue;
+      const late = Lc >= 0 ? T - d : 0, slip = Sc >= 0 ? T - P.jPrevEta[j] : 0;
+      if (!(late > 0) && !(slip > 0)) continue;
       const b = model.bCol[c];
-      if (b >= 0 && late * P.jLateW[j] * ch.share > model.cols.obj[b]) x[b] = 1;
-      else x[model.LCol[c]] = late;
+      if (b >= 0 && ((late > 0 ? late * P.jLateW[j] : 0) + (slip > 0 ? slip * P.jSlipW[j] : 0)) * ch.share > model.cols.obj[b]) x[b] = 1;
+      else { if (late > 0) x[Lc] = late; if (slip > 0) x[Sc] = slip; }
     }
     // platoon, rally, pinned
     model.wCol.forEach(function (col, key) {

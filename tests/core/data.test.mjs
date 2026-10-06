@@ -334,6 +334,7 @@ test('scenario: settings match DESIGN.md section 3', () => {
     method: 'tabu', timeLimitSec: 300,
     weights: { fuel: 3, distance: 3, risk: 5, simplicity: 2 },
     maxRallyPoints: 8, maxStops: 20,
+    etaSlipPerMin: 1,          // re-plan ETA stability (solver fix 2026-10-06; DESIGN.md section 3 to list it)
     convoyFactor: 1.5, mpg: 2, serviceMin: 15, loadMin: 20,
     periods: [
       { name: 'Day', start: '0700', end: '1800', speed: 1.0, risk: 1.0 },

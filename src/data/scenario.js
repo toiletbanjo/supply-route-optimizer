@@ -233,6 +233,9 @@
       weights: { fuel: 3, distance: 3, risk: 5, simplicity: 2 },
       maxRallyPoints: 8,
       maxStops: 20,
+      // re-plans: cost per minute a load arrives after the ETA the approved plan gave its platoon
+      // (planner-engine DEFAULT_ETA_SLIP_PER_MIN; 0 = no ETA stability term)
+      etaSlipPerMin: 1,
       convoyFactor: 1.5, mpg: 2, serviceMin: 15, loadMin: 20,
       periods: clone(PERIODS),
       riskRatings: clone(RISK_RATINGS),

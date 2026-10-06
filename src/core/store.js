@@ -43,7 +43,7 @@
   // A real finite number (the global isFinite(null) is true, which let null times through).
   function isNum(x) { return typeof x === 'number' && isFinite(x); }
   function ok(state, extra) { return { state: state, result: Object.assign({ ok: true }, extra || {}) }; }
-  function fail(state, error) { return { state: state, result: { ok: false, error: error } }; }
+  function fail(state, error, extra) { return { state: state, result: Object.assign({ ok: false, error: error }, extra || {}) }; }
 
   // Field lookup across action.payload and the action itself; a scalar or array payload stands
   // in for the first key (dispatch({ type: 'role/set', payload: 'planner' })).
@@ -850,6 +850,25 @@
     const plan = s.plans.find(function (p) { return p.id === id; });
     if (!plan) return fail(s, 'Plan ' + id + ' was not found.');
     if (plan.approved) return ok(s, { id: id });
+    // A plan that breaks a planning rule (plan.stats.violations > 0, e.g. more rally points than the
+    // limit) is refused while a draft for the same window and parent meets every rule; the result
+    // names those drafts (code 'infeasible-plan', alternativeIds). With no such draft it is approved,
+    // and the result carries a warning the UI shows.
+    const nViol = plan.stats && isNum(plan.stats.violations) ? plan.stats.violations : 0;
+    let violationWarning = null;
+    if (nViol > 0) {
+      const alts = s.plans.filter(function (p) {
+        return p.id !== id && !p.approved && !p.superseded && p.windowId === plan.windowId && (p.parentPlanId || null) === (plan.parentPlanId || null) &&
+          p.stats && p.stats.violations === 0;
+      }).map(function (p) { return p.id; });
+      const first = Array.isArray(plan.violations) && plan.violations[0] && plan.violations[0].detail ? ' (' + plan.violations[0].detail + ')' : '';
+      const what = 'Plan ' + id + ' breaks ' + nViol + ' planning rule' + (nViol === 1 ? '' : 's') + first;
+      if (alts.length) {
+        return fail(s, what + ', and ' + (alts.length === 1 ? 'plan ' + alts[0] + ' meets' : 'plans ' + alts.join(', ') + ' meet') + ' them all. Approve ' +
+          (alts.length === 1 ? 'that plan' : 'one of those') + ' instead, or re-plan.', { code: 'infeasible-plan', violations: nViol, alternativeIds: alts });
+      }
+      violationWarning = what + '. No other plan for this window meets every rule, so it was approved; check it before the trucks roll.';
+    }
     const now = nowOf(s, a);
     // plan.builtOn (planner engine): approved plans that were live when this plan was made. Their
     // deliveries were left out of it (it covers only requests they left open), so they stay approved,
@@ -907,7 +926,8 @@
       const planIds = (w.planIds || []).indexOf(id) >= 0 ? w.planIds : (w.planIds || []).concat([id]);
       return Object.assign({}, w, { status: 'approved', approvedPlanId: id, planIds: planIds });
     });
-    return ok(ns, { id: id, supersededPlanId: prev ? prev.id : null });
+    return ok(ns, violationWarning ? { id: id, supersededPlanId: prev ? prev.id : null, violations: nViol, warning: violationWarning }
+      : { id: id, supersededPlanId: prev ? prev.id : null });
   };
 
   H['plan/rename'] = function (s, a) {

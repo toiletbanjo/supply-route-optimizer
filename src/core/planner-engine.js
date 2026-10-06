@@ -19,7 +19,12 @@
 //       at their next stop (startNode, preloaded, capacity = what they still carry) with those jobs
 //       locked to them; jobs of trucks marked out, not yet departed, or cut off go back to the pool
 //       (a cut-off truck keeps its done stops, route.cutOff, returnAt null). A planner lock to a truck
-//       already on the road holds only for its onboard load.
+//       already on the road holds only for its onboard load. An en-route truck whose road to its next
+//       stop now crosses a closed zone turns back where it is: it starts at a 'pos:<truck>' node,
+//       available now, and its prefix ends with a turnedBack leg to that point (warning). Rally points
+//       of stops already made count toward settings.maxRallyPoints (instance limit lowered, those nodes
+//       rallyDone). Each re-planned load carries prevEta (the approved plan's ETA) and slipPerMin =
+//       settings.etaSlipPerMin (default DEFAULT_ETA_SLIP_PER_MIN; 0 turns ETA stability off).
 //       maps.builtOn = the approved plans live at build time; the Plan carries it as plan.builtOn and
 //       store plan/approve does not supersede those (a second batch in a window keeps the first).
 //   engine.decodePlan(build, result, meta) -> Plan (DESIGN.md section 3 schema plus per leg `path` =
@@ -27,7 +32,10 @@
 //       plan.byRequest[requestId] = { truckId, stopSeq, nodeKind, gridId, lat, lon, label, eta, etaText,
 //       qtyByLine, deferredQty, stopsBefore, ... } for the platoon sergeant views). qtyByLine counts
 //       every delivery in the plan (done stops of a re-plan too), so qtyByLine + deferredQty = what
-//       the plan covers per line. plan.warnings notes a plan above settings.maxStops.
+//       the plan covers per line. plan.warnings notes a plan above settings.maxStops and each pinned
+//       rally point no platoon can reach. plan.violations = [{ code, detail }] (evaluate's).
+//       plan.rallyPoints / stats.rallyPoints cover the whole window (done stops too); stats count what is
+//       planned from now on, plan.windowStats the whole window (done + planned) for a re-plan.
 //   engine.contingencyStart(build) -> solution | null   (the adjusted old plan, a warm start)
 //   engine.shouldPlan(state) -> bool   (the trigger rule for automatic planning; replaceable)
 //   engine.pendingRequests(state), engine.activePlan(state), engine.legCoords(leg), engine.mapRoutes(plan)
@@ -62,6 +70,7 @@
   E.HORIZON_HOURS = 72;
   E.PATH_PRECISION = 5;
   E.WARM_DELAY_MS = 1500;
+  E.DEFAULT_ETA_SLIP_PER_MIN = 1;     // re-plan cost per minute a load arrives after its approved ETA
   E.GROUPS = ['fuel', 'cargo'];
 
   const INF = Infinity;
@@ -172,16 +181,71 @@
   }
 
   // ---- contingency analysis -------------------------------------------------------------------------
+  // Legs of a route up to and including the one that arrives at stop k (0 for k < 0). Legs and stops
+  // are in time order; a re-plan may have put a turn-back leg to a 'pos:' point between them.
+  function legsTo(rt, k) {
+    const legs = rt.legs || [], stops = rt.stops || [];
+    if (k < 0) return 0;
+    let s = 0;
+    for (let i = 0; i < legs.length && s < stops.length; i++) {
+      if (legs[i] && legs[i].toKey === stops[s].nodeKey) { if (s === k) return i + 1; s++; }
+    }
+    return Math.min(k + 1, legs.length);
+  }
+  // An en-route truck whose road ahead (the rest of the leg it is on, or the next leg while it is still
+  // at a stop) crosses a closed zone turns back where it is: the point it has reached (the share of the
+  // leg's time driven, along the leg's road path, as the map shows it), or the last point of the path
+  // outside every closed zone when that point is inside one. -> null, or { lat, lon, legIdx, driven
+  // (path coords up to that point), share (of the leg's length), at (when it can drive on), zone }.
+  function closedAhead(rt, now, closed) {
+    if (!closed.length) return null;
+    const legs = rt.legs || [];
+    const li = legs.findIndex(function (l) { return l && isNum(l.arrive) && l.arrive > now; });
+    if (li < 0) return null;
+    const leg = legs[li];
+    const co = E.legCoords(leg);
+    if (!co || co.length < 2) return null;
+    const G = geo();
+    const seg = [];
+    let total = 0;
+    for (let i = 1; i < co.length; i++) { const d = G.haversineMi(co[i - 1], co[i]); seg.push(d); total += d; }
+    const f = isNum(leg.depart) && leg.depart < now && leg.arrive > leg.depart ? (now - leg.depart) / (leg.arrive - leg.depart) : 0;
+    let k = 0, acc = 0, pos = co[0];
+    for (; k < seg.length; k++) {
+      if (acc + seg[k] >= f * total) {
+        const t = seg[k] > 0 ? (f * total - acc) / seg[k] : 0;
+        pos = [co[k][0] + t * (co[k + 1][0] - co[k][0]), co[k][1] + t * (co[k + 1][1] - co[k][1])];
+        break;
+      }
+      acc += seg[k];
+    }
+    if (k >= seg.length) { k = seg.length - 1; pos = co[co.length - 1]; }
+    const zone = closed.find(function (z) { return G.polylineIntersectsCircle([pos].concat(co.slice(k + 1)), z); });
+    if (!zone) return null;
+    const driven = co.slice(0, k + 1).concat(f > 0 ? [pos] : []);
+    const inside = function (p) { return closed.some(function (z) { return G.haversineMi(p, z) < z.radiusMi; }); };
+    while (driven.length > 1 && inside(driven[driven.length - 1])) driven.pop();
+    const turn = driven[driven.length - 1];
+    return { lat: turn[0], lon: turn[1], legIdx: li, driven: driven, share: total > 0 ? G.polylineLength(driven) / total : 0,
+      at: Math.max(now, num(leg.depart, now)), zone: zone };
+  }
+
   // What the approved plan looks like at minute `now`.
   // -> { parent, trucks: { id: { kind: 'enroute' | 'returning' | 'waiting' | 'finished' | 'out', route,
-  //      nextIdx, startKey, availableAt, carried } }, done: { 'rid|group': load }, pool: { 'rid|group': load },
+  //      nextIdx, startKey, availableAt, carried, restart } }, done: { 'rid|group': load }, pool: { 'rid|group': load },
   //      locked: [{ truckId, requestId, group, qty }], base: { 'rid|group': load }, requestIds: [...] }
+  // restart (en route only): closedAhead() when a closed zone blocks the road to its next stop, else null.
+  // doneRally: node keys of the rally points of stops already made (they count toward maxRallyPoints).
+  // prevEta: { 'rid|group' and 'rid|group|truck': earliest arrival still ahead in the approved plan }.
   function contingencyBase(state, now, parentId) {
     const parent = parentId ? (state.plans || []).find(function (p) { return p.id === parentId; }) : E.activePlan(state);
     if (!parent) throw userError('There is no approved plan to re-plan. Approve a plan first.', 'no-parent');
     const fleet = {};
     (state.scenario.fleet || []).forEach(function (t) { fleet[t.id] = t; });
-    const out = { parent: parent, trucks: {}, done: {}, pool: {}, locked: [], base: {}, requestIds: [] };
+    const closed = (state.scenario.zones || []).filter(function (z) {
+      return z && z.kind === 'closed' && isNum(num(z.lat, NaN)) && isNum(num(z.lon, NaN)) && num(z.radiusMi, 0) > 0;
+    }).map(function (z) { return { id: z.id, label: z.label || null, lat: num(z.lat), lon: num(z.lon), radiusMi: num(z.radiusMi) }; });
+    const out = { parent: parent, trucks: {}, done: {}, pool: {}, locked: [], base: {}, requestIds: [], doneRally: [], prevEta: {} };
     function add(map, k, q) { map[k] = (map[k] || 0) + q; }
     function seeReq(id) { if (out.requestIds.indexOf(id) < 0) out.requestIds.push(id); }
     (parent.routes || []).forEach(function (rt) {
@@ -196,14 +260,18 @@
       else if (isNum(rt.returnAt) && rt.returnAt <= now) kind = 'finished';
       else if (nextIdx < 0) kind = 'returning';
       else kind = 'enroute';
-      const info = { kind: kind, route: rt, nextIdx: nextIdx, startKey: null, availableAt: null, carried: 0 };
-      if (kind === 'enroute') { info.startKey = stops[nextIdx].nodeKey; info.availableAt = stops[nextIdx].arrive; }
+      const info = { kind: kind, route: rt, nextIdx: nextIdx, startKey: null, availableAt: null, carried: 0, restart: null };
+      if (kind === 'enroute') {
+        info.startKey = stops[nextIdx].nodeKey; info.availableAt = stops[nextIdx].arrive;
+        info.restart = closedAhead(rt, now, closed);
+      }
       if (kind === 'returning' || kind === 'finished') info.availableAt = rt.returnAt;
       if (kind === 'waiting') info.availableAt = now;
       out.trucks[rt.truckId] = info;
       const lockedHere = {};
       stops.forEach(function (st, k) {
         const reached = departed && isNum(st.arrive) && st.arrive <= now;
+        if (reached && typeof st.nodeKey === 'string' && st.nodeKey.indexOf('rally:') === 0 && out.doneRally.indexOf(st.nodeKey) < 0) out.doneRally.push(st.nodeKey);
         (st.deliveries || []).forEach(function (d) {
           if (!d || !d.requestId) return;
           const g = d.group || 'cargo';
@@ -211,6 +279,11 @@
           const q = num(d.loadQty, 0);
           seeReq(d.requestId);
           add(out.base, key, q);
+          // the ETA the approved plan gave the platoon: earliest stop still ahead, per load group and
+          // per load group on this truck
+          if (!reached && isNum(st.arrive) && q > 0) {
+            [key, key + '|' + rt.truckId].forEach(function (k2) { if (!(out.prevEta[k2] <= st.arrive)) out.prevEta[k2] = st.arrive; });
+          }
           if (reached) add(out.done, key, q);
           else if (kind === 'enroute' && k >= nextIdx) add(lockedHere, key, q);
           else add(out.pool, key, q);
@@ -347,6 +420,16 @@
         label: r.unitName || r.designator || r.id, requestId: r.id },
         { lat: num(r.lat), lon: num(r.lon), gridId: r.gridId || null, onGrid: false });
     });
+    // en-route trucks turning back from a closed road start where they are ('pos:<truck>', a node of
+    // kind direct that no job uses)
+    if (cont) {
+      Object.keys(cont.trucks).forEach(function (tid) {
+        const rs = cont.trucks[tid].restart;
+        if (!rs) return;
+        addPoint({ key: 'pos:' + tid, kind: 'direct', gridId: null, lat: rs.lat, lon: rs.lon, label: tid + ' (turned back)' },
+          { lat: rs.lat, lon: rs.lon, gridId: null, onGrid: false });
+      });
+    }
 
     // -- travel matrix (base minutes; road graph, closures applied) --
     const N = SRO.core.network;
@@ -405,11 +488,19 @@
           v.preloaded = true;
           v.capacity = ti.carried;
           v.startKey = ti.startKey;
+          if (ti.restart) {
+            // the road to its next stop is closed: it turns back where it is and is routed from there
+            const nx = ti.route.stops[ti.nextIdx];
+            v.startKey = 'pos:' + t.id;
+            v.availableAt = ti.restart.at;
+            v.turnBack = 'Truck ' + t.id + ' is driving into a closed road (' + (ti.restart.zone.label || 'closed zone') + ') on its way to ' +
+              (nx.label || nx.nodeKey) + '; it turns back where it is and is re-routed from there.';
+          }
         }
       }
       vspecs.push(v);
     });
-    // start points of en-route trucks: the node of their next stop
+    // start points of en-route trucks: the node of their next stop (or their 'pos:' point)
     const keyToP = {};
     pnodes.forEach(function (n, p) { keyToP[n.key] = p; });
     vspecs.forEach(function (v) {
@@ -434,7 +525,7 @@
     if (cont) {
       vspecs.slice().forEach(function (v) {
         if (v.startP == null) return;
-        if (pm.minutes[v.startP][v.hubP] < INF) return;
+        if (pm.minutes[v.startP][v.hubP] < INF) { if (v.turnBack) warnings.push(v.turnBack); return; }
         warnings.push('Truck ' + v.id + ' is cut off by a closed road; its remaining loads go back to the pool.');
         vspecs.splice(vspecs.indexOf(v), 1);
         specs.forEach(function (s) { if (s.origin === 'onboard' && s.lockedTruck === v.id) { s.lockedTruck = null; s.origin = 'pool'; } });
@@ -500,6 +591,10 @@
       minutes.push(mr); miles.push(ml); riskUnits.push(rk);
     }
     const nodes = pointIndex.map(function (p) { return Object.assign({}, pnodes[p]); });
+    // rally points of stops already made (re-plan): open already, so free to use again (rallyDone; the
+    // solver does not count them) while the limit below is lowered by their number
+    const doneRally = cont ? cont.doneRally : [];
+    nodes.forEach(function (n) { if (n.kind === 'rally' && doneRally.indexOf(n.key) >= 0) n.rallyDone = true; });
 
     // -- vehicles --
     const vehicles = vspecs.map(function (v) {
@@ -510,18 +605,26 @@
 
     // -- jobs --
     const jobs = [], jobMaps = [];
+    const slipPerMin = Math.max(0, num(set.etaSlipPerMin, E.DEFAULT_ETA_SLIP_PER_MIN));
     specs.forEach(function (s) {
       const r = s.request;
       const cr = candByReq[r.id];
       const id = r.id + '/' + s.group + (s.origin === 'onboard' ? '@' + s.lockedTruck : '');
       const deadline = isNum(r.deadline) ? r.deadline : (isNum(r.nlt) ? r.nlt : null);
-      jobs.push({
+      const job = {
         id: id, requestId: r.id, lineIdxs: s.lines.map(function (l) { return l.lineIdx; }), group: s.group,
         qty: Math.round(s.qty * 1e6) / 1e6, unit: s.unit, tier: tierOf(r), classRank: classRankOf(r),
         deadline: deadline, hardDeadline: hardOf(r),
         candidates: cr.list.map(function (c) { return { node: nodeOfP[c.p], platoonMiles: c.platoonMiles, platoonCost: c.platoonCost, hint: !!c.hint }; }),
         lockedTruck: s.lockedTruck || null
-      });
+      };
+      // re-plan: each minute after the ETA the approved plan gave this load costs settings.etaSlipPerMin
+      if (cont && slipPerMin > 0) {
+        const pk = r.id + '|' + s.group;
+        const pe = s.origin === 'onboard' && isNum(cont.prevEta[pk + '|' + s.lockedTruck]) ? cont.prevEta[pk + '|' + s.lockedTruck] : cont.prevEta[pk];
+        if (isNum(pe)) { job.prevEta = pe; job.slipPerMin = slipPerMin; }
+      }
+      jobs.push(job);
       const share = s.fullQty > 0 ? s.qty / s.fullQty : 1;
       jobMaps.push({
         id: id, requestId: r.id, group: s.group, unit: s.unit, qty: s.qty, origin: s.origin, lockedTruck: s.lockedTruck || null,
@@ -533,8 +636,25 @@
     // -- the rest of the instance --
     const w = set.weights || {};
     const weights = { fuel: num(w.fuel, 3), distance: num(w.distance, 3), risk: num(w.risk, 5), simplicity: num(w.simplicity, 2) };
-    let maxRally = Math.max(0, Math.round(num(set.maxRallyPoints, 8)));
-    let pinnedNodes = pinnedIds.map(function (g) { return nodeOfP[rallyPt[g]]; }).filter(function (n) { return n >= 0; });
+    const rallyCap = Math.max(0, Math.round(num(set.maxRallyPoints, 8)));
+    let maxRally = Math.max(0, rallyCap - doneRally.length);
+    if (doneRally.length && !maxRally) {
+      warnings.push('The stops already made used ' + doneRally.length + ' rally point' + (doneRally.length === 1 ? '' : 's') + ', the limit of ' + rallyCap +
+        ' for this window; the rest is delivered at those points or direct.');
+    }
+    // a pinned point a stop already used is satisfied (and counted above); one no platoon of this plan
+    // can reach within its travel radius by road is left out, with a warning (it would stay unused)
+    const reachable = {};
+    specs.forEach(function (s) { candByReq[s.request.id].list.forEach(function (c) { reachable[c.p] = true; }); });
+    let pinnedNodes = pinnedIds.filter(function (g) {
+      const n = nodeOfP[rallyPt[g]];
+      if (!(n >= 0) || nodes[n].rallyDone) return false;
+      if (specs.length && !reachable[rallyPt[g]]) {
+        warnings.push('Pinned rally point ' + ((gridById[g] && gridById[g].name) || g) + ' is out of reach of every platoon in this plan (beyond their travel radius by road), so it is not used.');
+        return false;
+      }
+      return true;
+    }).map(function (g) { return nodeOfP[rallyPt[g]]; });
     if (pinnedNodes.length > maxRally) {
       warnings.push('More rally points are pinned (' + pinnedNodes.length + ') than the limit (' + maxRally + '); only the first ' + maxRally + ' are kept.');
       pinnedNodes = pinnedNodes.slice(0, maxRally);
@@ -574,15 +694,16 @@
         let nDone, nL, kind = ti.kind;
         if (ti.kind === 'enroute' && !vById[tid]) {
           kind = 'cutoff';
-          nDone = ti.nextIdx; nL = nDone;
+          nDone = ti.nextIdx; nL = legsTo(rt, nDone - 1);
           if (!nDone) return;
         } else if (ti.kind === 'enroute') {
-          nDone = ti.nextIdx; nL = nDone + 1;
+          // a truck turning back keeps the legs before the one it is on (see the turn-back leg below)
+          nDone = ti.nextIdx; nL = ti.restart ? ti.restart.legIdx : legsTo(rt, nDone);
         } else if (ti.kind === 'returning' || ti.kind === 'finished') {
           nDone = nStops; nL = nLegs;
         } else if (ti.kind === 'out') {
           if (!(isNum(rt.depart) && rt.depart <= now)) return;
-          nDone = ti.nextIdx < 0 ? nStops : ti.nextIdx; nL = nDone;
+          nDone = ti.nextIdx < 0 ? nStops : ti.nextIdx; nL = legsTo(rt, nDone - 1);
           if (!nDone) return;
         } else return;
         prefix[tid] = {
@@ -591,6 +712,13 @@
           legs: (rt.legs || []).slice(0, nL).map(function (l) { return clone(l); }),
           parentRoute: rt
         };
+        // the part of the closed leg driven before turning back: a leg to its 'pos:' point (turnedBack)
+        const rs = kind === 'enroute' ? ti.restart : null;
+        if (rs && rs.driven.length > 1) {
+          const l = rt.legs[rs.legIdx];
+          prefix[tid].legs.push(Object.assign(clone(l), { toKey: 'pos:' + tid, gridPath: [], arrive: rs.at,
+            miles: rd(num(l.miles, 0) * rs.share), riskUnits: rd(num(l.riskUnits, 0) * rs.share), path: encodePath(rs.driven), turnedBack: true }));
+        }
       });
     }
 
@@ -610,6 +738,9 @@
       network: { source: pm.source, counts: pm.counts, elapsedMs: pm.elapsedMs },
       convoyFactor: convoy,
       maxStops: Math.max(1, Math.round(num(set.maxStops, 20))),
+      // rally points of stops already made (re-plan); instance.params.maxRallyPoints is the window
+      // limit less these
+      doneRally: doneRally.length,
       path: function (i, j) { return pm.path(pointIndex[i], pointIndex[j]); },
       gridPath: function (i, j) { return pm.gridPath(pointIndex[i], pointIndex[j]); }
     };
@@ -638,7 +769,10 @@
       const stops = rt.stops || [];
       let from = 0;
       if (v.preloaded) {
-        from = stops.findIndex(function (st) { return st.nodeKey === maps.nodes[v.startNode].key && !(st.arrive <= maps.now); });
+        // the stop it is driving to, or (turning back from a closed road at its 'pos:' point) the first
+        // stop it has not reached
+        const sk = maps.nodes[v.startNode].key, turned = sk.indexOf('pos:') === 0;
+        from = stops.findIndex(function (st) { return (turned || st.nodeKey === sk) && !(st.arrive <= maps.now); });
         if (from < 0) return;
       } else if (maps.vehicles[vi].contKind !== 'waiting') return;
       for (let k = from; k < stops.length; k++) {
@@ -668,14 +802,16 @@
   };
 
   // ---- en-route trucks carry only what is on board ---------------------------------------------------
-  // The solver contract has no "this truck may only carry its locked jobs" rule, so a search can put a
-  // pool job on a preloaded (en-route) truck and leave part of its onboard load behind, which cannot
-  // happen on the road. This repair (applied to every contingency solution before decoding):
-  // takes pool chunks off preloaded trucks, puts any onboard load the solver dropped back on its truck
-  // (at a stop that is already a candidate, else the cheapest insertion in minutes), then tries to
-  // place each removed pool chunk on another truck of the right type with spare room (kept only when
-  // the plan total gets better). -> the same solution object when nothing had to change.
-  E.fixPreloaded = function (build, sol) {
+  // The solver rejects a pool job on a preloaded (en-route) truck itself (vehicleCompatible, every move,
+  // ACO, MIP and evaluate's 'not-on-board' violation), so this repair is a safety net for plans from
+  // elsewhere (an old stored best, a hand-made plan). It takes pool chunks off preloaded trucks, puts
+  // any onboard load the plan dropped back on its truck (at a stop that is already a candidate, else
+  // the cheapest insertion in minutes at a direct point, a rally point the plan already uses, or a new
+  // one only while the plan is under maxRallyPoints; when none is left the load stays deferred and
+  // notes gets a warning), then tries to place each removed pool chunk on another truck of the right
+  // type with spare room (kept only when the plan total gets better). -> the same solution object when
+  // nothing had to change. decodePlan keeps the better of the plan and its repair.
+  E.fixPreloaded = function (build, sol, notes) {
     const inst = build.instance, maps = build.maps, Sv = S();
     if (!sol || !Array.isArray(sol.routes) || !inst.vehicles.some(function (v) { return v.preloaded; })) return sol;
     let changed = false;
@@ -699,12 +835,19 @@
       route.visits = route.visits.filter(function (vs) { return vs.jobs.length; });
       if (route.visits.length !== n0) changed = true;
     });
-    const M = inst.minutes;
-    function cheapestInsert(route, j) {
+    const M = inst.minutes, P = Sv.prepare(inst);
+    // rally points the plan uses: a re-inserted onboard load opens a new one only under the limit
+    const rallyOn = new Uint8Array(P.nN);
+    let nRally = 0;
+    function markRally(n) { if (P.isRally[n] && !rallyOn[n]) { rallyOn[n] = 1; nRally++; } }
+    routes.forEach(function (r) { r.visits.forEach(function (vs) { markRally(vs.node); }); });
+    function nodeOK(n) { return !P.isRally[n] || rallyOn[n] || nRally < P.maxRally; }
+    function cheapestInsert(route, j, capped) {
       const v = inst.vehicles[route.vehicle];
       const start = v.startNode != null ? v.startNode : v.hubNode;
       let best = null;
       (inst.jobs[j].candidates || []).forEach(function (c) {
+        if (capped && !nodeOK(c.node)) return;
         for (let k = 0; k <= route.visits.length; k++) {
           const a = k === 0 ? start : route.visits[k - 1].node;
           const b = k === route.visits.length ? v.hubNode : route.visits[k].node;
@@ -714,7 +857,7 @@
       });
       return best;
     }
-    function addTo(route, j, q, allowInsert) {
+    function addTo(route, j, q, allowInsert, capped) {
       const vs = route.visits.find(function (x) { return Sv.isCandidate(inst, j, x.node); });
       if (vs) {
         const c = vs.jobs.find(function (x) { return x.job === j; });
@@ -722,9 +865,10 @@
         return true;
       }
       if (!allowInsert) return false;
-      const ins = cheapestInsert(route, j);
+      const ins = cheapestInsert(route, j, capped);
       if (!ins) return false;
       route.visits.splice(ins.k, 0, { node: ins.node, jobs: [{ job: j, qty: q }] });
+      if (capped) markRally(ins.node);
       return true;
     }
     // onboard loads left behind go back on their truck
@@ -739,7 +883,12 @@
       if (vi === undefined) return;
       let route = routes.find(function (r) { return r.vehicle === vi; });
       if (!route) { route = { vehicle: vi, visits: [] }; routes.push(route); }
-      if (addTo(route, j, miss, true)) changed = true;
+      if (addTo(route, j, miss, true, true)) changed = true;
+      else if (Array.isArray(notes)) {
+        notes.push(jm.requestId + ': the load on board ' + jm.lockedTruck + (cheapestInsert(route, j, false)
+          ? ' has no pickup point left within the limit of ' + (P.maxRally + (maps.doneRally || 0)) + ' rally points'
+          : ' has no pickup point the truck can reach') + '; it stays on the truck and waits for the next window.');
+      }
     });
     if (!changed) return sol;
     let cur = { routes: routes.filter(function (r) { return r.visits.length; }) };
@@ -756,7 +905,7 @@
           route.visits.forEach(function (vs) { vs.jobs.forEach(function (c) { load += c.qty; }); });
           if (load + ch.qty > v.capacity + 1e-9) return;
           const hit = route.visits.some(function (vs) { return Sv.isCandidate(inst, ch.job, vs.node); });
-          const ins = hit ? { d: 0 } : cheapestInsert(route, ch.job);
+          const ins = hit ? { d: 0 } : cheapestInsert(route, ch.job, false);
           if (ins) tries.push({ vi: vi, d: ins.d });
         });
         tries.sort(function (a, b) { return a.d - b.d; });
@@ -764,7 +913,7 @@
           const trial = { routes: cur.routes.map(function (r) { return { vehicle: r.vehicle, visits: r.visits.map(function (vs) { return { node: vs.node, jobs: vs.jobs.map(function (c) { return { job: c.job, qty: c.qty }; }) }; }) }; }) };
           let route = trial.routes.find(function (r) { return r.vehicle === tries[t].vi; });
           if (!route) { route = { vehicle: tries[t].vi, visits: [] }; trial.routes.push(route); }
-          if (!addTo(route, ch.job, ch.qty, true)) continue;
+          if (!addTo(route, ch.job, ch.qty, true, false)) continue;
           const ev = Sv.evaluate(inst, trial, { costOnly: true });
           if (ev.feasible && ev.total < curTotal - 1e-9) { cur = trial; curTotal = ev.total; break; }
         }
@@ -816,13 +965,23 @@
 
   // result: a solve() result ({ solution, evaluation?, explain?, elapsedSec, extra, params, ... }) or
   // { solution } (e.g. the best plan kept on Cancel). meta: { method, label, params, runtimeSec,
-  // cancelled, name, compareId, reason, warnings }.
+  // cancelled, name, compareId, reason, warnings, start }. start: the warm start a re-plan began from
+  // (contingencyStart); a re-plan keeps the cheapest of the solver plan, its fixPreloaded repair and
+  // that start (evaluate total, which counts each violation at 1e7), so it is never worse than the start.
   E.decodePlan = function (build, result, meta) {
     const Sv = S(), F = fmt();
     const inst = build.instance, maps = build.maps, m = meta || {};
     const res = result || {};
     const sol0 = res.solution || { routes: [] };
-    const sol = maps.contingency ? E.fixPreloaded(build, sol0) : sol0;
+    const fixNotes = [];
+    let sol = sol0, fromStart = false;
+    if (maps.contingency) {
+      const fixed = E.fixPreloaded(build, sol0, fixNotes);
+      const total = function (x) { return Sv.evaluate(inst, x, { costOnly: true }).total; };
+      let best = total(sol0);
+      if (fixed !== sol0) { const t = total(fixed); if (t < best - 1e-6) { sol = fixed; best = t; } }
+      if (m.start && m.start.routes && total(m.start) < best - 1e-6) { sol = m.start; fromStart = true; }
+    }
     const ev = sol === sol0 && res.evaluation && Array.isArray(res.evaluation.routes) && Array.isArray(res.evaluation.deferred) ? res.evaluation : Sv.evaluate(inst, sol);
     const explain = Array.isArray(res.explain) && res.evaluation === ev ? res.explain : Sv.explainDeferred(inst, ev);
     const now = maps.now;
@@ -842,7 +1001,7 @@
         pre.stops.forEach(function (st) { stops.push(clone(st)); });
         pre.legs.forEach(function (l) { legs.push(clone(l)); });
       }
-      let miles = 0, gallons = 0, riskUnits = 0, cost = { fuel: 0, distance: 0, risk: 0, simplicity: 0, platoon: 0, lateness: 0, total: 0 };
+      let miles = 0, gallons = 0, riskUnits = 0, cost = { fuel: 0, distance: 0, risk: 0, simplicity: 0, platoon: 0, lateness: 0, stability: 0, total: 0 };
       if (r) {
         miles = r.miles; gallons = r.gallons; riskUnits = r.riskUnits; cost = rdCost(r.cost);
         r.legs.forEach(function (l) {
@@ -904,7 +1063,7 @@
       routes.push(Object.assign(clone(pr), { stops: clone(pre.stops), legs: clone(pre.legs), continued: true, stopsDone: pre.stops.length,
         out: pre.kind === 'out', cutOff: pre.kind === 'cutoff', returning: pre.kind === 'returning',
         returnAt: pre.kind === 'out' ? (lastLeg ? lastLeg.arrive : null) : pre.kind === 'cutoff' ? null : pr.returnAt,
-        miles: 0, gallons: 0, riskUnits: 0, cost: { fuel: 0, distance: 0, risk: 0, simplicity: 0, platoon: 0, lateness: 0, total: 0 } }));
+        miles: 0, gallons: 0, riskUnits: 0, cost: { fuel: 0, distance: 0, risk: 0, simplicity: 0, platoon: 0, lateness: 0, stability: 0, total: 0 } }));
     });
 
     // deferred, per line
@@ -971,6 +1130,14 @@
       e.status = !p ? 'deferred' : hasDef ? 'partial' : 'planned';
     });
 
+    // rally points of the window: those of stops already made (a re-plan) and the solver's new ones;
+    // together they keep within settings.maxRallyPoints
+    const rallyPoints = [];
+    routes.forEach(function (rt) {
+      rt.stops.forEach(function (st) { if (st.done && typeof st.nodeKey === 'string' && st.nodeKey.indexOf('rally:') === 0 && rallyPoints.indexOf(st.gridId) < 0) rallyPoints.push(st.gridId); });
+    });
+    (ev.rallyNodes || []).forEach(function (n) { const g = maps.nodes[n].gridId; if (rallyPoints.indexOf(g) < 0) rallyPoints.push(g); });
+
     // requests counted in this plan
     const reqIds = {};
     maps.jobs.forEach(function (j) { reqIds[j.requestId] = true; });
@@ -978,6 +1145,19 @@
     deferred.forEach(function (d) { delayed[d.requestId] = true; });
     const lateReq = {};
     late.forEach(function (x) { lateReq[x.requestId] = true; });
+    // whole-window figures (stops already made + what is planned): a re-plan's stats count only what
+    // is planned from now on. Miles and risk are the legs' (done legs included); trucks = with a stop.
+    const windowStats = { requests: Object.keys(byRequest).length, stops: 0, stopsDone: 0, trucksUsed: 0, miles: 0, gallons: 0, riskUnits: 0,
+      delayed: Object.keys(delayed).length, rallyPoints: rallyPoints.length };
+    routes.forEach(function (rt) {
+      if (!rt.stops.length) return;
+      windowStats.trucksUsed++;
+      windowStats.stops += rt.stops.length;
+      rt.stops.forEach(function (st) { if (st.done) windowStats.stopsDone++; });
+      rt.legs.forEach(function (l) { windowStats.miles += num(l.miles, 0); windowStats.riskUnits += num(l.riskUnits, 0); });
+    });
+    windowStats.gallons = rd(windowStats.miles / (inst.params.mpg || 2));
+    windowStats.miles = rd(windowStats.miles); windowStats.riskUnits = rd(windowStats.riskUnits);
     const ex = res.extra || {};
     const runtimeSec = isNum(m.runtimeSec) ? m.runtimeSec : (isNum(res.elapsedSec) ? res.elapsedSec : (isNum(res.wallSec) ? res.wallSec : null));
     const label = m.label || res.label || (Sv.METHOD_LABELS && Sv.METHOD_LABELS[m.method]) || m.method || 'Plan';
@@ -997,22 +1177,28 @@
       builtOn: (maps.builtOn || []).slice(),
       replanReason: maps.contingency ? (m.reason || null) : null,
       compareId: m.compareId || null,
-      rallyPoints: (ev.rallyNodes || []).map(function (n) { return maps.nodes[n].gridId; }),
+      rallyPoints: rallyPoints,
       routes: routes,
       deferred: deferred,
       late: late,
+      // the planning rules the plan breaks (evaluate violations: code + plain-language detail); store
+      // plan/approve refuses such a plan while a draft for the same window meets every rule
+      violations: (ev.violations || []).map(function (x) { return { code: x.code, detail: x.detail || '' }; }),
       cost: rdCost(Object.assign({ total: ev.total }, ev.cost)),
       stats: {
         requests: Object.keys(reqIds).length, jobs: inst.jobs.length,
         stops: ev.stats ? ev.stats.stops : 0, trucksUsed: ev.stats ? ev.stats.trucksUsed : 0,
         miles: ev.stats ? rd(ev.stats.miles) : 0, gallons: ev.stats ? rd(ev.stats.gallons) : 0, riskUnits: ev.stats ? rd(ev.stats.riskUnits) : 0,
         late: Object.keys(lateReq).length, delayed: Object.keys(delayed).length, hardLate: (ev.hardLate || []).length,
-        rallyPoints: (ev.rallyNodes || []).length, violations: (ev.violations || []).length, feasible: !!ev.feasible,
+        rallyPoints: rallyPoints.length, violations: (ev.violations || []).length, feasible: !!ev.feasible,
         runtimeSec: rd(runtimeSec)
       },
+      windowStats: windowStats,
       network: { source: maps.network.source, counts: maps.network.counts, convoyFactor: maps.convoyFactor },
       warnings: (build.warnings || []).concat(Array.isArray(res.warnings) ? res.warnings : []).concat(m.warnings || [])
-        .concat(sol !== sol0 ? ['Loads were moved so that trucks already on the road carry only what is on board.'] : [])
+        .concat(sol !== sol0 && !fromStart ? ['Loads were moved so that trucks already on the road carry only what is on board.'] : [])
+        .concat(fromStart ? [] : fixNotes)
+        .concat(fromStart ? ['The search found nothing better than the current plan adjusted to the change, so this re-plan keeps it.'] : [])
         .concat(ev.stats && maps.maxStops && ev.stats.stops > maps.maxStops ? ['This plan has ' + ev.stats.stops + ' stops, more than the ' + maps.maxStops + '-stop guide for one window.'] : []),
       byRequest: byRequest,
       approved: false
@@ -1280,7 +1466,7 @@
     }
     const store = getStore();
     const job = { id: ++rt.jobSeq, kind: spec.kind, methods: spec.methods, method: spec.methods[0], best: null, bestCost: null, bestMethod: null,
-      history: [], plans: [], rows: [], started: wallNow(), cancelled: false, done: false, reason: spec.reason || null, auto: spec.auto || null,
+      history: [], plans: [], rows: [], start: null, started: wallNow(), cancelled: false, done: false, reason: spec.reason || null, auto: spec.auto || null,
       compareId: null, params: {} };
     rt.job = job;
     setStatus({ phase: 'preparing', kind: spec.kind, method: job.method, methods: spec.kind === 'compare' ? spec.methods.slice() : null, methodIndex: spec.kind === 'compare' ? 0 : null,
@@ -1346,10 +1532,10 @@
       const msg = { type: 'solve', instance: build.instance, method: method, params: paramsFor(state, method, spec), settings: settings };
       if (spec.kind === 'replan') {
         const start = E.contingencyStart(build);
-        if (start) msg.start = start;
+        if (start) { msg.start = start; job.start = start; }
       }
       return c.request(msg, { onProgress: onProgress }).then(function (result) {
-        const plan = storePlan(E.decodePlan(build, result, { method: method, label: result.label, params: result.params, reason: spec.reason }));
+        const plan = storePlan(E.decodePlan(build, result, { method: method, label: result.label, params: result.params, reason: spec.reason, start: job.start }));
         job.plans.push(plan);
         return plan;
       });
@@ -1393,7 +1579,7 @@
         const method = job.bestMethod || job.method;
         const plan = storePlan(E.decodePlan(job.build, { solution: job.best }, {
           method: method, label: labelOf(method), cancelled: true, compareId: job.compareId, reason: job.reason, runtimeSec: elapsedSec,
-          params: job.params[method] || null,
+          params: job.params[method] || null, start: job.start,
           name: (job.kind === 'compare' ? 'Compare, ' : '') + labelOf(method) + ' (stopped), ' + fmt().dtg(job.build.maps.now)
         }));
         job.plans.push(plan);

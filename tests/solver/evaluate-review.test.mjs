@@ -221,7 +221,7 @@ function refEvaluate(inst, sol) {
   const banned = new Set(pa.bannedRally || []);
   const candOf = (j, n) => banned.has(n) ? null : (inst.jobs[j].candidates || []).find((c) => c && c.node === n) || null;
   const okIdx = (x, n) => Number.isInteger(x) && x >= 0 && x < n;
-  let nViol = 0, miles = 0, risk = 0, stops = 0, trucks = 0, lateness = 0;
+  let nViol = 0, miles = 0, risk = 0, stops = 0, trucks = 0, lateness = 0, stability = 0;
   const delivered = inst.jobs.map(() => 0), lateMax = inst.jobs.map(() => 0), pairs = new Map(), rally = new Set(), used = new Set(), gotQty = new Set();
   for (const r of (sol && sol.routes) || []) {
     if (!r || !r.visits || !r.visits.length) continue;
@@ -242,14 +242,15 @@ function refEvaluate(inst, sol) {
       if (!vi || !okIdx(vi.node, nN)) { nViol++; continue; }
       const arrive = travel(cur, vi.node);
       stops++;
-      if (nodes[vi.node].kind === 'rally') rally.add(vi.node);
+      if (nodes[vi.node].kind === 'rally' && !nodes[vi.node].rallyDone) rally.add(vi.node);
       for (const ch of vi.jobs || []) {
         if (!ch || !okIdx(ch.job, inst.jobs.length)) { nViol++; continue; }
         const q = ch.qty;
         if (typeof q !== 'number' || !(q >= 0) || q === Infinity) { nViol++; continue; }
         const job = inst.jobs[ch.job];
         if ((job.group === 'fuel') !== (veh.type === 'tanker')) nViol++;
-        if (job.lockedTruck != null && job.lockedTruck !== veh.id) nViol++;
+        // a preloaded (en-route) truck carries only the jobs locked to it (contract of 2026-10-06)
+        if (job.lockedTruck != null ? job.lockedTruck !== veh.id : !!veh.preloaded) nViol++;
         const c = candOf(ch.job, vi.node);
         if (!c) nViol++;
         else if (q > 0) { const key = (job.requestId != null ? String(job.requestId) : '#' + ch.job) + '|' + vi.node; if (!pairs.has(key)) pairs.set(key, c.platoonCost || 0); }
@@ -257,11 +258,15 @@ function refEvaluate(inst, sol) {
         if (q > 0) {
           gotQty.add(vi.node);
           const late = arrive - job.deadline;
-          if (late > 0) {
+          // ETA slip (contract of 2026-10-06): lateness + slip share the lateness cap; lateness first
+          const slip = typeof job.prevEta === 'number' && job.slipPerMin > 0 ? arrive - job.prevEta : 0;
+          if (late > 0 || slip > 0) {
             const dw = pen.defer[job.tier] * pen.classFactor[job.classRank];
             const cap = pen.lateCapShare === Infinity ? Infinity : pen.lateCapShare * dw;
-            lateness += Math.min(late * pen.latePerMin[job.tier], cap) * q / job.qty;
-            lateMax[ch.job] = Math.max(lateMax[ch.job], late);
+            const lp = late > 0 ? late * pen.latePerMin[job.tier] : 0;
+            lateness += Math.min(lp, cap) * q / job.qty;
+            stability += (Math.min(lp + (slip > 0 ? slip * job.slipPerMin : 0), cap) - Math.min(lp, cap)) * q / job.qty;
+            if (late > 0) lateMax[ch.job] = Math.max(lateMax[ch.job], late);
           }
         }
       }
@@ -277,13 +282,13 @@ function refEvaluate(inst, sol) {
     else if (d < -eps) nViol++;
   });
   if (pa.maxRallyPoints != null && rally.size > pa.maxRallyPoints) nViol++;
-  const pinnedUnused = [...new Set(pa.pinnedRally || [])].filter((n) => okIdx(n, nN) && nodes[n].kind === 'rally' &&
+  const pinnedUnused = [...new Set(pa.pinnedRally || [])].filter((n) => okIdx(n, nN) && nodes[n].kind === 'rally' && !nodes[n].rallyDone &&
     inst.jobs.some((_, j) => candOf(j, n)) && !gotQty.has(n)).sort((a, b) => a - b);
   let platoon = 0;
   for (const c of pairs.values()) platoon += c;
   const cost = {
     fuel: w.fuel * miles / pa.mpg, distance: w.distance * 0.5 * miles, risk: w.risk * risk, simplicity: w.simplicity * (5 * stops + 25 * trucks),
-    platoon: w.distance * platoon, lateness, deferral, pinned: pen.pinUnused * pinnedUnused.length
+    platoon: w.distance * platoon, lateness, stability, deferral, pinned: pen.pinUnused * pinnedUnused.length
   };
   const late = lateMax.map((m, job) => ({ job, minutesLate: m })).filter((x) => x.minutesLate > 0);
   return { total: Object.values(cost).reduce((a, b) => a + b, 0) + 1e7 * nViol, nViol, cost, pinnedUnused, late, delivered };
@@ -309,13 +314,19 @@ function adversarial(seed, rng) {
   if (seed % 4 === 2) inst.periods = randomTable(rng, true);
   if (seed % 4 === 3) inst.periods = seed % 8 === 3 ? [] : randomTable(rng, false);
   if (seed % 3 === 0) inst.vehicles.forEach((v, i) => { if (i % 2) { v.preloaded = true; v.startNode = inst.nodes.length - 1 - i; } });
+  // re-plan ETAs (prevEta, slipPerMin) on most jobs of every other instance (own rng: the plans drawn
+  // from the shared one stay the same)
+  if (seed % 2 === 1) {
+    const er = SRO.util.rng(seed * 13 + 1);
+    inst.jobs.forEach((j) => { if (er() < 0.7) { j.prevEta = inst.startMin - 120 + er() * 600; j.slipPerMin = er() < 0.2 ? 0 : er() * (seed % 4 === 1 ? 500 : 5); } });
+  }
   S.prepare.invalidate(inst);
   return inst;
 }
 
 test('review v2: evaluate equals an independent reference evaluator on 1,200 adversarial plans (caps, pins, penalties, periods)', (t) => {
   const rng = SRO.util.rng(4711);
-  let compared = 0, capped = 0, pinCharged = 0, infeasible = 0;
+  let compared = 0, capped = 0, pinCharged = 0, infeasible = 0, slipped = 0;
   for (let seed = 1; seed <= 150; seed++) {
     const inst = adversarial(seed, rng);
     const P = S.prepare(inst);
@@ -344,15 +355,17 @@ test('review v2: evaluate equals an independent reference evaluator on 1,200 adv
       if (pen.lateCapShare < Infinity) {
         const bound = inst.jobs.reduce((a, job, j) => a + pen.lateCapShare * P.jDeferW[j] * ev.delivered[j] / job.qty, 0);
         assert.ok(ev.cost.lateness <= bound * (1 + 1e-12) + 1e-9, `${msg} lateness ${ev.cost.lateness} over the cap bound ${bound}`);
+        assert.ok(ev.cost.lateness + ev.cost.stability <= bound * (1 + 1e-12) + 1e-9, `${msg} lateness + ETA slip over the cap bound ${bound}`);
         if (ev.cost.lateness > 0 && ev.late.some((x) => x.minutesLate * P.jLateW[x.job] > P.jLateCap[x.job])) capped++;
       }
       if (ev.cost.pinned > 0) pinCharged++;
+      if (ev.cost.stability > 0) slipped++;
       if (!ev.feasible) infeasible++;
       compared++;
     }
   }
-  t.diagnostic(`${compared} plans: ${capped} with a capped lateness, ${pinCharged} charged for an unused pin, ${infeasible} with violations`);
-  assert.ok(capped > 100 && pinCharged > 100 && infeasible > 100 && compared - infeasible > 100);
+  t.diagnostic(`${compared} plans: ${capped} with a capped lateness, ${pinCharged} charged for an unused pin, ${infeasible} with violations, ${slipped} with an ETA slip cost`);
+  assert.ok(capped > 100 && pinCharged > 100 && infeasible > 100 && compared - infeasible > 100 && slipped > 100);
 });
 
 // ---- 3. rule edge cases ---------------------------------------------------------------------------------
