@@ -1,5 +1,6 @@
 // Schedule simulation and cost breakdown: the single source of truth for cost (DESIGN.md section 7,
-// "Evaluation semantics" and "Cost"). Every method scores with SRO.solver.evaluate.
+// "Evaluation semantics" and "Cost", including the rule changes of 2026-10-06). Every method scores
+// with SRO.solver.evaluate.
 //
 //   evaluate(instance, solution)                     -> full result (schedule, costs, violations)
 //   evaluate(instance, solution, { costOnly: true }) -> { total, feasible, nViolations } (hot path,
@@ -10,24 +11,35 @@
 // Rules implemented exactly as the contract states:
 //   start    t0 = max(startMin, availableAt) + (preloaded ? 0 : loadMin), from startNode (default hubNode),
 //            visits in order, then back to hubNode.
-//   legs     minutes[i][j] / speed of the period containing the leg's departure minute; risk =
-//            riskUnits[i][j] x that period's risk factor; miles and risk counted on every leg incl. the
-//            return. An unreachable leg (minutes Infinity) is a violation; it is then counted as
-//            0 minutes / 0 miles / 0 risk so totals stay finite and comparable.
+//   legs     FIFO travel (SRO.solver.legArrive in instance.js): the leg needs minutes[i][j] base minutes
+//            and in each time-of-day period the truck covers base minutes at period.speed per clock
+//            minute, so leaving later never arrives earlier. Leg risk = riskUnits[i][j] x the
+//            time-weighted mean period.risk over the leg's clock minutes. No periods: speed 1, risk 1.
+//            Miles and risk are counted on every leg incl. the return. An unreachable leg (minutes,
+//            miles or risk units Infinity: the contract's "Infinity if unreachable" holds for all three
+//            matrices, and Infinity risk units would otherwise give an Infinity or NaN total) is a
+//            violation; it is then counted as 0 minutes / 0 miles / 0 risk so totals stay finite and
+//            comparable.
 //   stops    arrival = delivery time for every chunk there; each stop adds serviceMin; no waiting.
 //            Every visit is a stop, even an empty one (moves never create empty visits).
 //   costs    fuel = wF x miles/mpg; distance = wD x 0.5 x miles; risk = wR x factored risk units;
 //            simplicity = wS x (5 x stops + 25 x trucks used); platoon = wD x platoonCost once per
 //            distinct (requestId, node) that receives a positive quantity (a zero-quantity chunk
-//            brings no platoon to the node); lateness per chunk = max(0, arrive - deadline) x
-//            latePerMin[tier] x qty/job.qty; deferral per job = deferred/job.qty x defer[tier] x
-//            classFactor[classRank]; total = sum + 1e7 per violation.
+//            brings no platoon to the node); lateness per chunk = min(max(0, arrive - deadline) x
+//            latePerMin[tier], lateCapShare x defer[tier] x classFactor[classRank]) x qty/job.qty;
+//            deferral per job = deferred/job.qty x defer[tier] x classFactor[classRank]; pinned =
+//            pinUnused per pinned rally node that is a candidate of some job but receives no positive
+//            quantity; total = sum + 1e7 per violation. Missing penalties fields use DEFAULT_PENALTIES.
 //
-// Full result notes: routes lists only routes with stops (routeIdx = index in solution.routes; extra
-// fields vehicleId, loadStart, load, capacity); stop.periodIdx is the period of the arrival minute,
-// leg.periodIdx the period of the departure minute; leg.riskUnits already includes the period factor;
-// late has one entry per job (its largest lateness over its chunks); stats = { miles, gallons,
-// riskUnits, stops, trucksUsed, rallyPoints }.
+// Full result notes: cost = { fuel, distance, risk, simplicity, platoon, lateness, deferral, pinned };
+// routes lists only routes with stops (routeIdx = index in solution.routes; extra fields vehicleId,
+// loadStart, load, capacity) and route.cost has the per-route terms only (fuel, distance, risk,
+// simplicity, platoon, lateness, total): deferral and pinned are plan-level, route-independent terms.
+// pinnedUnused lists the pinned nodes charged. stop.periodIdx is the period of the arrival minute,
+// leg.periodIdx the period of the departure minute (display only); leg.riskUnits already includes
+// the mean period factor, leg.riskFactor is that factor. late has one entry per job (its largest
+// lateness over its chunks; lateness minutes are not capped, only their cost); stats = { miles,
+// gallons, riskUnits, stops, trucksUsed, rallyPoints, pinnedUnused }.
 //
 // Violation codes: wrong-type, over-capacity, not-candidate (incl. banned rally nodes), too-many-rally,
 // unreachable, vehicle-reused (a vehicle in more than one route that has stops), locked-truck, over-qty,
@@ -59,15 +71,15 @@
     const P = S.prepare(inst);
     const nN = P.nN, nV = P.nV, nJ = P.nJ;
     let epoch = P.epoch + 1;
-    if (epoch > 2000000000) { P.vehStamp.fill(0); P.rallyStamp.fill(0); P.pairStamp.fill(0); epoch = 1; }
+    if (epoch > 2000000000) { P.vehStamp.fill(0); P.rallyStamp.fill(0); P.pairStamp.fill(0); P.nodeStamp.fill(0); epoch = 1; }
     P.epoch = epoch;
     const delivered = P.delivered; delivered.fill(0);
     const M = P.minutes, MI = P.miles, RK = P.risk;
-    const vehStamp = P.vehStamp, rallyStamp = P.rallyStamp, pairStamp = P.pairStamp, isRally = P.isRally;
+    const vehStamp = P.vehStamp, rallyStamp = P.rallyStamp, pairStamp = P.pairStamp, nodeStamp = P.nodeStamp, isRally = P.isRally;
     const jFuel = P.jFuel, jLockV = P.jLockV, cand = P.cand, candCost = P.candCost, jReq = P.jReq;
-    const jDeadline = P.jDeadline, jLateW = P.jLateW, jInvQty = P.jInvQty;
-    const pSpeed = P.pSpeed, pRisk = P.pRisk, serviceMin = P.serviceMin;
-    const hasPeriods = P.nP > 0;
+    const jDeadline = P.jDeadline, jLateW = P.jLateW, jLateCap = P.jLateCap, jInvQty = P.jInvQty;
+    const serviceMin = P.serviceMin;
+    const hasPeriods = P.nP > 0, legArrive = S.legArrive, legOut = P.legOut;
 
     let nViol = 0;
     const violations = full ? [] : null;
@@ -105,22 +117,21 @@
           if (full) violations.push({ code: V.BAD_INDEX, route: r, visit: s, detail: 'Truck ' + vehName(inst, v) + ' stop ' + (s + 1) + ' names node ' + node + ', which does not exist.' });
           continue;
         }
-        // leg cur -> node, timed by the period containing the departure minute
+        // leg cur -> node: FIFO travel across periods, risk x time-weighted mean period risk
         const k = cur * nN + node;
         const base = M[k];
-        let arrive, pi = -1;
-        if (base === INF || base !== base || MI[k] === INF) {
+        let arrive;
+        if (base === INF || base !== base || MI[k] === INF || RK[k] === INF) {
           nViol++;
           arrive = t;
           if (full) violations.push({ code: V.UNREACHABLE, route: r, visit: s, vehicle: v, node: node, detail: 'No open road from ' + nodeName(inst, cur) + ' to ' + nodeName(inst, node) + ' for truck ' + vehName(inst, v) + '.' });
-          if (full) legsOut.push({ from: cur, to: node, depart: t, arrive: t, miles: 0, riskUnits: 0, periodIdx: -1, unreachable: true });
+          if (full) legsOut.push({ from: cur, to: node, depart: t, arrive: t, miles: 0, riskUnits: 0, riskFactor: 0, periodIdx: -1, unreachable: true });
         } else {
-          let sp = 1, rf = 1;
-          if (hasPeriods) { pi = S.periodIndex(P, t); sp = pSpeed[pi]; rf = pRisk[pi]; }
-          arrive = t + base / sp;
+          let rf = 1;
+          if (hasPeriods) { arrive = legArrive(P, t, base, legOut); rf = legOut[0]; } else arrive = t + base;
           const lm = MI[k], lr = RK[k] * rf;
           rMiles += lm; rRisk += lr;
-          if (full) legsOut.push({ from: cur, to: node, depart: t, arrive: arrive, miles: lm, riskUnits: lr, periodIdx: pi });
+          if (full) legsOut.push({ from: cur, to: node, depart: t, arrive: arrive, miles: lm, riskUnits: lr, riskFactor: rf, periodIdx: hasPeriods ? legOut[1] : -1 });
         }
         rStops++;
         if (isRally[node] && rallyStamp[node] !== epoch) { rallyStamp[node] = epoch; nRally++; }
@@ -159,10 +170,16 @@
           }
           load += q;
           delivered[j] += q;
-          const late = arrive - jDeadline[j];
-          if (late > 0 && q > 0) {
-            rLate += late * jLateW[j] * q * jInvQty[j];
-            if (full && late > lateMax[j]) lateMax[j] = late;
+          if (q > 0) {
+            nodeStamp[node] = epoch;                     // the node received a delivery (pinned rule)
+            const late = arrive - jDeadline[j];
+            if (late > 0) {
+              // capped at lateCapShare x the job's deferral cost, then scaled by the chunk's share
+              let lp = late * jLateW[j];
+              if (lp > jLateCap[j]) lp = jLateCap[j];
+              rLate += lp * q * jInvQty[j];
+              if (full && late > lateMax[j]) lateMax[j] = late;
+            }
           }
         }
         const dep = arrive + serviceMin;
@@ -175,20 +192,19 @@
       const kr = cur * nN + hub;
       const baseR = M[kr];
       let returnAt;
-      if (baseR === INF || baseR !== baseR || MI[kr] === INF) {
+      if (baseR === INF || baseR !== baseR || MI[kr] === INF || RK[kr] === INF) {
         nViol++;
         returnAt = t;
         if (full) {
           violations.push({ code: V.UNREACHABLE, route: r, vehicle: v, node: hub, detail: 'No open road from ' + nodeName(inst, cur) + ' back to ' + nodeName(inst, hub) + ' for truck ' + vehName(inst, v) + '.' });
-          legsOut.push({ from: cur, to: hub, depart: t, arrive: t, miles: 0, riskUnits: 0, periodIdx: -1, unreachable: true });
+          legsOut.push({ from: cur, to: hub, depart: t, arrive: t, miles: 0, riskUnits: 0, riskFactor: 0, periodIdx: -1, unreachable: true });
         }
       } else {
-        let sp = 1, rf = 1, pi = -1;
-        if (hasPeriods) { pi = S.periodIndex(P, t); sp = pSpeed[pi]; rf = pRisk[pi]; }
-        returnAt = t + baseR / sp;
+        let rf = 1;
+        if (hasPeriods) { returnAt = legArrive(P, t, baseR, legOut); rf = legOut[0]; } else returnAt = t + baseR;
         const lm = MI[kr], lr = RK[kr] * rf;
         rMiles += lm; rRisk += lr;
-        if (full) legsOut.push({ from: cur, to: hub, depart: t, arrive: returnAt, miles: lm, riskUnits: lr, periodIdx: pi });
+        if (full) legsOut.push({ from: cur, to: hub, depart: t, arrive: returnAt, miles: lm, riskUnits: lr, riskFactor: rf, periodIdx: hasPeriods ? legOut[1] : -1 });
       }
       const cap = P.vCap[v];
       if (load > cap + 1e-9 * mmax(1, cap)) {
@@ -230,11 +246,18 @@
       nViol++;
       if (full) violations.push({ code: V.TOO_MANY_RALLY, detail: 'The plan uses ' + nRally + ' rally points; the limit is ' + P.maxRally + '.' });
     }
+    // pinned rally points some job could use that received no delivered quantity
+    const pins = P.pinNodes;
+    let nPinUnused = 0;
+    const pinnedOut = full ? [] : null;
+    for (let a = 0; a < pins.length; a++) {
+      if (nodeStamp[pins[a]] !== epoch) { nPinUnused++; if (full) pinnedOut.push(pins[a]); }
+    }
 
     const gallons = miles * P.invMpg;
     const cFuel = P.wF * gallons, cDist = P.wD * 0.5 * miles, cRisk = P.wR * risk;
-    const cSimp = P.wS * (5 * nStops + 25 * nTrucks), cPlat = P.wD * platoon;
-    const total = cFuel + cDist + cRisk + cSimp + cPlat + lateness + deferral + S.VIOLATION_PENALTY * nViol;
+    const cSimp = P.wS * (5 * nStops + 25 * nTrucks), cPlat = P.wD * platoon, cPin = P.pinUnused * nPinUnused;
+    const total = cFuel + cDist + cRisk + cSimp + cPlat + lateness + deferral + cPin + S.VIOLATION_PENALTY * nViol;
     if (!full) return { total: total, feasible: nViol === 0, nViolations: nViol };
 
     const late = [], hardLate = [], rallyNodes = [];
@@ -248,15 +271,16 @@
     return {
       total: total,
       feasible: nViol === 0,
-      cost: { fuel: cFuel, distance: cDist, risk: cRisk, simplicity: cSimp, platoon: cPlat, lateness: lateness, deferral: deferral },
+      cost: { fuel: cFuel, distance: cDist, risk: cRisk, simplicity: cSimp, platoon: cPlat, lateness: lateness, deferral: deferral, pinned: cPin },
       routes: routesOut,
       delivered: Array.from(delivered),
       deferred: deferredOut,
       late: late,
       hardLate: hardLate,
       rallyNodes: rallyNodes,
+      pinnedUnused: pinnedOut,
       violations: violations,
-      stats: { miles: miles, gallons: gallons, riskUnits: risk, stops: nStops, trucksUsed: nTrucks, rallyPoints: nRally }
+      stats: { miles: miles, gallons: gallons, riskUnits: risk, stops: nStops, trucksUsed: nTrucks, rallyPoints: nRally, pinnedUnused: nPinUnused }
     };
   }
 
@@ -270,11 +294,12 @@
   //   { job, qty, reason: 'radius'|'no-truck'|'closed-road'|'time'|'capacity', detail, note, earliestArrive?, deadline? }
   // Checks in order: no allowed pickup point (radius), no truck of the right type/lock (no-truck), no
   // reachable candidate from any such truck (closed-road), earliest possible arrival after the deadline
-  // (time), otherwise capacity (detail: 'trucks-full' | 'rally-limit' | 'cost'). Notes carry no clock
+  // (time), otherwise capacity (detail: 'trucks-full' | 'rally-limit' | 'cost'; room is counted only on
+  // trucks that can reach one of the job's pickup points and get back to their hub). Notes carry no clock
   // times: format.js owns time formatting, so the minute values are returned as fields.
   S.explainDeferred = function (instance, evalResult) {
     const P = S.prepare(instance);
-    const nN = P.nN;
+    const nN = P.nN, legOut = new F64(2);
     const ev = evalResult || S.evaluate(instance, { routes: [] });
     if (!Array.isArray(ev.deferred)) throw new TypeError('SRO.solver.explainDeferred needs a full evaluate() result (not { costOnly: true }).');
     const loadByVeh = new F64(P.nV);
@@ -313,17 +338,21 @@
         return out;
       }
       let earliest = INF, reachable = 0;
+      const reachVs = [];                          // trucks that can get to some candidate and back
       for (let a = 0; a < vs.length; a++) {
         const v = vs[a], st = P.vStart[v], hub = P.vHub[v], t0 = P.vT0[v];
+        let reaches = false;
         for (let b = 0; b < cands.length; b++) {
           const n = cands[b];
           const go = P.minutes[st * nN + n], back = P.minutes[n * nN + hub];
-          if (!(go < INF) || !(back < INF)) continue;
-          reachable++;
-          const pi = S.periodIndex(P, t0);
-          const arr = t0 + go / (pi >= 0 ? P.pSpeed[pi] : 1);
+          if (!(go < INF) || !(back < INF) || !(P.miles[st * nN + n] < INF) || !(P.miles[n * nN + hub] < INF) ||
+            !(P.risk[st * nN + n] < INF) || !(P.risk[n * nN + hub] < INF)) continue;
+          reachable++; reaches = true;
+          // straight there with the same FIFO travel rule as evaluate
+          const arr = S.legArrive(P, t0, go, legOut);
           if (arr < earliest) earliest = arr;
         }
+        if (reaches) reachVs.push(v);
       }
       if (!reachable) {
         out.reason = 'closed-road'; out.detail = 'unreachable';
@@ -338,8 +367,10 @@
         return out;
       }
       out.reason = 'capacity';
+      // room only counts on trucks that can reach the job: an empty truck cut off by a closed road is
+      // no help, and calling that "trucks had some room" would mislead the planner
       let free = 0, cap = 0;
-      vs.forEach(function (v) { cap += P.vCap[v]; free += mmax(0, P.vCap[v] - loadByVeh[v]); });
+      reachVs.forEach(function (v) { cap += P.vCap[v]; free += mmax(0, P.vCap[v] - loadByVeh[v]); });
       const allRally = cands.every(function (n) { return P.isRally[n] && !usedSet.has(n); });
       if (free <= 1e-9 * mmax(1, cap) || free < d.qty * 0.05) {
         out.detail = 'trucks-full';

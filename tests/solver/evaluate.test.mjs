@@ -58,7 +58,8 @@ function hand(edit) {
   return inst;
 }
 const visit = (node, ...chunks) => ({ node, jobs: chunks.map(([job, qty]) => ({ job, qty })) });
-const costSum = (c) => c.fuel + c.distance + c.risk + c.simplicity + c.platoon + c.lateness + c.deferral;
+// cost.pinned (unused pinned rally points) joined the breakdown on 2026-10-06
+const costSum = (c) => c.fuel + c.distance + c.risk + c.simplicity + c.platoon + c.lateness + c.deferral + c.pinned;
 
 test('hand instance is valid', () => {
   assert.deepEqual(plain(S.validateInstance(hand())), []);
@@ -80,23 +81,27 @@ test('basic schedule: start = max(startMin, availableAt) + loadMin, lateness, pl
   close(r0.depart, 420); close(r0.stops[0].arrive, 480); close(r0.stops[0].depart, 495); close(r0.returnAt, 555);
   close(r0.miles, 60); close(r0.riskUnits, 4); close(r0.gallons, 30);
   // V1: t0 = max(400, 500) + 20 = 520; 0->1 60 -> 580 (J1 due 700 ok); depart 595; 1->3 50 -> 645
-  //     (J2 due 560: 85 min late x 50/min x 6/6 = 4250); depart 660; 3->0 30 -> 690.
+  //     (J2 due 560: 85 min late x 50/min = 4250, capped at lateCapShare 0.9 x defer 5000 x class
+  //     factor 0.85 = 3825, x 6/6 = 3825); depart 660; 3->0 30 -> 690.
   //     miles 30+25+15 = 70, risk 2+0+0 = 2.
+  // (Updated 2026-10-06: lateness per chunk is now capped; this instance's penalties have no
+  // lateCapShare, so the default 0.9 applies. Before the cap the lateness here was 4250, total 4839.)
   const r1 = ev.routes[1];
   close(r1.depart, 520); close(r1.loadStart, 500);
   close(r1.stops[0].arrive, 580); close(r1.stops[1].arrive, 645); close(r1.stops[1].depart, 660); close(r1.returnAt, 690);
   close(r1.miles, 70); close(r1.riskUnits, 2);
   // totals: miles 130 -> gallons 65 -> fuel 3 x 65 = 195; distance 3 x 0.5 x 130 = 195; risk 5 x 6 = 30;
   // simplicity 2 x (5 x 3 stops + 25 x 2 trucks) = 130; platoon: (R-1, R1) = 5 once (J0 and J1 share it),
-  // (R-2, R2) = 8 -> 3 x 13 = 39; lateness 4250; deferral 0. total 4839.
+  // (R-2, R2) = 8 -> 3 x 13 = 39; lateness 3825 (capped); deferral 0; pinned 0. total 4414.
   close(ev.cost.fuel, 195); close(ev.cost.distance, 195); close(ev.cost.risk, 30);
-  close(ev.cost.simplicity, 130); close(ev.cost.platoon, 39); close(ev.cost.lateness, 4250); close(ev.cost.deferral, 0);
-  close(ev.total, 4839);
+  close(ev.cost.simplicity, 130); close(ev.cost.platoon, 39); close(ev.cost.lateness, 3825); close(ev.cost.deferral, 0);
+  close(ev.cost.pinned, 0);
+  close(ev.total, 4414);
   // per-route attribution: the (R-1, R1) pair is charged to V0, where it first appears
   close(r0.cost.platoon, 15); close(r1.cost.platoon, 24);
   close(r0.cost.simplicity, 2 * (5 + 25)); close(r1.cost.simplicity, 2 * (10 + 25));
-  close(r1.cost.lateness, 4250);
-  assert.deepEqual(plain(ev.late), [{ job: 2, minutesLate: 85 }]);
+  close(r1.cost.lateness, 3825);
+  assert.deepEqual(plain(ev.late), [{ job: 2, minutesLate: 85 }]);   // minutes late are not capped
   assert.deepEqual(plain(ev.hardLate), []);
   assert.deepEqual(plain(ev.rallyNodes), [1, 3]);
   assert.deepEqual(plain(ev.delivered), [1000, 4, 6]);
@@ -111,7 +116,10 @@ test('basic schedule: start = max(startMin, availableAt) + loadMin, lateness, pl
   assert.equal(S.totalCost(inst, sol), ev.total);
 });
 
-test('period boundary: leg speed and risk from the period containing the departure minute; lateness share', () => {
+// Updated 2026-10-06: travel is now integrated across periods (FIFO) and leg risk is the time-weighted
+// mean period risk. Before, the whole leg used the departure period (leg 2 below arrived at 1206.111
+// with risk 4 x 1.2, total 4855.333).
+test('period boundary: FIFO travel integrated across periods, time-weighted leg risk; lateness share', () => {
   // Day [0,1080) x1.0/x1.0, Dusk [1080,1170) x0.9/x1.2, Night [1170,1770) x0.7/x0.8
   const inst = hand((i) => {
     i.startMin = 1060;
@@ -127,30 +135,41 @@ test('period boundary: leg speed and risk from the period containing the departu
   const ev = S.evaluate(inst, sol);
   assert.equal(ev.feasible, true);
   const r = ev.routes[0];
-  // t0 = 1060 + 20 = 1080: exactly the Dusk boundary, so leg 1 is Dusk: 60 / 0.9 = 66.667 -> 1146.667, risk 2 x 1.2
+  // t0 = 1060 + 20 = 1080: exactly the Dusk boundary, so leg 1 is all Dusk: 60 / 0.9 = 66.667 -> 1146.667, risk 2 x 1.2
   close(r.depart, 1080);
   assert.equal(r.legs[0].periodIdx, 1);
-  close(r.stops[0].arrive, 1080 + 60 / 0.9);
+  const arrive1 = 1080 + 60 / 0.9;
+  close(r.stops[0].arrive, arrive1);
   assert.equal(r.stops[0].periodIdx, 1);
-  // depart 1161.667 (still Dusk): 40 / 0.9 = 44.444 -> 1206.111 (arrives in Night, timed as Dusk), risk 4 x 1.2
-  assert.equal(r.legs[1].periodIdx, 1);
-  const arrive2 = 1080 + 60 / 0.9 + 15 + 40 / 0.9;
+  close(r.legs[0].riskUnits, 2 * 1.2); close(r.legs[0].riskFactor, 1.2);
+  // depart 1161.667 (Dusk). Leg 2 needs 40 base minutes: Dusk until 1170 is 8.333 clock min x 0.9 = 7.5 base;
+  // the other 32.5 base at Night speed 0.7 take 46.429 clock min -> arrive 1216.429 (Night).
+  const dep1 = arrive1 + 15, inDusk = 1170 - dep1, inNight = (40 - inDusk * 0.9) / 0.7;
+  close(inDusk * 0.9, 7.5);
+  const arrive2 = 1170 + inNight;
+  close(arrive2, 1216.4285714285714, '', 1e-12);
+  assert.equal(r.legs[1].periodIdx, 1, 'leg.periodIdx is the departure period (display)');
   close(r.stops[1].arrive, arrive2);
   assert.equal(r.stops[1].periodIdx, 2);
-  // depart 1221.111 (Night): 90 / 0.7 = 128.571 -> 1349.683, risk 3 x 0.8
+  // leg 2 risk factor: time-weighted (8.333 min x 1.2 + 46.429 min x 0.8) / 54.762 min = 0.86087
+  const rf2 = (inDusk * 1.2 + inNight * 0.8) / (inDusk + inNight);
+  close(rf2, 0.8608695652173913, '', 1e-12);
+  close(r.legs[1].riskFactor, rf2); close(r.legs[1].riskUnits, 4 * rf2);
+  // depart 1231.429 (Night): 90 / 0.7 = 128.571 -> 1360.000, risk 3 x 0.8
   assert.equal(r.legs[2].periodIdx, 2);
   close(r.returnAt, arrive2 + 15 + 90 / 0.7);
-  close(r.riskUnits, 2 * 1.2 + 4 * 1.2 + 3 * 0.8);           // 9.6
+  close(r.riskUnits, 2 * 1.2 + 4 * rf2 + 3 * 0.8);           // 8.24348
   close(r.miles, 95);
-  // lateness: 400 of 1000 arrive 6.111 min late at 3/min (Priority): 6.111 x 3 x 0.4 = 7.333
+  // lateness: 400 of 1000 arrive 16.429 min late at 3/min (Priority; cap 0.9 x 600 = 540 not reached): x 0.4 = 19.714
   close(ev.cost.lateness, (arrive2 - 1200) * 3 * 0.4);
-  close(ev.cost.lateness, 7.333333333, 1e-8);
+  close(ev.cost.lateness, 19.714285714285715, '', 1e-9);
   assert.equal(ev.late.length, 1); close(ev.late[0].minutesLate, arrive2 - 1200);
-  // fuel 3 x 47.5 = 142.5; distance 3 x 0.5 x 95 = 142.5; risk 5 x 9.6 = 48; simplicity 2 x (5 x 2 + 25) = 70;
+  // fuel 3 x 47.5 = 142.5; distance 3 x 0.5 x 95 = 142.5; risk 5 x 8.24348 = 41.217; simplicity 2 x (5 x 2 + 25) = 70;
   // platoon 3 x (5 at R1 + 0 at D1) = 15; deferral J1 200 x 0.9 = 180 + J2 5000 x 0.85 = 4250 -> 4430
-  close(ev.cost.fuel, 142.5); close(ev.cost.distance, 142.5); close(ev.cost.risk, 48);
+  close(ev.cost.fuel, 142.5); close(ev.cost.distance, 142.5); close(ev.cost.risk, 5 * (2.4 + 4 * rf2 + 2.4));
   close(ev.cost.simplicity, 70); close(ev.cost.platoon, 15); close(ev.cost.deferral, 4430);
-  close(ev.total, 142.5 + 142.5 + 48 + 70 + 15 + 7.333333333333 + 4430, 1e-9);   // 4855.333
+  close(ev.total, 142.5 + 142.5 + 5 * (4.8 + 4 * rf2) + 70 + 15 + (arrive2 - 1200) * 1.2 + 4430, 1e-12);
+  close(ev.total, 4860.931677018633, '', 1e-12);   // 285 + 41.217 + 70 + 15 + 19.714 + 4430
 });
 
 test('preloaded en-route truck, partial delivery (deferral share), platoon cost per distinct (request, node)', () => {
@@ -206,15 +225,20 @@ test('empty plan: everything deferred at defer[tier] x classFactor[classRank]', 
   assert.equal(S.evaluate(hand(), S.emptySolution(hand())).total, 5030);
 });
 
-test('periods past the expanded table wrap by whole days; a leg is timed by the departure period', () => {
+// Updated 2026-10-06 (FIFO travel): the leg below crosses 0700 and is now integrated across Dawn and
+// Day; before, the whole leg used the Dawn speed (arrival 6140 + 60 / 0.9 = 6206.667).
+test('periods past the expanded table wrap by whole days; a leg is integrated across the wrapped periods', () => {
   const periods = S.expandPeriods(S.DEFAULT_PERIOD_TABLE, 360, 72);
   const inst = hand((i) => { i.periods = periods; i.startMin = 360 + 4 * 1440; });   // beyond the 72 h table
   const sol = { routes: [{ vehicle: 0, visits: [visit(1, [0, 1000])] }] };
   const ev = S.evaluate(inst, sol);
-  // t0 = 6120 + 20 = 6140 = Day 5 0620 -> Dawn (x0.9): 60 / 0.9
+  // t0 = 6120 + 20 = 6140 = Day 5 0620 -> Dawn (x0.9) until 0700 (6180): 40 min x 0.9 = 36 base min;
+  // the other 24 base min at Day x1.0 -> arrive 6204. Risk factor (40 x 1.2 + 24 x 1.0) / 64 = 1.125.
   const pi = ev.routes[0].legs[0].periodIdx;
   assert.equal(periods[pi].name, 'Dawn');
-  close(ev.routes[0].stops[0].arrive, 6140 + 60 / 0.9);
+  close(ev.routes[0].stops[0].arrive, 6204);
+  close(ev.routes[0].legs[0].riskFactor, 1.125);
+  close(ev.routes[0].legs[0].riskUnits, 2 * 1.125);
 });
 
 test('capacity check tolerates float sums', () => {

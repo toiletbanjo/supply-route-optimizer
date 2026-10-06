@@ -13,6 +13,12 @@ const codes = (ev) => plain(ev.violations.map((v) => v.code));
 const visit = (node, ...chunks) => ({ node, jobs: chunks.map(([job, qty]) => ({ job, qty })) });
 
 // ---- reference evaluator (straight from the DESIGN text; linear period scan, no caching) ----------
+// Updated 2026-10-06 for the rule changes in DESIGN.md section 7: FIFO travel integrated across periods
+// with time-weighted leg risk (refTravel), lateness per chunk capped at lateCapShare x deferral cost,
+// unused pinned rally points (pinUnused), and per-field penalty defaults. The integrator is independent
+// of instance.js: it lists every minute at which the period can change and reads the period at the
+// midpoint of each piece.
+const REF_PENALTIES = { latePerMin: [2, 6, 60, 600], defer: [5000, 15000, 60000, 250000], classFactor: [1.0, 0.9, 0.85, 0.8, 0.6], lateCapShare: 0.9, pinUnused: 2000 };
 function refPeriodIdx(periods, t) {
   if (!periods || !periods.length) return -1;
   const first = periods[0].startMin, last = periods[periods.length - 1].endMin;
@@ -22,10 +28,37 @@ function refPeriodIdx(periods, t) {
   for (let i = 0; i < periods.length; i++) if (periods[i].startMin <= tt) idx = i;
   return idx;
 }
+// Leg leaving at t that needs `base` base minutes: { arrive, riskFactor }.
+function refTravel(periods, t, base) {
+  if (!periods || !periods.length) return { arrive: t + base, riskFactor: 1 };
+  const first = periods[0].startMin, last = periods[periods.length - 1].endMin;
+  const minSpeed = Math.min(...periods.map((p) => p.speed));
+  const until = t + base / minSpeed + 1;
+  const cuts = [];
+  const shifts = [0];
+  if (last - first >= 1440) for (let k = Math.floor((t - last) / 1440) - 1; k <= Math.ceil((until - first) / 1440) + 1; k++) shifts.push(k * 1440);
+  for (const sh of shifts) { for (const p of periods) cuts.push(p.startMin + sh); cuts.push(last + sh); }
+  const pts = [...new Set(cuts.filter((c) => c > t && c < until))].sort((a, b) => a - b);
+  pts.push(Infinity);
+  let cur = t, rem = base, riskMin = 0;
+  for (const c of pts) {
+    const mid = c === Infinity ? (cur + until) / 2 : (cur + c) / 2;   // no cut in (cur, until)
+    const p = periods[refPeriodIdx(periods, mid)];
+    const room = (c - cur) * p.speed;
+    if (room >= rem) {
+      const arrive = cur + rem / p.speed;
+      riskMin += (arrive - cur) * p.risk;
+      return { arrive, riskFactor: arrive > t ? riskMin / (arrive - t) : periods[refPeriodIdx(periods, t)].risk };
+    }
+    riskMin += (c - cur) * p.risk; rem -= room; cur = c;
+  }
+  throw new Error('unreachable');
+}
 function refEvaluate(inst, sol) {
-  const w = inst.weights, pa = inst.params, pen = inst.penalties, nN = inst.nodes.length;
+  const w = inst.weights, pa = inst.params, nN = inst.nodes.length;
+  const pen = Object.assign({}, REF_PENALTIES, ...Object.entries(inst.penalties || {}).filter(([, x]) => x != null).map(([k, x]) => ({ [k]: x })));
   let miles = 0, risk = 0, stops = 0, trucks = 0, late = 0, nViol = 0;
-  const pairs = new Map(), delivered = inst.jobs.map(() => 0), rally = new Set(), usedVeh = new Set();
+  const pairs = new Map(), delivered = inst.jobs.map(() => 0), rally = new Set(), usedVeh = new Set(), gotQty = new Set();
   for (const r of (sol && sol.routes) || []) {
     if (!r || !r.visits || !r.visits.length) continue;
     const v = r.vehicle, veh = inst.vehicles[v];
@@ -35,15 +68,14 @@ function refEvaluate(inst, sol) {
     let t = Math.max(inst.startMin, veh.availableAt ?? inst.startMin) + (veh.preloaded ? 0 : pa.loadMin);
     let cur = veh.startNode ?? veh.hubNode, load = 0;
     const leg = (a, b) => {
-      if (!(inst.minutes[a][b] < Infinity) || !(inst.miles[a][b] < Infinity)) { nViol++; return 0; }
-      const pi = refPeriodIdx(inst.periods, t);
-      const p = pi < 0 ? { speed: 1, risk: 1 } : inst.periods[pi];
-      miles += inst.miles[a][b]; risk += inst.riskUnits[a][b] * p.risk;
-      return inst.minutes[a][b] / p.speed;
+      if (!(inst.minutes[a][b] < Infinity) || !(inst.miles[a][b] < Infinity)) { nViol++; return t; }
+      const tr = refTravel(inst.periods, t, inst.minutes[a][b]);
+      miles += inst.miles[a][b]; risk += inst.riskUnits[a][b] * tr.riskFactor;
+      return tr.arrive;
     };
     for (const vi of r.visits) {
       if (!vi || !Number.isInteger(vi.node) || vi.node < 0 || vi.node >= nN) { nViol++; continue; }
-      const arrive = t + leg(cur, vi.node);
+      const arrive = leg(cur, vi.node);
       stops++;
       if (inst.nodes[vi.node].kind === 'rally') rally.add(vi.node);
       for (const ch of vi.jobs || []) {
@@ -56,12 +88,16 @@ function refEvaluate(inst, sol) {
         const cand = banned ? null : (job.candidates || []).find((c) => c.node === vi.node);
         if (!cand) nViol++;
         else if (ch.qty > 0) { const key = job.requestId + '|' + vi.node; if (!pairs.has(key)) pairs.set(key, cand.platoonCost || 0); }
+        if (ch.qty > 0) gotQty.add(vi.node);
         load += ch.qty; delivered[ch.job] += ch.qty;
-        if (ch.qty > 0 && job.deadline != null) late += Math.max(0, arrive - job.deadline) * pen.latePerMin[job.tier] * ch.qty / job.qty;
+        if (ch.qty > 0 && job.deadline != null) {
+          const cap = pen.lateCapShare * pen.defer[job.tier] * pen.classFactor[job.classRank];
+          late += Math.min(Math.max(0, arrive - job.deadline) * pen.latePerMin[job.tier], cap) * ch.qty / job.qty;
+        }
       }
       t = arrive + pa.serviceMin; cur = vi.node;
     }
-    t += leg(cur, veh.hubNode);
+    t = leg(cur, veh.hubNode);
     if (load > veh.capacity * (1 + 1e-9)) nViol++;
   }
   let deferral = 0;
@@ -73,8 +109,14 @@ function refEvaluate(inst, sol) {
   if (pa.maxRallyPoints != null && rally.size > pa.maxRallyPoints) nViol++;
   let platoon = 0;
   for (const c of pairs.values()) platoon += c;
+  // pinned rally nodes some job could use (banned nodes are never candidates) that got no positive quantity
+  let pinned = 0;
+  for (const n of new Set(pa.pinnedRally || [])) {
+    if ((pa.bannedRally || []).includes(n) || !inst.nodes[n] || inst.nodes[n].kind !== 'rally') continue;
+    if (inst.jobs.some((job) => (job.candidates || []).some((c) => c.node === n)) && !gotQty.has(n)) pinned += pen.pinUnused;
+  }
   const cost = { fuel: w.fuel * miles / pa.mpg, distance: w.distance * 0.5 * miles, risk: w.risk * risk,
-    simplicity: w.simplicity * (5 * stops + 25 * trucks), platoon: w.distance * platoon, lateness: late, deferral };
+    simplicity: w.simplicity * (5 * stops + 25 * trucks), platoon: w.distance * platoon, lateness: late, deferral, pinned };
   return { total: Object.values(cost).reduce((a, b) => a + b, 0) + 1e7 * nViol, nViol, cost };
 }
 
@@ -186,11 +228,13 @@ test('review: partial split with the rest deferred: deferral share and per-chunk
   close(refEvaluate(inst, sol).total, ev.total);
 });
 
-test('review: period boundary is half-open and the whole leg uses the departure period (incl. return leg)', () => {
+// Updated 2026-10-06: legs are integrated across periods (FIFO). The first two cases below give the same
+// numbers as under the old departure-period rule; the third used to arrive at 680 - 1e-6 with risk 1.
+test('review: period boundary is half-open and a leg is integrated across it (FIFO, incl. return leg)', () => {
   const periods = [{ startMin: 0, endMin: 650, speed: 1, risk: 1 }, { startMin: 650, endMin: 2000, speed: 0.5, risk: 2 }];
   const sol = { routes: [{ vehicle: 2, visits: [visit(1, [1, 1000])] }] };
-  // t0 = 620 (period 0): 0->A 30 -> arrive exactly 650 (stop is in period 1); dep 665 (period 1):
-  // A->0 30 / 0.5 = 60 -> 725. risk 1 x 1 + 1 x 2 = 3.
+  // t0 = 620 (period 0): 0->A 30 base min fill period 0 exactly -> arrive 650 (stop is in period 1);
+  // dep 665 (period 1): A->0 30 / 0.5 = 60 -> 725. risk 1 x 1 + 1 x 2 = 3.
   let ev = S.evaluate(h2((i) => { i.periods = periods; }), sol);
   let r = ev.routes[0];
   assert.equal(r.legs[0].periodIdx, 0); close(r.stops[0].arrive, 650); assert.equal(r.stops[0].periodIdx, 1);
@@ -199,10 +243,20 @@ test('review: period boundary is half-open and the whole leg uses the departure 
   ev = S.evaluate(h2((i) => { i.periods = periods; i.startMin = 630; }), sol);
   r = ev.routes[0];
   assert.equal(r.legs[0].periodIdx, 1); close(r.stops[0].arrive, 710); close(r.riskUnits, 4);
-  // a hair before the boundary is still the old period for the whole leg, even though it ends in the new one
+  // a hair before the boundary: 1e-6 base min at speed 1, the other 30 - 1e-6 at 0.5 -> 710 - 2e-6;
+  // the leg risk is the time-weighted mean, a hair under 2
   ev = S.evaluate(h2((i) => { i.periods = periods; i.startMin = 630 - 1e-6; }), sol);
   r = ev.routes[0];
-  assert.equal(r.legs[0].periodIdx, 0); close(r.stops[0].arrive, 680 - 1e-6, '', 1e-12); close(r.legs[0].riskUnits, 1);
+  assert.equal(r.legs[0].periodIdx, 0, 'periodIdx is the departure period');
+  close(r.stops[0].arrive, 710 - 2e-6, '', 1e-12);
+  close(r.legs[0].riskFactor, (1e-6 * 1 + (60 - 2e-6) * 2) / (60 - 1e-6), '', 1e-12);
+  assert.ok(r.legs[0].riskFactor < 2);
+  // later departure never arrives earlier across the boundary
+  let prev = -Infinity;
+  for (let d = -3; d <= 3; d += 0.25) {
+    const a = S.evaluate(h2((i) => { i.periods = periods; i.startMin = 630 + d; }), sol).routes[0].stops[0].arrive;
+    assert.ok(a >= prev, 'FIFO at ' + d); prev = a;
+  }
 });
 
 test('review: Infinity legs (minutes or miles), return-leg only, and repeated visits at one node', () => {
@@ -486,8 +540,10 @@ test('review: a job three trucks large is split into capacity-sized chunks; with
   assert.deepEqual(codes(ev), []);
   assert.equal(ev.delivered[0], 5000);
   assert.deepEqual(plain(ev.deferred), [{ job: 0, qty: 2500 }]);
-  // deferral = 2500/7500 x 50000 x classFactor[rank]
-  close(ev.cost.deferral, 50000 / 3 * inst.penalties.classFactor[inst.jobs[0].classRank]);
+  // deferral = 2500/7500 x defer[Immediate] x classFactor[rank] (defer[3] is 250000 since the 2026-10-06
+  // defaults; it was 50000)
+  assert.equal(inst.penalties.defer[3], 250000);
+  close(ev.cost.deferral, inst.penalties.defer[3] / 3 * inst.penalties.classFactor[inst.jobs[0].classRank]);
 });
 
 // ---- moves -------------------------------------------------------------------------------------------

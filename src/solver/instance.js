@@ -8,8 +8,24 @@
 // typed arrays and caches them (WeakMap keyed by the instance object). The cache is rebuilt when the
 // instance's top-level arrays/objects are replaced, when params.pinnedRally / params.bannedRally or a
 // penalties array is replaced, or when a weight / key param (mpg, serviceMin, loadMin, maxRallyPoints)
-// changes; call SRO.solver.prepare.invalidate(instance) after any other in-place edit (a job, vehicle,
-// period or matrix cell). Hot paths call prepare() on every evaluate, so the check stays O(1).
+// or penalties.lateCapShare / penalties.pinUnused changes; call SRO.solver.prepare.invalidate(instance)
+// after any other in-place edit (a job, vehicle, period or matrix cell). Hot paths call prepare() on
+// every evaluate, so the check stays O(1).
+//
+// Penalties (DESIGN.md section 7, rules of 2026-10-06): each field missing from instance.penalties
+// falls back to DEFAULT_PENALTIES on its own (SRO.solver.resolvePenalties shows the merged values).
+// Prepared per job: jLateW = latePerMin[tier], jDeferW = defer[tier] x classFactor[classRank],
+// jLateCap = lateCapShare x jDeferW (lateness cap per job, scaled by the chunk share like lateness).
+// pinNodes = pinned rally nodes that are a candidate of at least one job (each costs pinUnused when it
+// receives no delivered quantity).
+//
+// Travel time (FIFO): SRO.solver.legArrive(P, depart, baseMinutes, out) integrates a leg across the
+// time-of-day periods: in each period the truck covers base minutes at period.speed per clock minute.
+// out[0] = time-weighted mean period.risk over the leg's clock minutes, out[1] = period at departure.
+// The period at a minute is periodIndex() (a gap in the table keeps the period before it; outside the
+// table the times wrap by whole days when the table spans >= 24 h, else the first / last period
+// extends). No periods: speed 1, risk 1. Later departures never arrive earlier, exactly (each step is
+// monotone in floating point and a finishing step is clamped to its segment end).
 (function (root) {
   'use strict';
   const SRO = root.SRO = root.SRO || {};
@@ -23,10 +39,16 @@
   S.TIER_NAMES = ['Routine', 'Priority', 'Urgent', 'Immediate'];
   S.GROUP_TYPE = { fuel: 'tanker', cargo: 'cargo' };          // load group -> vehicle type
   S.DEFAULT_WEIGHTS = { fuel: 3, distance: 3, risk: 5, simplicity: 2 };
+  // Re-sized on 2026-10-06 (DESIGN.md section 7, "Cost"): the Routine deferral (5000) is above the
+  // routing cost of the longest round trip on the island, so a job is only deferred for lack of room
+  // or time; lateness per chunk is capped at lateCapShare x its deferral cost, so a late delivery is
+  // always cheaper than deferring; an unused pinned rally point costs pinUnused.
   S.DEFAULT_PENALTIES = {
-    latePerMin: [1, 3, 50, 500],
-    defer: [200, 600, 5000, 50000],
-    classFactor: [1.0, 0.9, 0.85, 0.8, 0.6]
+    latePerMin: [2, 6, 60, 600],
+    defer: [5000, 15000, 60000, 250000],
+    classFactor: [1.0, 0.9, 0.85, 0.8, 0.6],
+    lateCapShare: 0.9,
+    pinUnused: 2000
   };
   S.DEFAULT_PERIOD_TABLE = [
     { name: 'Day', start: '0700', end: '1800', speed: 1.0, risk: 1.0 },
@@ -37,6 +59,28 @@
 
   function num(x, d) { return typeof x === 'number' && x === x ? x : d; }
   function isInt(x) { return typeof x === 'number' && (x | 0) === x; }
+
+  // One penalty field of instance.penalties, or its default when missing or malformed. An array is used
+  // only when validateInstance accepts it (one finite value >= 0 per tier / class), so a short or broken
+  // array never shifts the tier clamp (a 2-entry latePerMin would otherwise charge Immediate jobs the
+  // Priority deferral).
+  const PEN_LEN = { latePerMin: 4, defer: 4, classFactor: 5 };
+  function penNums(a, n) {
+    if (!isArray(a) || a.length < n) return false;
+    for (let i = 0; i < a.length; i++) { const x = a[i]; if (!(typeof x === 'number' && x >= 0 && x < INF)) return false; }
+    return true;
+  }
+  function penArray(pen, k) { const a = pen && pen[k]; return penNums(a, PEN_LEN[k]) ? a : S.DEFAULT_PENALTIES[k]; }
+  function penCapShare(pen) { const x = pen && pen.lateCapShare; return typeof x === 'number' && x >= 0 ? x : S.DEFAULT_PENALTIES.lateCapShare; }
+  function penPinUnused(pen) { const x = pen && pen.pinUnused; return typeof x === 'number' && x >= 0 && x < INF ? x : S.DEFAULT_PENALTIES.pinUnused; }
+  // The penalties evaluate() uses: instance.penalties with each missing field taken from the defaults.
+  S.resolvePenalties = function (instance) {
+    const pen = instance && instance.penalties;
+    return {
+      latePerMin: penArray(pen, 'latePerMin').slice(), defer: penArray(pen, 'defer').slice(),
+      classFactor: penArray(pen, 'classFactor').slice(), lateCapShare: penCapShare(pen), pinUnused: penPinUnused(pen)
+    };
+  };
 
   // ---- prepared (flattened, cached) view ----------------------------------------------------------
   const cache = typeof WeakMap === 'function' ? new WeakMap() : null;
@@ -54,6 +98,8 @@
     return out;
   }
 
+  function same(a, b) { return a === b || (a !== a && b !== b); }   // NaN equals NaN here
+
   function fresh(P, inst) {
     const w = inst.weights || S.DEFAULT_WEIGHTS, pa = inst.params || {}, pen = inst.penalties || {};
     return P.ref.nodes === inst.nodes && P.ref.vehicles === inst.vehicles && P.ref.jobs === inst.jobs &&
@@ -63,6 +109,7 @@
       // arrays replaced inside params / penalties (e.g. inst.params.bannedRally = [...]) also rebuild
       P.ref.banned === pa.bannedRally && P.ref.pinned === pa.pinnedRally &&
       P.ref.late === pen.latePerMin && P.ref.defer === pen.defer && P.ref.cf === pen.classFactor &&
+      same(P.capShareRaw, pen.lateCapShare) && same(P.pinUnusedRaw, pen.pinUnused) &&
       P.nN === (inst.nodes ? inst.nodes.length : 0) && P.nV === (inst.vehicles ? inst.vehicles.length : 0) &&
       P.nJ === (inst.jobs ? inst.jobs.length : 0) && P.nP === (inst.periods ? inst.periods.length : 0) &&
       P.wF === num(w.fuel, 0) && P.wD === num(w.distance, 0) && P.wR === num(w.risk, 0) && P.wS === num(w.simplicity, 0) &&
@@ -75,10 +122,9 @@
     const nN = nodes.length, nV = vehicles.length, nJ = jobs.length, nP = periods.length;
     const w = inst.weights || S.DEFAULT_WEIGHTS;
     const pa = inst.params || {};
-    const pen = inst.penalties || S.DEFAULT_PENALTIES;
-    const late = pen.latePerMin || S.DEFAULT_PENALTIES.latePerMin;
-    const defer = pen.defer || S.DEFAULT_PENALTIES.defer;
-    const cf = pen.classFactor || S.DEFAULT_PENALTIES.classFactor;
+    const pen = inst.penalties || {};
+    const late = penArray(pen, 'latePerMin'), defer = penArray(pen, 'defer'), cf = penArray(pen, 'classFactor');
+    const capShare = penCapShare(pen);
     const startMin = num(inst.startMin, 0);
     const P = {
       ref: { nodes: inst.nodes, vehicles: inst.vehicles, jobs: inst.jobs, minutes: inst.minutes, miles: inst.miles,
@@ -86,6 +132,7 @@
         banned: pa.bannedRally, pinned: pa.pinnedRally,
         late: inst.penalties ? inst.penalties.latePerMin : undefined, defer: inst.penalties ? inst.penalties.defer : undefined,
         cf: inst.penalties ? inst.penalties.classFactor : undefined },
+      capShareRaw: pen.lateCapShare, pinUnusedRaw: pen.pinUnused, lateCapShare: capShare, pinUnused: penPinUnused(pen),
       startMin: inst.startMin, nN: nN, nV: nV, nJ: nJ, nP: nP,
       wF: num(w.fuel, 0), wD: num(w.distance, 0), wR: num(w.risk, 0), wS: num(w.simplicity, 0),
       serviceMin: num(pa.serviceMin, 15), loadMin: num(pa.loadMin, 20), mpgRaw: pa.mpg, maxRallyRaw: pa.maxRallyPoints,
@@ -105,10 +152,32 @@
     for (let i = 0; i < nP; i++) {
       const p = periods[i] || {};
       P.pStart[i] = num(p.startMin, 0); P.pEnd[i] = num(p.endMin, P.pStart[i]);
-      const sp = num(p.speed, 1); P.pSpeed[i] = sp > 0 ? sp : 1;
-      P.pRisk[i] = num(p.risk, 1);
+      // speed and risk must be finite (validateInstance reports bad values) so the FIFO integration
+      // never multiplies Infinity by a zero-length segment
+      const sp = num(p.speed, 1); P.pSpeed[i] = sp > 0 && sp < INF ? sp : 1;
+      const rk = num(p.risk, 1); P.pRisk[i] = rk >= 0 && rk < INF ? rk : 1;
     }
     P.pFirst = nP ? P.pStart[0] : 0; P.pLastEnd = nP ? P.pEnd[nP - 1] : 0; P.pSpan = P.pLastEnd - P.pFirst;
+    // whole-day wrap (segmentAt): pWrapA = the period running at pLastEnd - 1440 (it opens each day after
+    // the table), pWrapB = the last period starting before pFirst + 1440 (it closes each day before it)
+    P.pWrapA = 0; P.pWrapB = 0;
+    for (let i = 0; i < nP; i++) {
+      if (P.pStart[i] <= P.pLastEnd - 1440) P.pWrapA = i;
+      if (P.pStart[i] < P.pFirst + 1440) P.pWrapB = i;
+    }
+    // legArrive lookups inside the table: segment i (constant speed) runs to pBrk[i] (the next period
+    // start, so a gap keeps the period before it); pStartX = starts + an Infinity sentinel; pBucket[b]
+    // = a period index at or before every minute of bucket b (buckets of >= 15 min, at most ~20000)
+    P.pBrk = new F64(nP); P.pStartX = new F64(nP + 1); P.pStartX[nP] = INF;
+    for (let i = 0; i < nP; i++) { P.pStartX[i] = P.pStart[i]; P.pBrk[i] = i + 1 < nP ? P.pStart[i + 1] : P.pLastEnd; }
+    const bSize = mmax(15, P.pSpan / 20000), nB = P.pSpan > 0 ? mceil(P.pSpan / bSize) + 2 : 1;
+    P.pBucketInv = 1 / bSize; P.pBucket = new I32(nB);
+    for (let b = 0, i = 0; b < nB; b++) {
+      const tb = P.pFirst + b * bSize - 1e-6 * bSize;   // a hair early: rounding in the lookup never skips a period
+      while (i + 1 < nP && P.pStart[i + 1] <= tb) i++;
+      P.pBucket[b] = i;
+    }
+    P.legOut = new F64(2);                          // scratch for legArrive (risk factor, departure period)
     // vehicles
     P.vFuel = new U8(nV); P.vCap = new F64(nV); P.vHub = new I32(nV); P.vStart = new I32(nV);
     P.vT0 = new F64(nV); P.vLoadStart = new F64(nV);
@@ -128,7 +197,7 @@
     // jobs
     P.jFuel = new U8(nJ); P.jQty = new F64(nJ); P.jInvQty = new F64(nJ); P.jEps = new F64(nJ);
     P.jTier = new I32(nJ); P.jClass = new I32(nJ); P.jDeadline = new F64(nJ); P.jHard = new U8(nJ);
-    P.jLateW = new F64(nJ); P.jDeferW = new F64(nJ); P.jReq = new I32(nJ); P.jLockV = new I32(nJ);
+    P.jLateW = new F64(nJ); P.jDeferW = new F64(nJ); P.jLateCap = new F64(nJ); P.jReq = new I32(nJ); P.jLockV = new I32(nJ);
     P.cand = new I32(nJ * nN).fill(-1); P.candCost = new F64(nJ * nN);
     P.jCandNodes = new Array(nJ);
     const reqIndex = Object.create(null); let nReq = 0;
@@ -146,6 +215,8 @@
       P.jHard[j] = jb.hardDeadline || jb.tier === 3 ? 1 : 0;
       P.jLateW[j] = num(late[tier], 0);
       P.jDeferW[j] = num(defer[tier], 0) * num(cf[cr], 1);
+      // lateness cap: lateCapShare x the job's deferral cost (Infinity share = no cap)
+      P.jLateCap[j] = capShare === INF ? INF : capShare * P.jDeferW[j];
       const rk = jb.requestId != null ? String(jb.requestId) : '\u0000job' + j;
       if (!(rk in reqIndex)) reqIndex[rk] = nReq++;
       P.jReq[j] = reqIndex[rk];
@@ -165,11 +236,21 @@
       P.jCandNodes[j] = I32.from(list);
     }
     P.nReq = nReq;
+    // pinned rally nodes some job could use (banned nodes are never candidates, so a node both pinned
+    // and banned never counts; a pinned node that is not a rally node is an instance error that
+    // validateInstance reports, and it costs nothing here)
+    const pins = [];
+    for (let n = 0; n < nN; n++) {
+      if (!P.pinned[n] || !P.isRally[n]) continue;
+      for (let j = 0; j < nJ; j++) if (P.cand[j * nN + n] >= 0) { pins.push(n); break; }
+    }
+    P.pinNodes = I32.from(pins);
     // scratch for evaluate (epoch-stamped so nothing is cleared per call)
     P.epoch = 0;
     P.delivered = new F64(nJ);
     P.vehStamp = new I32(nV);
     P.rallyStamp = new I32(nN);
+    P.nodeStamp = new I32(nN);                      // node received a positive quantity this call
     P.pairStamp = new I32(mmax(1, nReq * nN));
     return P;
   }
@@ -192,23 +273,155 @@
 
   // Index into instance.periods for minute t (the period containing t; the table repeats daily when it
   // covers at least 24 h, so times past either end wrap by whole days). -1 when there are no periods.
+  // Outside the table this is segmentAt's index, so periodIndex and the FIFO integration always agree.
   S.periodIndex = function (P, t) {
     const n = P.nP;
     if (n === 0) return -1;
     const st = P.pStart;
     if (!(t >= st[0] && t < P.pLastEnd)) {
       if (t !== t || t === INF || t === -INF) return t === -INF ? 0 : n - 1;
-      if (P.pSpan >= 1440) {
-        if (t >= P.pLastEnd) t -= 1440 * mceil((t - P.pLastEnd + 1e-9) / 1440);
-        else t += 1440 * mceil((st[0] - t) / 1440);
-      }
-      if (t < st[0]) return 0;
+      return segmentAt(P, t);
     }
     let lo = 0, hi = n - 1;
     while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (st[mid] <= t) lo = mid; else hi = mid - 1; }
     return lo;
   };
   S.periodAt = function (instance, t) { return S.periodIndex(S.prepare(instance), t); };
+
+  // The constant-speed segment of the period timeline that contains minute t (finite, nP > 0): returns
+  // its period index and leaves in segEnd the first minute after t at which that index can change (the
+  // next period start, the table end, a whole-day wrap point, or Infinity), so the index is constant on
+  // [t, segEnd) and segEnd > t.
+  //   Inside the table: the last period starting at or before t (a gap keeps the period before it).
+  //   Table shorter than a day: the first period runs before it and the last one after it.
+  //   Table of 24 h or more: after it, day m >= 1 = [last + 1440 (m - 1), last + 1440 m) repeats the
+  //   table's last 24 h (period k starts at st[k] + 1440 m; the period running at last - 1440, pWrapA,
+  //   opens the day); before it, day m >= 1 = [first - 1440 m, first - 1440 (m - 1)) repeats its first
+  //   24 h (period k <= pWrapB starts at st[k] - 1440 m).
+  // Every boundary is computed with one fixed formula and t is compared with those same numbers (never
+  // with a shifted copy of t, which rounds differently when period starts are fractional), so the speed
+  // at a minute is single-valued and no segment comes out empty.
+  let segEnd = 0;
+  function lastStartAtOrBefore(st, lo, hi, t, sh) {   // largest k in [lo, hi] with st[k] + sh <= t, else lo
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (st[mid] + sh <= t) lo = mid; else hi = mid - 1; }
+    return lo;
+  }
+  function segmentAt(P, t) {
+    const n = P.nP, st = P.pStart, first = st[0], last = P.pLastEnd;
+    if (t >= first && t < last) {
+      const k = lastStartAtOrBefore(st, 0, n - 1, t, 0);
+      segEnd = k + 1 < n ? st[k + 1] : last;
+      return k;
+    }
+    if (!(P.pSpan >= 1440)) {
+      // (a one-period table still breaks at its end, like a departure inside it does: every departure
+      // must step through the same breakpoints, or two paths round differently and FIFO slips by an ulp)
+      if (t < first) { segEnd = n > 1 ? st[1] : (last > t ? last : INF); return 0; }
+      segEnd = INF; return n - 1;
+    }
+    if (t >= last) {
+      let m = mfloor((t - last) / 1440) + 1;
+      if (m > 1 && t < last + 1440 * (m - 1)) m--;
+      else if (t >= last + 1440 * m) m++;
+      const sh = 1440 * m, k0 = P.pWrapA;
+      const k = k0 + 1 < n && st[k0 + 1] + sh <= t ? lastStartAtOrBefore(st, k0 + 1, n - 1, t, sh) : k0;
+      segEnd = k + 1 < n ? st[k + 1] + sh : last + sh;
+      return k;
+    }
+    let m = mceil((first - t) / 1440);
+    if (t < first - 1440 * m) m++;
+    else if (m > 1 && t >= first - 1440 * (m - 1)) m--;
+    const sh = -1440 * m, kB = P.pWrapB;
+    const k = lastStartAtOrBefore(st, 0, kB, t, sh);
+    segEnd = k < kB ? st[k + 1] + sh : first - 1440 * (m - 1);
+    return k;
+  }
+
+  // Stepping integration from minute cur with rem base minutes left (rint = risk-minutes so far), one
+  // constant-speed segment at a time via segmentAt. Used outside the period table and past its end.
+  function legGeneral(P, t, cur, rem, rint, out, setIdx) {
+    const sp = P.pSpeed, rk = P.pRisk;
+    let i = segmentAt(P, cur), end = segEnd;
+    if (setIdx) out[1] = i;
+    for (let it = 0; ; it++) {
+      const s = sp[i];
+      const room = (end - cur) * s;                 // base minutes this segment can cover (Infinity ok)
+      if (room >= rem || !(end > cur) || it > 100000) {   // (the last two only as a safety net)
+        let a = cur + rem / s;
+        if (a > end && room >= rem) a = end;        // rounding: never past the segment end (keeps FIFO)
+        if (cur === t) { out[0] = rk[i]; return a; }
+        rint += (a - cur) * rk[i];
+        out[0] = a > t ? rint / (a - t) : rk[i];
+        return a;
+      }
+      rint += (end - cur) * rk[i];
+      rem -= room;
+      cur = end;
+      i = segmentAt(P, cur); end = segEnd;
+    }
+  }
+  // Inside the table, a leg whose first segment cannot cover it: step through the following periods
+  // in order (segment i ends at pBrk[i]); past the table end, continue with legGeneral.
+  function legSteps(P, t, base, out, i) {
+    const n = P.nP, brk = P.pBrk, sp = P.pSpeed, rk = P.pRisk;
+    out[1] = i;
+    let cur = t, rem = base, rint = 0;
+    for (; i < n; i++) {
+      const end = brk[i], s = sp[i];
+      if (!(end > cur)) continue;                   // zero-length period (or an out-of-order table)
+      const room = (end - cur) * s;
+      if (room >= rem) {
+        let a = cur + rem / s;
+        if (a > end) a = end;
+        rint += (a - cur) * rk[i];
+        out[0] = a > t ? rint / (a - t) : rk[i];
+        return a;
+      }
+      rint += (end - cur) * rk[i];
+      rem -= room;
+      cur = end;
+    }
+    return legGeneral(P, t, cur, rem, rint, out, false);
+  }
+
+  // FIFO leg timing (see the header). P = prepare(instance); t = departure minute; base = minutes[i][j]
+  // (finite, >= 0). Returns the arrival minute; out[0] = time-weighted mean period risk over the leg
+  // (the departure period's risk for a zero-length leg), out[1] = period index at departure (-1 with no
+  // periods). A leg inside one period gives exactly t + base / speed and that period's risk.
+  // Hot path (evaluate): a departure inside the table finds its period with a bucket lookup plus a
+  // short forward scan, and most legs end in that period.
+  S.legArrive = function (P, t, base, out) {
+    if (t >= P.pFirst && t < P.pLastEnd && base >= 0 && base < INF) {
+      const stx = P.pStartX;
+      let i = P.pBucket[((t - P.pFirst) * P.pBucketInv) | 0];
+      while (stx[i + 1] <= t) i++;
+      const end = P.pBrk[i], s = P.pSpeed[i];
+      if ((end - t) * s >= base) {
+        let a = t + base / s;
+        if (a > end) a = end;
+        out[0] = P.pRisk[i]; out[1] = i;
+        return a;
+      }
+      return legSteps(P, t, base, out, i);
+    }
+    const n = P.nP;
+    if (n === 0) { out[0] = 1; out[1] = -1; return t + base; }
+    if (!(t > -INF && t < INF) || !(base >= 0 && base < INF)) {
+      const pi = S.periodIndex(P, t);
+      out[0] = P.pRisk[pi]; out[1] = pi; return t + base / P.pSpeed[pi];
+    }
+    return legGeneral(P, t, t, base, 0, out, true);
+  };
+  // Public, allocation-friendly form for planners/UI: timing of leg i -> j leaving at minute t.
+  // Returns { depart, arrive, minutes, riskFactor, riskUnits, miles, periodIdx } (arrive Infinity when
+  // the leg is unreachable: minutes, miles or risk units Infinity).
+  S.legTiming = function (instance, t, i, j) {
+    const P = S.prepare(instance), k = i * P.nN + j, base = P.minutes[k];
+    if (!(base < INF) || !(P.miles[k] < INF) || !(P.risk[k] < INF)) return { depart: t, arrive: INF, minutes: INF, riskFactor: 0, riskUnits: 0, miles: INF, periodIdx: P.nP ? S.periodIndex(P, t) : -1 };
+    const out = new F64(2);
+    const a = S.legArrive(P, t, base, out);
+    return { depart: t, arrive: a, minutes: a - t, riskFactor: out[0], riskUnits: P.risk[k] * out[0], miles: P.miles[k], periodIdx: out[1] };
+  };
 
   // ---- small public helpers -----------------------------------------------------------------------
   S.typeCompatible = function (vehicle, job) {
@@ -382,8 +595,8 @@
     else periods.forEach(function (p, i) {
       if (!p || typeof p.startMin !== 'number' || typeof p.endMin !== 'number' || !(p.endMin > p.startMin)) out.push('Period ' + i + ' needs startMin < endMin.');
       else if (i > 0 && periods[i - 1] && p.startMin < periods[i - 1].endMin) out.push('Period ' + i + ' overlaps or is out of order with period ' + (i - 1) + '.');
-      if (p && !(p.speed > 0)) out.push('Period ' + i + ' speed factor must be greater than 0.');
-      if (p && !(p.risk >= 0)) out.push('Period ' + i + ' risk factor must be 0 or more.');
+      if (p && !(p.speed > 0 && p.speed < INF)) out.push('Period ' + i + ' speed factor must be a number greater than 0.');
+      if (p && !(p.risk >= 0 && p.risk < INF)) out.push('Period ' + i + ' risk factor must be a number 0 or more.');
     });
     const ids = Object.create(null);
     vehicles.forEach(function (v, i) {
@@ -397,8 +610,9 @@
     });
     const params = inst.params || {};
     const banned = new Set(params.bannedRally || []), pinned = params.pinnedRally || [];
-    const late = (inst.penalties && inst.penalties.latePerMin) || S.DEFAULT_PENALTIES.latePerMin;
-    const cf = (inst.penalties && inst.penalties.classFactor) || S.DEFAULT_PENALTIES.classFactor;
+    // tier / class ranges from the arrays evaluate uses (a malformed array is reported below and replaced
+    // by its default, so it does not also produce a bogus range message per job)
+    const late = penArray(inst.penalties, 'latePerMin'), cf = penArray(inst.penalties, 'classFactor');
     const jobIds = Object.create(null);
     jobs.forEach(function (jb, i) {
       if (!jb) { out.push('Job ' + i + ' is missing.'); return; }
@@ -434,11 +648,15 @@
       if (banned.has(n)) out.push('Rally node ' + n + ' is both pinned and banned.');
     });
     if (params.maxRallyPoints != null && pinned.length > params.maxRallyPoints) out.push('More rally points are pinned (' + pinned.length + ') than the limit (' + params.maxRallyPoints + ').');
+    // every penalties field is optional (a missing one takes its default); a present one must be sound
     const pen = inst.penalties;
     if (pen) {
-      if (!isArray(pen.latePerMin) || pen.latePerMin.length < 4) out.push('penalties.latePerMin needs 4 values (one per tier).');
-      if (!isArray(pen.defer) || pen.defer.length < 4) out.push('penalties.defer needs 4 values (one per tier).');
-      if (!isArray(pen.classFactor) || pen.classFactor.length < 5) out.push('penalties.classFactor needs 5 values (one per class).');
+      const nums = penNums;                         // the same test penArray uses
+      if (pen.latePerMin != null && !nums(pen.latePerMin, 4)) out.push('penalties.latePerMin needs 4 values 0 or more (one per tier).');
+      if (pen.defer != null && !nums(pen.defer, 4)) out.push('penalties.defer needs 4 values 0 or more (one per tier).');
+      if (pen.classFactor != null && !nums(pen.classFactor, 5)) out.push('penalties.classFactor needs 5 values 0 or more (one per class).');
+      if (pen.lateCapShare != null && !(typeof pen.lateCapShare === 'number' && pen.lateCapShare >= 0)) out.push('penalties.lateCapShare must be a number 0 or more.');
+      if (pen.pinUnused != null && !(typeof pen.pinUnused === 'number' && pen.pinUnused >= 0 && pen.pinUnused < INF)) out.push('penalties.pinUnused must be a number 0 or more.');
     }
     return out;
   };
