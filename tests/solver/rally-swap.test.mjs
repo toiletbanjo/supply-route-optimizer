@@ -204,4 +204,12 @@ test('SA: a rally burst after each cooling cycle while the plan is at the limit,
   const free = S.makeTestInstance(2, Object.assign({}, P1, { pinned: 2, maxRallyPoints: 10 }));
   const r = S.methods.sa.run(free, S.clampParams('sa', Object.assign({ seed: 2 }, sa)), {});
   assert.equal(r.extra.rallyTrials, 0);
+  // at the limit but not held back by it (no unused pin, no deferred job wanting another rally
+  // point): no burst. Before the fix the 20-request demo spent 18 shakes (gain 0) and ~10-25% more time.
+  const real = S.rallyState;
+  S.rallyState = (i, sol) => Object.assign(real(i, sol), { atCap: true, bound: false });
+  try {
+    const r2 = S.methods.sa.run(inst, S.clampParams('sa', Object.assign({ seed: 2 }, sa)), {});
+    assert.equal(r2.extra.rallyTrials, 0);
+  } finally { S.rallyState = real; }
 });

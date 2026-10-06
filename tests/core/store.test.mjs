@@ -450,6 +450,19 @@ test('plan/approve refuses a plan that breaks planning rules while a draft for t
   assert.equal(st.dispatch({ type: 'plan/approve', planId: 'P-0004' }).warning, undefined);
 });
 
+test('plan/approve offers only drafts built on the same approved plans as alternatives', () => {
+  // Before the fix a draft made before an approval (builtOn []) was offered against a later plan
+  // (builtOn ['P-0002']); approving it would drop the newer requests.
+  const stats = (violations) => ({ ...samplePlan().stats, violations, feasible: !violations });
+  const st = storeWithThreeRequests();
+  st.dispatch({ type: 'plan/store', plan: samplePlan({ id: 'P-0001', windowId: 'W-D1-1200', stats: stats(0), builtOn: [] }) });
+  st.dispatch({ type: 'plan/store', plan: samplePlan({ id: 'P-0003', windowId: 'W-D1-1200', stats: stats(0), builtOn: ['P-0002'] }) });
+  st.dispatch({ type: 'plan/store', plan: samplePlan({ id: 'P-0005', windowId: 'W-D1-1200', stats: stats(1), builtOn: ['P-0002'] }) });
+  const res = st.dispatch({ type: 'plan/approve', planId: 'P-0005' });
+  assert.equal(res.ok, false);
+  assert.deepEqual(Array.from(res.alternativeIds), ['P-0003']);
+});
+
 test('plan/rename and snapshot/save', () => {
   const st = storeWithThreeRequests();
   assert.equal(st.dispatch({ type: 'snapshot/save', name: 'none yet' }).ok, false);

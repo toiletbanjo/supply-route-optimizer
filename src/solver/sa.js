@@ -39,7 +39,7 @@
 // walk instead (see autoTemp). Geometric cooling: after every params.itersPerTemp proposals
 // T *= params.coolingRate. A cooling cycle ends when T has fallen to
 // params.stopTempRatio x T0; its final plan gets a short localSearch (CFG.cyclePolish), and while the
-// best plan uses maxRallyPoints rally points it gets CFG.rallyTrials rally-point shakes (see
+// best plan is held back by maxRallyPoints (rallyState bound) it gets CFG.rallyTrials rally-point shakes (see
 // rallyBurst: the walk's moves never trade a whole rally point). Then, up to
 // params.reheats times, T is raised to CFG.reheatFrac x T0 (at least sqrt(stopTempRatio) x T0, so above
 // the stop temperature) and the walk restarts from the best plan so far, polished first with a short
@@ -106,7 +106,7 @@
     polishShare: 0.05,        // share of the time cap held back for the final polish ...
     polishReserveMaxMs: 2000, // ... but at most this many ms
     maxNullRun: 2000,         // this many proposals in a row without an applicable move: converged
-    rallyTrials: 6,           // rally-point shakes of the best plan at each cycle end while it uses maxRallyPoints ...
+    rallyTrials: 6,           // rally-point shakes of the best plan at each cycle end while maxRallyPoints binds ...
     rallyPolishEvals: 20000   // ... each polished with at most this many evaluations
   };
 
@@ -395,7 +395,7 @@
       phase = 'rally';
       for (let b = 0; ; b++) {
         const rs = S.rallyState(instance, best);
-        if (!rs.atCap || b >= CFG.rallyTrials || timeUp(searchEndAt)) break;
+        if (!rs.bound || b >= CFG.rallyTrials || timeUp(searchEndAt)) break;
         let rr = rs.bound && b % 2 === 0 ? S.rallySwap(instance, best, { rng: rng }) : null;
         if (!rr && b % 2 === 1) rr = rallyKick(best);
         if (!rr) rr = S.ruinRally(instance, best, rng, rs.used[rallyTrialsDone % rs.used.length]);
