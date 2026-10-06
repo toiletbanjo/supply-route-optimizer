@@ -444,13 +444,16 @@
       }
       return tiles.layer;
     }
-    function startTiles() {
+    function startTiles(auto) {
       if (destroyed) return;
       if (!tiles.wanted) { tiles.state = 'off'; tiles.reason = 'disabled'; syncBase(); return; }
       if (root.navigator && root.navigator.onLine === false) { fallback('offline'); return; }
       // A page opened from a file sends no Referer, and OSM answers every tile with a 403
       // "tile usage policy" image (DESIGN section 6), so skip tiles there.
       if (root.location && root.location.protocol === 'file:' && !MAP.FILE_TILES) { fallback('file'); return; }
+      // Inside a preview frame the tile requests often carry no Referer either, and the 403 policy
+      // image loads like a normal tile, so start on the outline map there; the Tiles button retries.
+      if (auto && !MAP.FILE_TILES && framed()) { fallback('framed'); return; }
       tiles.state = 'loading'; tiles.reason = null; tiles.loads = 0; tiles.errors = 0;
       const layer = tilesLayer();
       if (!map.hasLayer(layer)) map.addLayer(layer);
@@ -471,6 +474,7 @@
         }).catch(function () { /* unreadable (CORS) or network: inconclusive, tile events decide */ });
       } catch (e) { /* inconclusive */ }
     }
+    function framed() { try { return root.top !== root; } catch (e) { return true; } }
     function fallback(reason) {
       if (destroyed) return;
       clearTimeout(tiles.timer);
@@ -1511,7 +1515,7 @@
         el.removeAttribute('data-sro-theme');
       }
     };
-    startTiles();
+    startTiles(true);
     syncBase();
     return api;
   };
