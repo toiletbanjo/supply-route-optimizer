@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1418">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="Supply Route Optimizer prototype (MA481X). Platoon sergeants request supplies; a planner optimizes truck routes across Taiwan. All data is notional.">
+<meta name="format-detection" content="telephone=no">
+<title>Supply Route Optimizer</title>
+<script>
+/* Apply the saved theme before the first paint (boot.js keeps it in sync afterwards). */
+(function () {
+  try {
+    var s = JSON.parse(window.localStorage.getItem('sro.v1') || 'null');
+    var t = s && s.ui && s.ui.theme;
+    if (t === 'dark' || t === 'light' || t === 'night') {
+      document.documentElement.setAttribute('data-theme', t);
+      var m = document.querySelector('meta[name="theme-color"]');
+      if (m) m.setAttribute('content', { dark: '#0f1418', light: '#f4f5f2', night: '#000000' }[t]);
+    }
+    var r = s && s.ui && s.ui.role;
+    if (r === 'psg' || r === 'planner') document.documentElement.setAttribute('data-role', r);
+  } catch (e) { /* storage blocked: keep the dark default */ }
+})();
+</script>
+<!--INLINE:lib-css-->
+<!--INLINE:app-css-->
+</head>
+<body>
+<header id="topbar" class="topbar">
+  <div class="tb-brand"><span class="tb-mark" aria-hidden="true"></span><span class="tb-name">Supply Route Optimizer</span></div>
+</header>
+<main id="app" class="app">
+  <section id="psg-root" class="psg-root" aria-label="Platoon sergeant view"></section>
+  <section id="planner-root" class="planner-root" aria-label="Planner view" hidden></section>
+</main>
+<div id="toast-root" class="toast-root" aria-live="polite" aria-relevant="additions"></div>
+<div id="modal-root" class="modal-root"></div>
+<div id="print-root" class="print-root"></div>
+<noscript>
+  <div class="noscript">
+    <strong>Supply Route Optimizer needs JavaScript.</strong>
+    Turn JavaScript on, or open this file in a current version of Chrome, Edge, Firefox or Safari.
+    Everything runs inside this one file; nothing is sent anywhere.
+  </div>
+</noscript>
+<!--INLINE:worker-->
+<!--INLINE:highs-->
+<!--INLINE:lib-js-->
+<!--INLINE:main-->
+</body>
+</html>

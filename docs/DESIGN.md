@@ -353,6 +353,17 @@ All methods start from `construct.js` output. Each reports progress at least eve
 - Reference code from the verification run: `scratchpad/verify-solver/{vrp-model.js, solve-core.js, minimal-template.html, heuristic-sa.js}` (copied to `tools/reference/highs/`).
 
 
+### Method interface (tabu.js, sa.js, aco.js, mip.js)
+
+Each method registers `SRO.solver.methods[key] = { key, label, run(instance, params, hooks) }`.
+
+- `params` is `SRO.solver.clampParams(key, params, settings)` output (all knobs present).
+- `hooks = { onProgress(p), now() -> ms, shouldStop() -> bool, start?: solution }`. `onProgress` is called at least every 250 ms and whenever the best plan improves, with `{ fraction 0..1, bestCost, currentCost?, elapsedSec, iteration, message, best?: solution }`; `best` is included only when it changed since the last call (the worker forwards it so Cancel can keep it). `start` is an optional starting plan (MIP passes the heuristic plan; contingency re-plans pass the adjusted old plan).
+- `run` is synchronous (it blocks the worker; cancel = `worker.terminate()`), deterministic for a given `params.seed`, starts from `hooks.start` or `construct()`, scores only with `evaluate`, stops at its iteration budget, `params.timeCapSec`, or `shouldStop()`, and returns `{ solution, total, feasible, evals, iterations, elapsedSec, stopReason: 'budget' | 'time' | 'stopped' | 'converged' | 'optimal', history: [{ t, best }], extra? }` (MIP puts `{ status, mipGap, dualBound, modelObjective }` in `extra`).
+- `api.js`: `SRO.solver.solve(instance, { method, params, settings, hooks }) -> result` (normalizes params, runs, re-evaluates the final plan, attaches `evaluation`); `SRO.solver.compare(instance, methods[], opts)` runs them in sequence on the same instance.
+- `worker-main.js` message protocol. Page to worker: `{ type: 'init', wasmGzB64 }`, `{ type: 'solve', id, instance, method, params, settings }`, `{ type: 'estimate', id, instance, method, params, settings }`. Worker to page: `{ type: 'ready', highs: bool }`, `{ type: 'progress', id, ...p }`, `{ type: 'done', id, result }`, `{ type: 'error', id, message }`. Instances cross the boundary as JSON with Infinity encoded by `SRO.util.jsonReplacer` / `jsonReviver`.
+- MIP needs HiGHS: `SRO.solver.mip.setLoader(fn)` where `fn()` returns a promise for the highs module (Node tests: `require('highs')()`; worker: the `instantiateWasm` loader). `run` must be called after the loader resolved (`SRO.solver.mip.ready()`), so the worker awaits it before solving.
+
 ### Method parameters (planner-tunable, Advanced tab)
 
 `src/solver/params.js` is the single source of truth: `SRO.solver.PARAMS[method] = [{ key, label, help, type: 'int'|'float'|'bool'|'select', min, max, step, default, options? }]` plus `SRO.solver.defaultParams(method)` and `SRO.solver.clampParams(method, params)`. The UI builds the tuning form from this table, so a new knob needs one entry here and nothing else in the UI.
@@ -396,6 +407,20 @@ Rules: heuristics stop at whichever comes first of their own iteration budget, `
 - Truck colors: 8 distinct colors, readable on dark, light and night themes; fixed per truck everywhere.
 - Formats: `format.js` is the only place that formats times, DTGs, MGRS, classes and miles.
 - Nothing in the app mentions medevac.
+
+## 8b. Planner engine (src/core/planner-engine.js) - contract for views
+
+`SRO.core.engine` connects the store, the road network and the solver worker. Views never build instances or talk to the worker themselves.
+
+- `engine.init(store)` (boot calls it). Creates the solver worker lazily from `#highs-js`, `#worker-src`, `#highs-wasm-gz` (falls back to running heuristics on the main thread if a Blob worker cannot start; MIP is then unavailable).
+- `engine.status() -> { phase: 'idle' | 'preparing' | 'estimating' | 'running' | 'done' | 'error' | 'cancelled', method, methods (compare), fraction, bestCost, elapsedSec, message, history: [{ t, best }], error, highsReady }` and `engine.subscribe(fn) -> unsubscribe`. Solver progress is NOT dispatched to the store (that would write localStorage every 250 ms); only the finished Plan is.
+- `engine.buildInstance(state, { windowId, now, contingency }) -> { instance, maps, warnings }`: nodes = hubs + rally candidates (not banned) + direct nodes (one per request location that may take direct delivery); travel minutes/miles from `SRO.core.network` (OSM road matrix via `SRO.core.roads.matrix`, closed zones applied), x `settings.convoyFactor`; risk units = miles of the arc's road path inside risk circles x rating; periods expanded from `settings.periods` for 72 h from now; jobs from `catalogHelpers.requestLoads(lines)` per load group (fuel / cargo), tier from final urgency, classRank from the request's top class, deadline, `hardDeadline`; candidates = direct node (always for fixed or `forceDirect` or `directOnly`) plus rally nodes within the mobility radius (road miles from the platoon), `platoonCost = platoon miles x 2 (out and back) x mobility costPerMi`, desired pickup as `hint`; vehicles from `scenario.fleet` with `status !== 'out'`, `availableAt`, colors; weights, params, penalties from settings and solver defaults.
+- `engine.estimate(method, params?) -> Promise<{ seconds, low, high, basis }>` for the current window.
+- `engine.run({ method, params?, windowId? }) -> Promise<Plan>`; `engine.compare(methods[]) -> Promise<Plan[]>` (one Plan per method, same instance, all stored; the compare table uses `plan.cost` and `plan.stats`); `engine.cancel()` (terminates the worker, stores the best plan so far with `cancelled: true`, restarts the worker).
+- `engine.replan({ reason })` contingency: from the approved plan at the current simMin, delivered stops stay done, en-route trucks get `startNode` = next stop, `preloaded: true`, their remaining jobs locked to them; jobs on trucks marked out or cut off go back to the pool; runs the selected method; stores a Plan with `parentPlanId`; requests whose ETA or pickup changed get `updated: true` on approval.
+- Auto planning: when the store sets `ui.planRequested` with reason `'boundary'` (window boundary at 0000/0600/1200/1800) and there are pending requests, the engine runs `settings.method` and stores the plan unapproved; the planner reviews and approves. The trigger rule is one function `engine.shouldPlan(state)` so a future "dispatch when worth it" queue rule can replace it.
+- Plan decoding: solver solution + evaluation -> the Plan schema in section 3, plus per leg `path` = encoded polyline of the road route (`SRO.core.geo.encodePolyline`, precision 5) for drawing and animation, and per stop `etaText`; per request a `plan.byRequest[requestId] = { truckId, stopSeq, nodeKind, gridId, lat, lon, label, eta, qtyByLine, deferredQty, stopsBefore }` index the platoon sergeant views read.
+- Truck colors come from `SRO.data.scenario.truckColors` only.
 
 ## 9. Build and tests
 

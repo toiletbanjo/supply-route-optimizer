@@ -70,7 +70,16 @@
     var CELL = 0.02, grid = new Map();
     function ck(x, y) { return x * 100000 + y; }
     for (i = 0; i < N; i++) { var k = ck(Math.floor(nodes[i][1] / CELL), Math.floor(nodes[i][0] / CELL)); var b = grid.get(k); if (!b) grid.set(k, b = []); b.push(i); }
-    function nearest(p) {
+    var nearCache = new Map();
+    function nearest(p) {                 // memoized: the matrix asks for the same points thousands of times
+      var nk = p[0] + ',' + p[1], hit = nearCache.get(nk);
+      if (hit) return hit;
+      var res = nearestScan(p);
+      if (nearCache.size > 5000) nearCache.clear();
+      nearCache.set(nk, res);
+      return res;
+    }
+    function nearestScan(p) {
       var cx = Math.floor(p[1] / CELL), cy = Math.floor(p[0] / CELL), best = -1, bd = Infinity;
       for (var ring = 0; ring < 60; ring++) {
         for (var dx = -ring; dx <= ring; dx++) for (var dy = -ring; dy <= ring; dy++) {
@@ -114,19 +123,28 @@
       return w;
     }
     function dijkstra(src, target, w) {
-      var dist = new Float64Array(N).fill(Infinity), prevArc = new Int32Array(N).fill(-1), done = new Uint8Array(N), h = new Heap();
+      var dist = new Float64Array(N).fill(Infinity), len = new Float64Array(N), prevArc = new Int32Array(N).fill(-1), done = new Uint8Array(N), h = new Heap();
       dist[src] = 0; h.push(0, src);
       while (h.k.length) {
         var u = h.pop(); if (done[u]) continue; done[u] = 1; if (u === target) break;
         for (var s = off[u]; s < off[u + 1]; s++) {
           var we = w[arcEdge[s]]; if (we === Infinity) continue;
-          var v = arcTo[s], nd = dist[u] + we; if (nd < dist[v]) { dist[v] = nd; prevArc[v] = s; h.push(nd, v); }
+          var v = arcTo[s], nd = dist[u] + we; if (nd < dist[v]) { dist[v] = nd; len[v] = len[u] + elen[arcEdge[s]]; prevArc[v] = s; h.push(nd, v); }
         }
       }
-      return { dist: dist, prevArc: prevArc };
+      return { dist: dist, len: len, prevArc: prevArc };
     }
+    // Numbers come straight from the Dijkstra arrays; coords and edges are only built
+    // when read (the travel-time matrix needs numbers for every pair, paths for few).
     function walk(res, src, dst) {
       if (res.dist[dst] === Infinity) return null;
+      var full = null;
+      var r = { meters: res.len[dst], seconds: res.dist[dst] };
+      Object.defineProperty(r, 'coords', { enumerable: true, configurable: true, get: function () { full = full || walkFull(res, src, dst); return full.coords; }, set: function (v) { Object.defineProperty(r, 'coords', { value: v, writable: true, enumerable: true }); } });
+      Object.defineProperty(r, 'edges', { enumerable: true, configurable: true, get: function () { full = full || walkFull(res, src, dst); return full.edges; }, set: function (v) { Object.defineProperty(r, 'edges', { value: v, writable: true, enumerable: true }); } });
+      return r;
+    }
+    function walkFull(res, src, dst) {
       var arcs = []; for (var v = dst; v !== src;) { var s = res.prevArc[v]; if (s < 0) return null; arcs.push(s); v = arcFwd[s] ? ea[arcEdge[s]] : eb[arcEdge[s]]; }
       arcs.reverse();
       var coords = [nodes[src]], meters = 0, edgesUsed = [];
