@@ -185,7 +185,11 @@ async function gallery(page, tag, vp) {
             h('button.btn.btn-ghost', 'Ghost'),
             h('button.btn.btn-icon', { 'aria-label': 'Settings' }, ui.icon('gear')),
             h('button.btn.btn-sm', 'Small'),
+            h('button.btn.btn-sm.btn-icon.btn-ghost', { 'aria-label': 'Close' }, ui.icon('x')),
             h('button.btn.btn-primary', { disabled: true }, 'Disabled')),
+          h('div.pq-chips', h('button.chip', { 'aria-pressed': 'true' }, 'All'), h('button.chip', 'Delayed')),
+          h('button.pm-legend-toggle', { type: 'button' }, ui.icon('layers'), h('span', 'Legend')),
+          h('button.pp-tl-row', { type: 'button' }, h('span', 'Alpha-1'), h('span', '0630-1015')),
           h('div.seg.seg-block', h('button', { 'aria-pressed': 'true' }, 'Mounted'), h('button', 'Dismounted'), h('button', 'Fixed')),
           h('div.chip-group', h('button.chip', { 'aria-pressed': 'true' }, 'JP-8'), h('button.chip', 'Diesel'), h('button.chip', 'Gasoline')),
           h('div.card',
@@ -266,13 +270,42 @@ async function gallery(page, tag, vp) {
       const swatches = [...document.querySelectorAll('[data-tab="zzgallery"] .truck-chip')].slice(0, 8).map((el) => ({ k: el.textContent, rgb: parse(getComputedStyle(el, '::before').backgroundColor) }));
       const pairs = (list) => { let min = Infinity, which = ''; for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) { const d = dE(list[i].rgb, list[j].rgb); if (d < min) { min = d; which = list[i].k + '/' + list[j].k; } } return { min: Math.round(min * 10) / 10, which }; };
       const minContrast = (list) => { let min = Infinity, which = ''; list.forEach((x) => { const c = contrast(x.rgb, surface); if (c < min) { min = c; which = x.k; } }); return { min: Math.round(min * 100) / 100, which }; };
-      return { urgPairs: pairs(urg), truckPairs: pairs(swatches), urgContrast: minContrast(urg), truckContrast: minContrast(swatches), nTrucks: swatches.length };
+      // small text: faint / muted on the surface, and status badge text on its own tint
+      const rgba = (c) => {
+        const srgb = /color\(srgb ([^)]+)\)/.exec(c);
+        if (srgb) { const v = srgb[1].split(/[ /]+/).filter(Boolean).map(Number); return [v[0] * 255, v[1] * 255, v[2] * 255, v.length > 3 ? v[3] : 1]; }
+        const v = c.match(/[\d.]+/g).map(Number);
+        return [v[0], v[1], v[2], v.length > 3 ? v[3] : 1];
+      };
+      const over = (fg, bg) => [0, 1, 2].map((i) => fg[i] * fg[3] + bg[i] * (1 - fg[3]));
+      const under = (el) => { for (let e = el.parentElement; e; e = e.parentElement) { const c = rgba(getComputedStyle(e).backgroundColor); if (c[3] >= 1) return c.slice(0, 3); } return surface; };
+      const r2 = (x) => Math.round(x * 100) / 100;
+      const faint = r2(contrast(toRgb(hex(css.getPropertyValue('--text-faint'))), surface));
+      const muted = r2(contrast(toRgb(hex(css.getPropertyValue('--text-muted'))), surface));
+      let badge = { min: Infinity, which: '' };
+      document.querySelectorAll('[data-tab="zzgallery"] .badge[class*="st-"]').forEach((el) => {
+        const cs = getComputedStyle(el);
+        const bg = over(rgba(cs.backgroundColor), under(el));
+        const c = contrast(over(rgba(cs.color), bg), bg);
+        if (c < badge.min) badge = { min: r2(c), which: el.textContent };
+      });
+      // phone touch targets in the gallery (M11)
+      const small = innerWidth < 600 ? [...document.querySelectorAll('[data-tab="zzgallery"] .stepper > button, [data-tab="zzgallery"] .btn, [data-tab="zzgallery"] .pq-chips .chip, [data-tab="zzgallery"] .pm-legend-toggle, [data-tab="zzgallery"] .pp-tl-row')]
+        .map((el) => ({ el, r: el.getBoundingClientRect() }))
+        .filter((x) => x.r.height < 44 || ((x.el.matches('.btn, .stepper > button')) && x.r.width < 44))
+        .map((x) => x.el.className + ' ' + Math.round(x.r.width) + 'x' + Math.round(x.r.height)) : [];
+      return { urgPairs: pairs(urg), truckPairs: pairs(swatches), urgContrast: minContrast(urg), truckContrast: minContrast(swatches), nTrucks: swatches.length, faint, muted, badge, small };
     });
     const minC = theme === 'night' ? 2 : 3;
     check(res.urgPairs.min >= 15, theme + ': urgency colors distinct (min deltaE ' + res.urgPairs.min + ' ' + res.urgPairs.which + ')');
     check(res.nTrucks === 8 && res.truckPairs.min >= 12, theme + ': 8 truck colors distinct (min deltaE ' + res.truckPairs.min + ' ' + res.truckPairs.which + ')');
     check(res.urgContrast.min >= minC, theme + ': urgency colors contrast >= ' + minC + ':1 on surface (min ' + res.urgContrast.min + ' ' + res.urgContrast.which + ')');
     check(res.truckContrast.min >= minC, theme + ': truck colors contrast >= ' + minC + ':1 on surface (min ' + res.truckContrast.min + ' ' + res.truckContrast.which + ')');
+    // M10 / psg-lint 6: small text reads at 4.5:1 (night keeps a dim red, at least 3:1)
+    const minT = theme === 'night' ? 3 : 4.5;
+    check(res.faint >= minT && res.muted >= minT, theme + ': faint and muted text contrast >= ' + minT + ':1 on surface (faint ' + res.faint + ', muted ' + res.muted + ')');
+    check(res.badge.min >= minT, theme + ': status badge text contrast >= ' + minT + ':1 on its tint (min ' + res.badge.min + ' ' + res.badge.which + ')');
+    if (theme === 'dark') check(res.small.length === 0, 'touch targets >= 44px (steppers, icon buttons, queue chips, legend toggle, timeline rows)' + (res.small.length ? ' (' + res.small.join(', ') + ')' : ''));
     if (theme === 'night') {
       const bad = await whiteOffenders(page, ['[data-tab="zzgallery"]']);
       check(bad.length === 0, 'night: no near-white color in the component gallery' + (bad.length ? ' (' + bad.slice(0, 5).join('; ') + ')' : ''));
@@ -335,7 +368,10 @@ async function runViewport(browser, fileUrl, vp) {
   }
   // PSG column width
   const psgBox = await box(page, '#psg-root');
-  if (vp.width > 500) {
+  if (vp.width >= 768 && vp.width < 1100) {
+    // tablets get a wider column (psg-lint 17: a 480px strip left the sides empty)
+    check(psgBox.width >= 600 && psgBox.width <= 642 && Math.abs(psgBox.x + psgBox.width / 2 - vp.width / 2) < 2, 'PSG view is a centered 640px column on tablets (width ' + psgBox.width + ')');
+  } else if (vp.width > 500) {
     check(psgBox.width <= 482 && Math.abs(psgBox.x + psgBox.width / 2 - vp.width / 2) < 2, 'PSG view is a centered phone-width column (width ' + psgBox.width + ')');
   } else {
     check(Math.abs(psgBox.width - vp.width) < 1, 'PSG view fills the phone width');
@@ -351,9 +387,13 @@ async function runViewport(browser, fileUrl, vp) {
       .map((x) => (x.b.className || x.b.textContent) + ' ' + Math.round(x.r.width) + 'x' + Math.round(x.r.height)));
     check(small.length === 0, 'top bar touch targets >= 44px on phone' + (small.length ? ' (' + small.join(', ') + ')' : ''));
     check(!(await visible(page, '#topbar .tb-speed')), 'speed control moves into the clock sheet on phones');
+    const tagPh = await notionalTag(page);
+    check(tagPh.shown && /notional/i.test(tagPh.text) && tagPh.inside && !tagPh.hit.length, 'NOTIONAL tag stays on phones, clear of the top bar buttons (' + JSON.stringify(tagPh) + ')');
   } else {
     check(await visible(page, '#topbar .tb-speed'), 'speed control visible in the top bar');
   }
+  const mark = await page.evaluate(() => { const m = document.querySelector('#topbar .tb-mark'); if (!m) return null; const cs = getComputedStyle(m); return { border: cs.borderTopWidth, bg: cs.backgroundColor, button: m.tagName === 'BUTTON' }; });
+  check(!mark || (mark.border === '0px' && /rgba\(0, 0, 0, 0\)|transparent/.test(mark.bg) && !mark.button), 'brand mark has no button-like border or fill (' + JSON.stringify(mark) + ')');
   check(await visible(page, '#topbar .tb-hhmm') && (await page.textContent('#topbar .tb-hhmm')) === '0600', 'clock shows 0600');
   check((await page.textContent('#topbar .tb-day')) === 'Day 1', 'clock shows Day 1');
 
@@ -363,6 +403,22 @@ async function runViewport(browser, fileUrl, vp) {
   check(s.role === 'planner', 'role switch sets ui.role = planner');
   check(await visible(page, '#planner-root') && !(await visible(page, '#psg-root')), 'planner root visible, PSG root hidden');
   check(await page.getAttribute('#topbar .tb-role button[data-role="planner"]', 'aria-pressed') === 'true', 'Planner button pressed');
+  // J1: an absolutely placed .sr-only deep inside a planner view (the compare table's header) must
+  // not make the page itself scrollable, or scrollIntoView slides the top bar off screen
+  const j1 = await page.evaluate(() => [...document.querySelectorAll('#planner-root .pl-view')].filter((e) => e.getClientRects().length).map((v) => {
+    const probe = document.createElement('div');
+    probe.innerHTML = '<div style="height:3000px"></div><span class="sr-only">Measure</span>';
+    v.appendChild(probe);
+    const se = document.scrollingElement;
+    const out = { tab: v.dataset.tab, pos: getComputedStyle(v).position, scrollH: se.scrollHeight, vh: innerHeight };
+    probe.lastElementChild.scrollIntoView();
+    out.scrollTop = se.scrollTop;
+    probe.remove();
+    v.scrollTop = 0;
+    se.scrollTop = 0;
+    return out;
+  }));
+  check(j1.length > 0 && j1.every((x) => x.pos === 'relative' && x.scrollH <= x.vh + 1 && x.scrollTop === 0), 'J1: hidden text deep in a planner view does not scroll the page under the top bar (' + JSON.stringify(j1) + ')');
 
   const labels = ['Map', 'Queue', 'Plan', 'Scenario', 'Outputs'];
   if (!wide) {
@@ -727,6 +783,21 @@ async function topbarFits(page) {
   });
 }
 
+// the NOTIONAL tag: shown, inside the screen, and not over any top bar button
+async function notionalTag(page) {
+  return page.evaluate(() => {
+    const t = document.querySelector('#topbar .tb-tag');
+    if (!t || !t.getClientRects().length) return { shown: false };
+    const r = t.getBoundingClientRect();
+    const cs = getComputedStyle(t);
+    const hit = [...document.querySelectorAll('#topbar button')].filter((b) => b.getClientRects().length).filter((b) => {
+      const q = b.getBoundingClientRect();
+      return r.left < q.right - 0.5 && q.left < r.right - 0.5 && r.top < q.bottom - 0.5 && q.top < r.bottom - 0.5;
+    }).map((b) => b.className || b.textContent);
+    return { shown: cs.visibility !== 'hidden' && cs.opacity !== '0' && r.width > 20, text: t.textContent.trim(), inside: r.left >= 0 && r.right <= innerWidth && r.top >= 0, hit };
+  });
+}
+
 async function edgeCases(browser, fileUrl) {
   // ---- 320 x 568 phone with touch: top bar fits, long labels wrap, PSG tab bar -------------------
   scope = '320x568';
@@ -739,6 +810,8 @@ async function edgeCases(browser, fileUrl) {
       const f = await topbarFits(page);
       check(f.scroll <= f.vw && f.vw === 320, role + ': no horizontal scroll at 320px (scrollWidth ' + f.scroll + ', viewport ' + f.vw + ')');
       check(f.bad.length === 0, role + ': every top bar button is inside the screen and >= 44px' + (f.bad.length ? ' (' + f.bad.join(', ') + ')' : ''));
+      const tag320 = await notionalTag(page);
+      check(tag320.shown && /notional/i.test(tag320.text) && tag320.inside && !tag320.hit.length, role + ': NOTIONAL tag shown at 320px, clear of the top bar buttons (' + JSON.stringify(tag320) + ')');
       await page.screenshot({ path: path.join(SHOTS, '320x568-dark-' + role + '.png') });
     }
     // planner bottom tabs by touch

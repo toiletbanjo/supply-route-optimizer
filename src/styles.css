@@ -74,6 +74,7 @@
   --pl-left: clamp(300px, 24vw, 380px);
   --pl-right: clamp(340px, 28vw, 440px);
   --truck-mix: 100%;
+  --badge-text-mix: 75%;          /* status badge text: its color mixed toward --text (AA on the tint) */
   --primary-bg: var(--accent);
   --primary-hover: var(--accent-hover);
   --primary-text: var(--accent-text);
@@ -94,7 +95,7 @@ html[data-theme="dark"], html:not([data-theme]) {
   --border-strong: #3a4753;
   --text: #e3e8ec;
   --text-muted: #a3afb9;
-  --text-faint: #75838e;
+  --text-faint: #8a98a3;           /* 5.7:1 on surface, 4.5:1 on a selected row */
   --accent: #5cb88a;
   --accent-hover: #74c89d;
   --accent-text: #06120c;
@@ -138,7 +139,7 @@ html[data-theme="light"] {
   --border-strong: #b7c0b9;
   --text: #141a1e;
   --text-muted: #4b5660;
-  --text-faint: #75808a;
+  --text-faint: #5f6b75;           /* 5.5:1 on surface, 4.8:1 on surface-2 */
   --accent: #1d7a4c;
   --accent-hover: #166640;
   --accent-text: #ffffff;
@@ -181,8 +182,8 @@ html[data-theme="night"] {
   --border: #2b0c0b;
   --border-strong: #4a1513;
   --text: #cf443b;
-  --text-muted: #a2352e;
-  --text-faint: #702520;
+  --text-muted: #b8473f;           /* still dim red; labels at least 3:1 (faint 3.2:1, muted 3.9:1 on surface) */
+  --text-faint: #a0413a;
   --accent: #b5362f;
   --accent-hover: #cc443b;
   --accent-text: #000000;
@@ -192,7 +193,7 @@ html[data-theme="night"] {
   --ok: #8c8530;
   --warn: #b07a2a;
   --danger: #e2392e;
-  --info: #a2352e;
+  --info: #b8473f;
   --danger-bg: #2a0706;
   --danger-text: #ec5a4e;
   --primary-bg: #4d1310;
@@ -205,7 +206,7 @@ html[data-theme="night"] {
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.8);
   --shadow-2: 0 12px 32px rgba(0, 0, 0, 0.9);
   --backdrop: rgba(0, 0, 0, 0.74);
-  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23a2352e' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23b8473f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5 6.5 11.5 12.5 4.5' fill='none' stroke='%23000000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --map-sea: #040000;
   --map-land: #130404;
@@ -217,6 +218,7 @@ html[data-theme="night"] {
   --overlay-filter: brightness(0.78);
   --symbol-filter: grayscale(1) brightness(0.62) sepia(1) hue-rotate(-50deg) saturate(4);
   --truck-mix: 68%;
+  --badge-text-mix: 100%;          /* mixing toward the red text would lower contrast here */
 }
 
 /* ---- phone sizing ------------------------------------------------------------------------------- */
@@ -282,18 +284,16 @@ ul, ol { margin: 0; padding-left: 1.25em; }
   border-bottom: 1px solid var(--border);
 }
 .tb-brand { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 0 1 auto; }
+/* the mark is a logo, not a control: no border or fill, so it does not read as a button */
 .tb-mark {
   flex: none;
   display: grid;
   place-items: center;
-  width: 30px;
+  width: 26px;
   height: 30px;
-  border-radius: var(--radius);
-  border: 1px solid var(--accent-line);
   color: var(--accent);
-  background: var(--accent-soft);
 }
-.tb-mark .icon { width: 18px; height: 18px; }
+.tb-mark .icon { width: 24px; height: 24px; }
 .tb-name { font-weight: 650; font-size: 0.9667rem; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tb-tag {
   flex: none;
@@ -356,7 +356,7 @@ html[data-role="planner"] #planner-root { display: flex; }
   .psg-root { border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
 }
 .psg { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-.psg-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; display: flex; flex-direction: column; }
+.psg-body { position: relative; flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; display: flex; flex-direction: column; }
 .psg-view { display: none; flex-direction: column; gap: 12px; padding: 16px; flex: 1 0 auto; }
 .psg-view[data-active] { display: flex; }
 .psg-root-view { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow: auto; }
@@ -374,6 +374,9 @@ html[data-role="planner"] #planner-root { display: flex; }
 }
 .pl-head { display: none; }
 .pl-view {
+  /* positioned: absolutely placed children (.sr-only table headers) stay inside this scroller instead
+     of growing the page, which a scrollIntoView then scrolled under the top bar */
+  position: relative;
   grid-area: main;
   display: none;
   flex-direction: column;
@@ -563,9 +566,12 @@ html[data-theme="night"] .btn-danger { border-color: var(--danger); }
 .btn-danger:hover { background: var(--danger-bg); border-color: var(--danger); color: var(--danger-text); }
 .btn-ghost { background: transparent; border-color: transparent; color: var(--text-muted); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
-.btn-icon { width: var(--btn-h); padding: 0; }
+.btn-icon { flex: none; width: var(--btn-h); padding: 0; }
 .btn-sm { --btn-h: var(--ctl-h-sm); padding: 0 10px; font-size: 0.8667rem; }
 .btn-sm.btn-icon { padding: 0; }
+/* touch: no small or icon button narrower than 44px (an icon-only .btn-sm is 40px wide from its
+   padding); other buttons keep their content width as flex items */
+@media (max-width: 599px), (pointer: coarse) { .btn-sm, .btn-icon { min-width: 44px; } }
 .btn-lg { --btn-h: 48px; padding: 0 20px; font-size: 1rem; }
 /* full-width buttons wrap long labels instead of clipping them */
 .btn-block {
@@ -730,6 +736,7 @@ html[data-theme="night"] .btn-danger { border-color: var(--danger); }
   -moz-appearance: textfield;
   appearance: textfield;
 }
+@media (max-width: 599px), (pointer: coarse) { .stepper { height: calc(var(--ctl-h) + 2px); } }   /* 44px buttons inside the border */
 .stepper-block { display: flex; align-self: stretch; }
 .stepper-block > input { flex: 1 1 auto; }
 .stepper > input::-webkit-inner-spin-button, .stepper > input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
@@ -895,6 +902,7 @@ button.list-row:hover, a.list-row:hover, .list-row.is-clickable:hover { backgrou
   background: transparent;
   background: color-mix(in srgb, var(--badge-c) 14%, transparent);
   color: var(--badge-c);
+  color: color-mix(in srgb, var(--badge-c) var(--badge-text-mix), var(--text));
 }
 .badge-ok, .badge.st-approved, .badge.st-delivered { --badge-c: var(--ok); }
 .badge-warn, .badge.st-partial { --badge-c: var(--warn); }
@@ -1316,8 +1324,23 @@ button.stat:hover { background: var(--surface-2); }
 }
 @media (max-width: 599px) {
   .topbar { gap: 6px; padding-left: max(8px, env(safe-area-inset-left, 0px)); padding-right: max(8px, env(safe-area-inset-right, 0px)); }
-  .tb-tag, .tb-speed { display: none; }
-  .tb-mark { width: 32px; height: 32px; }
+  .tb-speed { display: none; }
+  /* NOTIONAL stays on phones (the main PSG device, and the screenshots most likely to be passed on):
+     a small tab centred on the bar's bottom edge, below the 44px buttons, so it costs no height and
+     no room in the row */
+  .tb-tag {
+    position: absolute;
+    z-index: 1;
+    left: 50%;
+    bottom: -8px;
+    transform: translateX(-50%);
+    padding: 0 7px;
+    border-radius: 999px;
+    background: var(--surface);
+    font-size: 0.625rem;
+    line-height: 10px;
+    pointer-events: none;
+  }
   .role-long { display: none; }
   .role-short { display: inline; }
   .tb-role > button { padding: 0 10px; }
@@ -1327,10 +1350,10 @@ button.stat:hover { background: var(--surface-2); }
   .tb-run-dot { display: none; }
   .psg-view { padding: 12px; }
 }
-/* 320-359px phones (iPhone SE 1st gen, small Androids): drop the brand, tighten the rest so the role
-   switch, clock, play and theme still fit at 44px touch size */
+/* 320-359px phones (iPhone SE 1st gen, small Androids): drop the mark (the NOTIONAL tab stays),
+   tighten the rest so the role switch, clock, play and theme still fit at 44px touch size */
 @media (max-width: 359px) {
-  .tb-brand { display: none; }
+  .tb-mark { display: none; }
   .topbar { gap: 4px; padding-left: max(6px, env(safe-area-inset-left, 0px)); padding-right: max(6px, env(safe-area-inset-right, 0px)); }
   .tb-role > button { padding: 0 8px; }
   .tb-time { min-width: 0; padding: 0 6px; }
@@ -1438,6 +1461,8 @@ html[data-theme="night"] {
 .pm-legend-zone.is-risk { border: 1.5px dashed var(--warn); background: color-mix(in srgb, var(--warn) 25%, transparent); }
 .pm-legend-note { padding: 5px 10px 6px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 11px; line-height: 1.3; }
 .pm-legend:not(.is-open) .pm-legend-note { border-top: 0; padding-top: 0; }
+/* narrow map: the collapsed legend is a button only, so it does not cover the map's "Offline map" note */
+@container (max-width: 560px) { .pm-legend:not(.is-open) .pm-legend-note { display: none; } }
 .sro-map.sro-drawing .pm-legend { display: none; }
 
 /* ---- queue ------------------------------------------------------------------------------------- */
@@ -1587,7 +1612,7 @@ html[data-theme="night"] {
 .pp-status.is-cancelled { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
 .pp-picker-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; }
 .pp-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.pp-summary .stat { padding: 7px 8px; }
+.pp-summary .stat { justify-content: space-between; padding: 7px 8px; }   /* values line up when a label wraps */
 .pp-summary .stat-label { white-space: normal; line-height: 1.15; min-height: 1.15em; letter-spacing: 0.03em; }
 .pp-summary .stat-value { font-size: 1.1rem; font-size: clamp(0.95rem, 4.3cqi, 1.1rem); overflow: hidden; text-overflow: ellipsis; }
 .pp-summary .stat-unit { margin-left: 2px; font-size: 0.75rem; }
@@ -1730,9 +1755,9 @@ html[data-theme="night"] {
   .pr-reqs { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
 }
 @media (max-width: 599px), (pointer: coarse) {
-  .pm-legend-toggle { min-height: 40px; }
-  .pq-chips .chip { min-height: 40px; }
-  .pp-tl-row { min-height: 36px; }
+  .pm-legend-toggle { min-height: 44px; }
+  .pq-chips .chip { min-height: 44px; }
+  .pp-tl-row { min-height: 44px; }
 }
 
 /* ==== PLANNER SCENARIO / OUTPUTS (src/ui/planner/scenario.js, outputs.js) ======================
@@ -2151,8 +2176,8 @@ html[data-theme="night"] {
   padding: 8px 4px 8px 12px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
 }
 .psg-line-main:hover .psg-line-title { text-decoration: underline; text-underline-offset: 2px; }
-.psg-line-class { font-size: 0.6933rem; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text-faint); }
-.psg-line-title { font-weight: 650; overflow-wrap: anywhere; }
+.psg-line-class { font-size: 0.6933rem; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text-faint); overflow-wrap: break-word; }
+.psg-line-title { font-weight: 650; overflow-wrap: break-word; }
 .psg-line-sub { font-size: 0.8rem; color: var(--text-muted); }
 .psg-line-qty { padding-left: 4px; font-weight: 700; white-space: nowrap; }
 .psg-line-remove { --btn-h: 44px; color: var(--text-faint); }
@@ -2177,7 +2202,17 @@ html[data-theme="night"] {
 }
 .psg-unit-strip.is-invalid { border-color: var(--danger); }
 .psg-unit-strip-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.psg-unit-strip-name { font-weight: 650; }
+/* the platoon's own name wraps to two lines rather than losing its end to an ellipsis */
+.psg-unit-strip-name {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+  font-weight: 650; overflow-wrap: break-word;
+}
+/* 'grid · place': the place moves to its own line when both do not fit (and wraps there only if it
+   must); the dot sits in the gap and is clipped off then, so no line starts or ends with a lone dot */
+.psg-unit-strip-loc { display: flex; flex-wrap: wrap; column-gap: 1.1em; overflow: hidden; }
+.psg-unit-strip-loc > .mono { white-space: nowrap; }
+.psg-loc-near { position: relative; min-width: 0; }
+.psg-loc-near::before { content: '\00b7'; position: absolute; left: -0.75em; }
 .psg-strip-update { flex: none; }
 .psg-unit-strip-wrap { display: flex; flex-direction: column; gap: 6px; }
 
@@ -2193,11 +2228,18 @@ html[data-theme="night"] {
 .psg-map { width: 100%; height: 240px; background: var(--map-sea); }
 .psg-map-sheet { height: min(46vh, 360px); }
 .psg-map-track { height: 220px; }
+/* tablets: a wider column and a taller tracking map instead of a phone strip with empty margins */
+@media (min-width: 768px) and (max-width: 1099px) {
+  :root { --psg-max: 640px; }
+  .psg-map-track { height: 300px; }
+}
+/* over the bottom edge, above the attribution (the maps fit their points clear of it), up to two lines */
 .psg-map-hint {
-  position: absolute; top: 8px; left: 52px; right: 10px; z-index: 1000; width: fit-content; max-width: calc(100% - 62px); margin: 0 auto;
-  padding: 4px 12px; border: 1px solid var(--border); border-radius: 999px; pointer-events: none;
+  position: absolute; bottom: 34px; left: 10px; right: 10px; z-index: 1000; width: fit-content; max-width: calc(100% - 20px); margin: 0 auto;
+  padding: 3px 12px; border: 1px solid var(--border); border-radius: 12px; pointer-events: none;
   background: var(--surface); background: color-mix(in srgb, var(--surface) 90%, transparent);
-  color: var(--text); font-size: 0.8rem; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text); font-size: 0.8rem; font-weight: 650; line-height: 1.3; text-align: center;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
 }
 .psg-map-wrap.has-loc .psg-map-hint { display: none; }
 .psg-loc { display: flex; flex-direction: column; gap: 8px; }
@@ -2219,6 +2261,7 @@ html[data-theme="night"] {
 }
 .psg-unit-line { gap: 12px; min-width: 0; }
 .psg-unit-name { font-weight: 650; overflow-wrap: anywhere; }
+.psg-name-part { display: inline-block; max-width: 100%; }   /* psg.unitNameParts: wraps after commas only */
 .psg-unit-name-lg { font-size: 1.1333rem; }
 .psg-unit-missing { color: var(--warn); font-style: italic; }
 .psg-unit-card { display: flex; flex-direction: column; gap: 12px; }
@@ -2229,6 +2272,11 @@ html[data-theme="night"] {
 /* 3. NLT */
 .psg-nlt-chips .chip { min-width: 72px; justify-content: center; }
 .psg-nlt-selects { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+/* the Day select gets its own row ("Day 1 (today)" does not fit a third of a phone) */
+@media (max-width: 479px) {
+  .psg-nlt-selects { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .psg-nlt-selects > :first-child { grid-column: 1 / -1; }
+}
 .psg-nlt-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
 .psg-nlt-big { font-size: 1.6rem; font-weight: 750; letter-spacing: 0.02em; }
 .psg-nlt-rel { font-size: 0.8667rem; color: var(--text-muted); }
@@ -2298,9 +2346,11 @@ html[data-theme="night"] {
 .psg-req-head { display: flex; flex-direction: column; gap: 4px; }
 .psg-req-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .psg-req-id { margin-right: 2px; font-family: var(--font-mono); font-size: 1.0667rem; font-weight: 750; }
-.psg-req-lines { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; }
-.psg-req-lines li { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
-.psg-req-qty { flex: none; min-width: 4.6em; font-weight: 700; }
+/* one qty column for every line, as wide as the widest qty ("40,000 rds"), so the items line up */
+.psg-req-lines { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 10px; margin: 0; padding: 0; list-style: none; }
+.psg-req-lines li { display: grid; grid-column: 1 / -1; grid-template-columns: 6.2em minmax(0, 1fr); align-items: baseline; column-gap: 10px; min-width: 0; }
+@supports (grid-template-columns: subgrid) { .psg-req-lines li { grid-template-columns: subgrid; } }
+.psg-req-qty { font-weight: 700; white-space: nowrap; }
 .psg-req-item { min-width: 0; overflow-wrap: anywhere; }
 .psg-req-body { display: flex; flex-direction: column; gap: 10px; }
 .psg-req-body:empty { display: none; }
@@ -2319,6 +2369,32 @@ html[data-theme="night"] {
 .psg-freq { margin-left: auto; font-weight: 650; white-space: nowrap; }
 .psg-stops-before { display: flex; align-items: center; gap: 8px; font-weight: 650; }
 .psg-stops-before .icon { width: 16px; height: 16px; color: var(--text-muted); }
+/* which stops come first: '1 Fengyuan 0853  2 Direct 1032  3 You 1128' (wraps by whole stops) */
+.psg-stop-list { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: -4px 0 0; padding: 0 0 0 24px; list-style: none; font-size: 0.8667rem; color: var(--text-muted); }
+.psg-stop-list li { display: inline-flex; align-items: baseline; gap: 5px; white-space: nowrap; }
+.psg-stop-n {
+  align-self: center; display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 4px;
+  border: 1px solid var(--border-strong); border-radius: 999px; font-size: 0.7333rem; font-weight: 700; line-height: 1;
+}
+.psg-stop-name { color: var(--text); }
+.psg-stop-list li.is-you { color: var(--text); font-weight: 700; }
+.psg-stop-list li.is-you .psg-stop-n { border-color: var(--text); background: var(--text); color: var(--bg); }
+.psg-stop-list li.is-done .psg-stop-name { text-decoration: line-through; text-decoration-color: var(--text-faint); }
+/* one-line key under the card map */
+.psg-map-key { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: -4px; color: var(--text-muted); }
+.psg-key-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.psg-key-sym { display: inline-flex; flex: none; }
+.psg-key-stop {
+  display: inline-flex; flex: none; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--truck); background: color-mix(in srgb, var(--truck) var(--truck-mix), #000); color: var(--truck-fg, #fff);
+  box-shadow: 0 0 0 1.5px var(--surface), 0 0 0 3px var(--truck); font-size: 0.6667rem; font-weight: 750;
+}
+html[data-theme="night"] .psg-key-stop { background: #000; color: var(--text); box-shadow: 0 0 0 2px var(--text-muted); }
+.psg-key-zone {
+  flex: none; width: 14px; height: 14px; border: 1.5px solid var(--danger); border-radius: 50%;
+  background: repeating-linear-gradient(45deg, var(--text-faint) 0 1.5px, transparent 1.5px 4px);
+}
+.psg-change-note .psg-seen { flex: none; align-self: center; margin: -6px -6px -6px 0; }
 .psg-live { padding: 8px 10px; border-radius: var(--radius); background: var(--surface-2); font-size: 0.9333rem; }
 .psg-also { display: flex; flex-direction: column; gap: 6px; }
 .psg-also-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
@@ -2341,5 +2417,11 @@ html[data-theme="night"] {
 @media (max-width: 359px) {
   .psg-unit-row { grid-template-columns: minmax(0, 1fr); }
   .psg-eta-time { font-size: 1.6rem; }
+  .psg-seg > button { padding: 0 3px; font-size: 0.8rem; }   /* "Dismounted" fits an 88px third */
+  /* cart: the qty moves under the title, so a long title is not broken mid-word */
+  .psg-cart .psg-line { grid-template-columns: minmax(0, 1fr) auto; }
+  .psg-cart .psg-line-main { min-height: 52px; padding-bottom: 2px; }
+  .psg-cart .psg-line-qty { grid-column: 1; grid-row: 2; padding: 0 12px 10px; }
+  .psg-cart .psg-line-remove { grid-column: 2; grid-row: 1 / span 2; }
 }
 /* ==== end PSG views ============================================================================ */

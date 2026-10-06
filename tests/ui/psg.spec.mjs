@@ -400,6 +400,16 @@ async function runFlow(browser, fileUrl, vp) {
   check(await inView(page, V('request') + ' .psg-head') && await inView(page, V('request') + ' .psg-tile[data-class="III"]'),
     'after setup the request form opens at its top ("What do you need?" on screen, not scrolled to the Save position)', await bodyScroll(page));
   check((await text(page, V('request') + ' .psg-unit-strip')).includes(geoWant), 'unit strip shows the MGRS location');
+  const strip = await page.evaluate((sel) => {
+    const el = document.querySelector(sel), name = el.querySelector('.psg-unit-strip-name');
+    const loc = el.querySelector('.psg-unit-strip-loc'), lr = loc.getBoundingClientRect();
+    const near = el.querySelector('.psg-loc-near').getBoundingClientRect(), grid = loc.querySelector('.mono');
+    return { nameFits: name.scrollHeight <= name.clientHeight + 1 && name.scrollWidth <= name.clientWidth + 1,
+      gridLines: grid.getClientRects().length, placeInside: near.right <= lr.right + 0.5 && near.bottom <= lr.bottom + 0.5 };
+  }, V('request') + ' .psg-unit-strip');
+  check(strip.nameFits && strip.gridLines === 1 && strip.placeInside, 'unit strip: the whole unit name, the grid on one line, the place not cut off', strip);
+  const segFit = await page.$$eval(V('request') + ' .psg-seg[data-name="mobility"] > button', (els) => els.map((b) => [b.textContent, b.scrollWidth, b.clientWidth]));
+  check(segFit.length >= 2 && segFit.every((x) => x[1] <= x[2]), 'mobility segment: every label fits its button (psg-lint 13)', segFit);
 
   // ---- 2. My requests empty state ---------------------------------------------------------------------
   await showTab(page, act, 'myrequests');
@@ -473,6 +483,7 @@ async function runFlow(browser, fileUrl, vp) {
   check(imm.includes('This will be sent as IMMEDIATE: you run out in about 9 hours'), 'result shown plainly: "This will be sent as IMMEDIATE: you run out in about 9 hours"', imm);
   check(imm.includes('Deadline moves up to 1500'), 'deadline moves up to the run-out time', imm);
   check((await text(page, V('request') + ' .psg-footer-sum')).includes('Immediate'), 'footer badge shows Immediate');
+  check((await text(page, V('request') + ' .psg-footer-when')) === 'Deadline 1500', 'footer gives the escalated deadline, not the NLT (psg-lint 15)', await text(page, V('request') + ' .psg-footer-when'));
   check(!(await visible(page, V('request') + ' .psg-errors')), 'errors cleared once answered');
   await shots(page, tag, '08-urgent-immediate', { before: async () => { await page.locator(V('request') + ' .psg-urg-result').evaluate((el) => el.scrollIntoView({ block: 'center' })); } });
   // optional desired pickup spot, tapped on the mini map
@@ -487,6 +498,17 @@ async function runFlow(browser, fileUrl, vp) {
     return c ? { id: c.g.id, lat: c.g.lat, lon: c.g.lon, name: window.SRO.ui.psg.placeName(c.g), d: c.d } : null;
   });
   await shots(page, tag, '08b-pickup-hint', { themes: ['dark'], before: async () => { await page.locator(V('request') + ' .psg-map-hint-pick').evaluate((el) => el.scrollIntoView({ block: 'center' })); } });
+  // the platoon symbol sits beside a drop point it would cover, without designator text
+  const hm = await page.evaluate((sel) => {
+    const host = document.querySelector(sel);
+    const R = (el) => { const r = el.getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom }; };
+    const plt = host.querySelector('.sro-pane-platoons .leaflet-marker-icon');
+    const ps = plt && R(plt.querySelector('svg:not(.sro-leader)') || plt);
+    const rally = [...host.querySelectorAll('.sro-pane-rally .leaflet-marker-icon')].map((el) => R(el.querySelector('svg') || el));
+    const covered = rally.filter((q) => ps && ps.l < q.r - 2 && q.l < ps.r - 2 && ps.t < q.b - 2 && q.t < ps.b - 2).length;
+    return { rally: rally.length, covered, text: plt ? [...plt.querySelectorAll('svg text')].map((t) => t.textContent).join('') : null };
+  }, V('request') + ' .psg-map-hint-pick');
+  check(hm.rally > 0 && hm.covered === 0 && hm.text === '', 'hint map: the platoon symbol covers no drop point and has no designator text', hm);
   const hp = want && await mapPoint(page, V('request') + ' .psg-map-hint-pick', want);
   check(!!hp, 'drop point ' + (want && want.name) + ' visible on the hint map');
   if (hp) {
@@ -549,6 +571,9 @@ async function runFlow(browser, fileUrl, vp) {
   // NLT in the past (Other time, 0500 today)
   await act.tap(V('request') + ' .psg-nlt-other');
   check(await visible(page, V('request') + ' .psg-nlt-hour'), 'Other time shows 24 h selects');
+  // the Day select ("Day 1 (today)") is not clipped on a phone (psg-lint 5)
+  const daySel = await page.evaluate((sel) => { const el = document.querySelector(sel); if (!el) return null; const c = document.createElement('canvas').getContext('2d'); const cs = getComputedStyle(el); c.font = cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily; const t = el.options[el.selectedIndex].text; return { t, need: Math.ceil(c.measureText(t).width) + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight), w: el.clientWidth }; }, V('request') + ' .psg-nlt-day');
+  check(daySel && daySel.need <= daySel.w + 1, 'Other time: the Day select text fits', daySel);
   await page.selectOption(V('request') + ' .psg-nlt-hour', '5');
   await settle(page);
   check(await page.locator(V('request') + ' [data-sec="when"].is-invalid').count() === 1, 'NLT in the past: section marked at once');
@@ -600,6 +625,9 @@ async function runFlow(browser, fileUrl, vp) {
   await showTab(page, act, 'profile');
   check((await text(page, V('profile') + ' .psg-unit-card')).includes(unitName) && (await text(page, V('profile') + ' .psg-unit-card')).includes(desig), 'Unit summary: name and designator');
   check((await text(page, V('profile') + ' .psg-unit-card .psg-mgrs')) === geoWant, 'Unit summary: MGRS');
+  // how the platoon moves shows once: as the choice, not also as a row of the summary card
+  const unitDts = await page.$$eval(V('profile') + ' .psg-unit-card dt', (els) => els.map((e) => e.textContent.trim()));
+  check(!unitDts.includes('Moving') && (await text(page, V('profile') + ' .psg-sec-title')).includes('How you move'), 'Unit tab: mobility shown once ("How you move")', unitDts);
   await shots(page, tag, '11-unit');
   await act.tap(V('profile') + ' .psg-choice[data-value="dismounted"]');
   check((await S(page)).profile.mobility === 'dismounted', 'mobility change saved (profile/save)');
@@ -755,10 +783,46 @@ async function runFlow(browser, fileUrl, vp) {
   const chipColor = await page.evaluate((sel) => document.querySelector(sel).style.getPropertyValue('--truck'), c1 + ' .psg-truck-chip');
   check(chipColor.toLowerCase() === plan.truck.color.toLowerCase(), 'card: truck color chip', chipColor);
   check((await text(page, c1 + ' .psg-stops-before')).includes('1 stop before yours'), 'card: "1 stop before yours"');
+  // the stops before theirs, in order, with arrival times (spec-answers: "which stops come before theirs")
+  const stopsWant = await page.evaluate(({ p, eta }) => {
+    const s0 = p.routes[0].stops[0];
+    const g = window.SRO.data.grid.find((x) => x.id === s0.gridId);
+    return { name: window.SRO.ui.psg.placeName(g), t0: window.SRO.core.format.time24(s0.arrive), t1: window.SRO.core.format.time24(eta) };
+  }, { p: plan.plan, eta: plan.stops[1].arrive });
+  const stopItems = await page.$$eval(c1 + ' .psg-stop-list > li', (els) => els.map((e) => ({ t: e.textContent.replace(/\s+/g, ' ').trim(), you: e.classList.contains('is-you') })));
+  check(stopItems.length === 2 && stopItems[0].t.includes(stopsWant.name) && stopItems[0].t.startsWith('1') && stopItems[0].t.endsWith(stopsWant.t0) && !stopItems[0].you,
+    'card: stop list, 1 = ' + stopsWant.name + ' ' + stopsWant.t0, stopItems);
+  check(stopItems[1] && stopItems[1].you && /^2\s*You\s*/.test(stopItems[1].t) && stopItems[1].t.endsWith(stopsWant.t1), 'card: stop list, 2 = You ' + stopsWant.t1, stopItems);
+  // the compact map: own stop numbered and on top, other stops as dots, no hub / designator text,
+  // symbols clear of the zoom buttons and the attribution
+  const cm = await page.evaluate((sel) => {
+    const host = document.querySelector(sel);
+    const R = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom }; };
+    const mine = host.querySelector('.leaflet-sro-mystop-pane .sro-stop-mine');
+    const plt = host.querySelector('.leaflet-sro-platoons-pane .leaflet-marker-icon');
+    const hub = host.querySelector('.leaflet-sro-hubs-pane .leaflet-marker-icon');
+    return { map: R(host), zoom: R(host.querySelector('.leaflet-control-zoom')), attr: R(host.querySelector('.leaflet-control-attribution')),
+      mine: R(mine), mineText: mine ? mine.textContent.trim() : null, dots: host.querySelectorAll('.sro-stop-dot').length,
+      dotText: [...host.querySelectorAll('.sro-stop-dot')].map((d) => d.textContent.trim()).join(''),
+      hubLabels: host.querySelectorAll('.sro-icon-hublabel').length, svgText: [...host.querySelectorAll('.leaflet-sro-hubs-pane svg text, .leaflet-sro-platoons-pane svg text')].map((t) => t.textContent).join('|'),
+      plt: R(plt && (plt.querySelector('svg:not(.sro-leader)') || plt)), hub: R(hub && (hub.querySelector('svg') || hub)) };
+  }, c1 + ' .psg-map-track');
+  const overlaps = (a, b) => !!a && !!b && a.l < b.r && b.l < a.r && a.t < b.b && b.t < a.b;
+  const inside = (a, m) => !!a && !!m && a.l >= m.l - 1 && a.r <= m.r + 1 && a.t >= m.t - 1 && a.b <= m.b + 1;
+  check(cm.mine && cm.mineText === '2', 'card map: own stop numbered 2 in the top stop pane', cm.mineText);
+  check(cm.dots === 1 && cm.dotText === '', 'card map: the other stop is an unnumbered dot', [cm.dots, cm.dotText]);
+  check(cm.hubLabels === 0 && cm.svgText === '', 'card map: no hub name or designator text on the symbols (the key names them)', cm.svgText);
+  for (const k of ['mine', 'plt', 'hub']) {
+    check(inside(cm[k], cm.map) && !overlaps(cm[k], cm.zoom) && !overlaps(cm[k], cm.attr), 'card map: ' + k + ' symbol inside the map, clear of the zoom buttons and attribution', { [k]: cm[k], zoom: cm.zoom, attr: cm.attr, map: cm.map });
+  }
+  const keyTxt = await text(page, c1 + ' .psg-map-key');
+  check(['Your stop', 'You', 'FOB Granite', plan.truck.id + ' route'].every((w) => keyTxt.includes(w)) && !keyTxt.includes('Closed area'), 'card map key: your stop, you, hub, route', keyTxt);
   check((await text(page, c1 + ' .psg-live')).includes('loads at FOB Granite and departs 0630'), 'live line before departure', await text(page, c1 + ' .psg-live'));
   check(card.includes('Drive') && card.includes('from you'), 'card: drive distance to the pickup');
   check(!(await visible(page, c1 + ' .psg-edit')) && await visible(page, c1 + ' .psg-locked'), 'approved card: no Edit / Cancel');
   const c4 = V('myrequests') + ' .psg-req[data-id="' + r4 + '"]';
+  const firstOpen = await page.getAttribute(V('myrequests') + ' .psg-req-list .psg-req', 'data-id');
+  check(firstOpen === r4, 'a delayed request sorts first under Open', firstOpen);
   check((await text(page, c4 + ' .psg-delayed')).includes('Not in this window - next plan at 1200.'), 'deferred card: "Not in this window - next plan at 1200"', await text(page, c4 + ' .psg-delayed'));
   check((await text(page, c4 + ' .psg-why')).includes('All trucks were full this window.'), 'deferred card: the reason in plain words');
   check(!(await text(page, c4 + ' .psg-why')).includes('loaded'), 'deferred card: the solver\'s planner note is not shown', await text(page, c4 + ' .psg-why'));
@@ -791,6 +855,18 @@ async function runFlow(browser, fileUrl, vp) {
   }, c1 + ' .psg-map-track');
   check(mapCounts.routes >= 2, 'map draws the route and the drive line', mapCounts);
   check(mapCounts.markers >= 4, 'map shows hub, pickup, platoon and truck markers', mapCounts);
+  // a closed area added by the planner shows on the card map and in its key
+  const zid = await page.evaluate((p) => {
+    const s0 = p.routes[0].stops[0];
+    const res = window.SRO.app.store.dispatch({ type: 'zone/add', zone: { kind: 'closed', lat: s0.lat + 0.02, lon: s0.lon + 0.02, radiusMi: 1, label: 'Bridge out' } });
+    return res && res.id;
+  }, plan.plan);
+  await settle(page);
+  check(!!zid && await count(page, c1 + ' .psg-map-track path.sro-zone-closed') === 1, 'card map draws a closed area', zid);
+  check((await text(page, c1 + ' .psg-map-key')).includes('Closed area'), 'card map key adds "Closed area"', await text(page, c1 + ' .psg-map-key'));
+  await page.evaluate((id) => window.SRO.app.store.dispatch({ type: 'zone/remove', id }), zid);
+  await settle(page);
+  check(await count(page, c1 + ' .psg-map-track path.sro-zone-closed') === 0 && !(await text(page, c1 + ' .psg-map-key')).includes('Closed area'), 'closed area removed from the card map and key');
   const posAt = (sim) => page.evaluate(({ legs, sim, plan }) => {
     const G = window.SRO.core.geo;
     const L = plan.routes[0].legs.map((l) => ({ coords: G.decodePolyline(l.path), depart: l.depart, arrive: l.arrive }));
@@ -829,9 +905,8 @@ async function runFlow(browser, fileUrl, vp) {
   check(bar2 > bar1, 'progress bar advanced', [bar1, bar2]);
   nums.truckMoves = { atHub: tp0 && [+tp0.lat.toFixed(5), +tp0.lon.toFixed(5)], leg1: tp1 && [+tp1.lat.toFixed(5), +tp1.lon.toFixed(5)], leg2: tp2 && [+tp2.lat.toFixed(5), +tp2.lon.toFixed(5)] };
   await shots(page, tag, '15-mine-en-route', { before: async () => { await page.locator(c1).scrollIntoViewIfNeeded(); } });
-  // contingency re-plan: R1's ETA moves 25 min later -> "Updated" with what changed, until seen
-  // (keep the note up for the screenshots; the moment on screen that counts as seen is checked below)
-  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 1e9; });
+  // contingency re-plan: R1's ETA moves 25 min later -> "Updated" with what changed (old -> new ETA),
+  // until the platoon sergeant taps it: never on a timer (psg-lint 8: a glance away missed the change)
   const etaNew = await page.evaluate(({ p, r1 }) => {
     const q = JSON.parse(JSON.stringify(p));
     q.id = 'P-TEST2'; q.parentPlanId = 'P-TEST1'; q.name = 'Test re-plan'; q.createdAt = window.SRO.app.store.getState().clock.simMin;
@@ -849,27 +924,30 @@ async function runFlow(browser, fileUrl, vp) {
   check(await visible(page, c1 + ' .psg-updated'), 'card: "Updated" badge');
   const etaTxt = await page.evaluate((v) => window.SRO.core.format.time24(v), etaNew);
   check((await text(page, c1 + ' .psg-eta-time')) === etaTxt, 'card shows the new ETA ' + etaTxt);
+  const prevTxt = await page.evaluate((v) => window.SRO.core.format.time24(v), etaNew - 25);
   const chg = await text(page, c1 + ' .psg-change-note');
-  check(chg.startsWith('Updated:') && chg.includes('ETA now ' + etaTxt) && !chg.includes('Pickup moved'), 'card says what changed: "Updated: ETA now ' + etaTxt + '."', chg);
+  check(chg.startsWith('Updated:') && chg.includes('ETA ' + prevTxt + ' \u2192 ' + etaTxt) && !chg.includes('Pickup moved'), 'card says what changed, old and new ETA: "Updated: ETA ' + prevTxt + ' \u2192 ' + etaTxt + '."', chg);
   check(R && R.updatedChange && R.updatedChange.kind === 'eta' && R.updatedChange.etaChanged === true && R.updatedChange.planId === 'P-TEST2', 'store: the change (eta, from P-TEST2) is on the request', R && R.updatedChange);
   check(await count(page, c1 + ' .psg-map-track.leaflet-container') === 1, 'map still shown after the re-plan');
   await shots(page, tag, '16-mine-updated', { before: async () => { await page.locator(c1).scrollIntoViewIfNeeded(); } });
   await shots(page, tag, '17-mine-delayed', { themes: ['dark'], before: async () => { await page.locator(c4).scrollIntoViewIfNeeded(); } });
-  check((await reqById(page, r1)).updated === true, '"Updated" stays while it has not been on screen for the moment that counts as seen');
-  // seen: the note on screen for a moment (here 1.5 s) -> request/seen. Leave the tab and come back
-  // (a hidden tab does not count), bring the note into view, and wait.
-  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 1500; });
+  check((await reqById(page, r1)).updated === true, '"Updated" stays while the platoon sergeant has not tapped it');
+  // on screen for longer than the old 4 s dwell, after leaving the tab and coming back: still there
   await showTab(page, act, 'request');
   await showTab(page, act, 'myrequests');
   await page.locator(c1 + ' .psg-change-note').scrollIntoViewIfNeeded();
-  await page.waitForTimeout(300);
-  check((await reqById(page, r1)).updated === true, 'not cleared before the moment has passed');
-  const seenOk = await page.waitForFunction((id) => !window.SRO.app.store.getState().requests.find((r) => r.id === id).updated, r1, { timeout: 8000 }).then(() => true, () => false);
+  await page.waitForTimeout(4500);
+  check((await reqById(page, r1)).updated === true && await visible(page, c1 + ' .psg-change-note'), 'note on screen 4.5 s: "Updated" stays until tapped');
+  const cardOrder = () => page.evaluate(() => Array.from(document.querySelectorAll('#psg-root .psg-view[data-tab="myrequests"] .psg-req')).map((e) => e.getAttribute('data-id')));
+  const order0 = await cardOrder();
+  // "Got it" -> request/seen; the card keeps its place in the list (no jump under the finger)
+  await act.tap(c1 + ' .psg-seen');
   await settle(page);
-  check(seenOk && !(await visible(page, c1 + ' .psg-updated')) && !(await visible(page, c1 + ' .psg-change-note')), 'after a moment on screen request/seen clears "Updated" and the note', seenOk);
   R = await reqById(page, r1);
+  check(R && R.updated === false && !(await visible(page, c1 + ' .psg-updated')) && !(await visible(page, c1 + ' .psg-change-note')), '"Got it": request/seen clears "Updated" and the note', R && R.updated);
   check(R && !('updatedChange' in R) && R.eta === etaNew, 'seen: the change note is cleared, the new ETA stays', R && [R.eta, R.updatedChange]);
-  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 4000; });
+  const order1 = await cardOrder();
+  check(JSON.stringify(order0) === JSON.stringify(order1), 'the seen card keeps its place in the list', [order0, order1]);
   // delivered
   await tick(etaNew + 1);
   R = await reqById(page, r1);
@@ -1066,7 +1144,6 @@ async function editAndSplitCases(browser, fileUrl) {
 
   // a re-plan that moves only the second stop of the split (Bravo-2 to another drop point, 15 min
   // later): the platoon is "Updated" and the card says which delivery changed
-  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 1e9; });
   const moved = await page.evaluate((id) => {
     const SRO = window.SRO, S = SRO.app.store, st = S.getState(), G = SRO.core.geo;
     const p = JSON.parse(JSON.stringify(st.plans.find((x) => x.id === 'P-SPLIT')));

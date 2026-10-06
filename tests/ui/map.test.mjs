@@ -73,8 +73,17 @@ test('truckPosition: route ending away from its start stays at-stop; bad input g
 test('platoon SIDC follows mobility and branch', () => {
   assert.equal(S.platoonSidc({ mobility: 'dismounted' }), S.SIDC.dismounted);
   assert.equal(S.platoonSidc({ mobility: 'mounted', designator: '1/B/3-21IN' }), S.SIDC.motorized);
-  assert.equal(S.platoonSidc({ mobility: 'mounted', designator: '1/A/5-86AR' }), S.SIDC.mechanized);
-  assert.equal(S.platoonSidc({ mobility: 'mounted', unitName: '2nd PLT, B TRP, 4-98 CAV' }), S.SIDC.mechanized);
+  assert.equal(S.platoonSidc({ mobility: 'mounted', vehicle: 'tracked', designator: '1/B/3-21IN' }), S.SIDC.mechanized);
+  // the branch picks the 2525D entity (armor, reconnaissance / cavalry, engineer, field artillery),
+  // whether the platoon is mounted, dismounted or fixed today
+  assert.equal(S.platoonSidc({ mobility: 'mounted', designator: '1/A/5-86AR' }), S.SIDC.armor);
+  assert.equal(S.SIDC.armor, '10031000141205000000');
+  assert.equal(S.platoonSidc({ mobility: 'mounted', unitName: '2nd PLT, B TRP, 4-98 CAV' }), S.SIDC.cavalry);
+  assert.equal(S.platoonSidc({ mobility: 'dismounted', unitName: '2nd PLT, B TRP, 4-98 CAV' }), '10031000141213000000');
+  assert.equal(S.platoonSidc({ mobility: 'mounted', designator: '3/C/2-12EN' }), '10031000141407000000');
+  assert.equal(S.platoonSidc({ mobility: 'fixed', designator: '1/A/3-20FA' }), '10031000141303000000');
+  assert.equal(S.branchOf({ designator: '1/B/3-21IN' }), 'IN');
+  assert.equal(S.branchOf({ unitName: 'Support platoon' }), null);
   assert.equal(S.platoonSidc({ mobility: 'fixed' }), S.SIDC.dismounted);
   assert.equal(S.platoonSidc({ mobility: 'fixed', baseMobility: 'mounted', designator: '1/B/3-21IN' }), S.SIDC.motorized);
   assert.equal(S.shortCallsign('Charlie-2'), 'C-2');

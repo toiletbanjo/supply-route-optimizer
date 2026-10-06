@@ -11,8 +11,10 @@
 //       of the truck's color, a heading pointer and a callsign label in the truck's color.
 //   symbols.rally(point, { used, pinned, banned, theme })      -> L.divIcon (Logistics Release Point)
 //   symbols.svg(sidc, { size, uniqueDesignation, theme, ... }) -> inline SVG string for lists / cards
+//   symbols.refreshInline(rootEl?, theme?) -> count: draws the inline symbols again (theme change)
 //   symbols.render(sidc, opts) -> { svg, width, height, anchor: { x, y } } (cached by key)
-//   symbols.platoonSidc(requestOrProfile), symbols.urgencyColor(urgency, theme), symbols.setTheme(theme)
+//   symbols.platoonSidc(requestOrProfile) (branch AR / CAV / EN / FA from the designator, else
+//       infantry by mobility), symbols.branchOf(p), symbols.urgencyColor(urgency, theme), symbols.setTheme(theme)
 // Every icon uses milsymbol's getAnchor() for iconAnchor. Rendered SVG strings are cached by key.
 (function (root) {
   'use strict';
@@ -24,6 +26,10 @@
     dismounted: '10031000141211000000',    // infantry platoon
     mechanized: '10031000141211020000',    // infantry, armored / mechanized / tracked, platoon
     motorized: '10031000141211040000',     // infantry, motorized, platoon
+    armor: '10031000141205000000',         // armor / armored / mechanized / self-propelled / tracked, platoon
+    cavalry: '10031000141213000000',       // reconnaissance / cavalry / scout, platoon
+    engineer: '10031000141407000000',      // engineer, platoon
+    artillery: '10031000141303000000',     // field artillery, platoon
     hub: 'SFGPUSS---H----',                // supply unit with installation indicator (2525C; same drawing as 2525E)
     cargo: '10031500001401000000',         // utility vehicle
     tanker: '10031500001409000000',        // petroleum, oil and lubricants vehicle
@@ -126,23 +132,62 @@
 
   S.isValid = function (sidc) { return S.render(sidc, { size: 20, infoFields: false }).valid; };
 
-  // Small inline symbol for lists / cards.
+  // Small inline symbol for lists / cards. The span keeps its SIDC and options (data-sidc, data-sym)
+  // so S.refreshInline() can draw it again in a new theme: a symbol drawn in the dark or light style
+  // and only filtered red at night reads as a red-filled (hostile) frame.
+  const INLINE_KEYS = ['size', 'uniqueDesignation', 'higherFormation', 'additionalInformation', 'infoFields', 'control'];
+  function inlineHtml(sidc, o) {
+    const r = S.render(sidc, o);
+    const keep = {};
+    INLINE_KEYS.forEach(function (k) { if (o[k] !== undefined) keep[k] = o[k]; });
+    const cls = 'sro-sym-inline' + (o.className ? ' ' + o.className : '');
+    return { width: r.width, height: r.height, svg: r.svg, html: '<span class="' + cls + '" style="width:' + r.width + 'px;height:' + r.height + 'px" role="img" aria-label="' + esc(o.label || 'symbol') +
+      '" data-sidc="' + esc(sidc) + '" data-sym="' + esc(JSON.stringify(keep)) + '">' + r.svg + '</span>' };
+  }
   S.svg = function (sidc, opts) {
     const o = Object.assign({ size: 18, control: sidc === S.SIDC.rally }, opts || {});
     S.ensureStyles();
-    const r = S.render(sidc, o);
-    const cls = 'sro-sym-inline' + (o.className ? ' ' + o.className : '');
-    return '<span class="' + cls + '" style="width:' + r.width + 'px;height:' + r.height + 'px" role="img" aria-label="' + esc(o.label || 'symbol') + '">' + r.svg + '</span>';
+    return inlineHtml(sidc, o).html;
+  };
+  // Draw every inline symbol under root again in the current (or given) theme; the shell calls it
+  // when the theme changes.
+  S.refreshInline = function (rootEl, theme) {
+    const scope = rootEl || (root.document && root.document.body);
+    if (!scope || !scope.querySelectorAll) return 0;
+    let n = 0;
+    Array.prototype.forEach.call(scope.querySelectorAll('.sro-sym-inline[data-sidc]'), function (el) {
+      let o = {};
+      try { o = JSON.parse(el.getAttribute('data-sym') || '{}') || {}; } catch (e) { o = {}; }
+      if (theme) o.theme = theme;
+      try {
+        const x = inlineHtml(el.getAttribute('data-sidc'), o);
+        el.innerHTML = x.svg;
+        el.style.width = x.width + 'px';
+        el.style.height = x.height + 'px';
+        n++;
+      } catch (e) { /* milsymbol missing: keep the old drawing */ }
+    });
+    return n;
   };
 
   // ---- platoons ---------------------------------------------------------------------------------
+  // The branch at the end of the designator or unit name ('2/B/5-86AR', '1st PLT, B TRP, 4-98 CAV')
+  // picks the 2525D entity: AR armor, CAV reconnaissance / cavalry, EN engineer, FA field artillery.
+  // Infantry (IN, or no branch) shows how it moves: dismounted, mechanized (tracked) or motorized.
   // Fixed-in-place uses the unit's own mounted / dismounted SIDC ("fixed" shows as a label).
+  const BRANCH_SIDC = { AR: 'armor', CAV: 'cavalry', EN: 'engineer', FA: 'artillery' };
+  S.branchOf = function (p) {
+    const m = /(?:\d|\s)(IN|AR|CAV|EN|FA)$/i.exec(String((p && (p.designator || p.unitName)) || '').trim());
+    return m ? m[1].toUpperCase() : null;
+  };
   S.platoonSidc = function (p) {
     p = p || {};
+    const branch = S.branchOf(p);
+    if (BRANCH_SIDC[branch]) return S.SIDC[BRANCH_SIDC[branch]];
     let mob = p.mobility || 'mounted';
     if (mob === 'fixed') mob = p.baseMobility || p.profileMobility || 'dismounted';
     if (mob === 'dismounted') return S.SIDC.dismounted;
-    if (p.vehicle === 'tracked' || /(?:\d|\s)(AR|CAV)$/i.test(String(p.designator || p.unitName || '').trim())) return S.SIDC.mechanized;
+    if (p.vehicle === 'tracked') return S.SIDC.mechanized;
     return S.SIDC.motorized;
   };
   function designatorOf(p) {
