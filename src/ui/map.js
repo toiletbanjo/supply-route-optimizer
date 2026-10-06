@@ -1,7 +1,7 @@
 // Shared Leaflet map component for both roles (DESIGN.md sections 6 and 8).
 //
 //   const m = SRO.ui.map.create(el, { theme, tiles: true, compact: false, controls: true, scale: true })
-//   m.setZones(zones)                         closed = gray hatching + red outline; risk = amber..red fill + rating label
+//   m.setZones(zones)                         closed = gray hatching + red outline; risk = amber..red fill + rating label (none on compact maps)
 //   m.setHubs(hubs, { labels })               2525 supply installation symbols; the names (labels: false = none)
 //                                             draw above the platoon symbols
 //   m.setRally(points, { walkRingMi })        [{ id|gridId, lat, lon, label, used, pinned, banned, walkRingMi }]
@@ -185,7 +185,7 @@
     '.sro-map.leaflet-container{background:var(--sro-sea);font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}',
     '.sro-map[data-sro-theme="dark"]{--sro-sea:#0a0f13;--sro-ctl-bg:#161d23;--sro-ctl-bg2:#1e272f;--sro-ctl-fg:#e3e8ec;--sro-ctl-muted:#8e9aa5;--sro-ctl-border:#2b3640;--sro-accent:#6fbf8a;--sro-sel:#e8ecef;--sro-sel-gap:#0a0f13;--sro-badge-bg:#e8ecef;--sro-badge-fg:#0b1014;--sro-label-bg:rgba(10,15,19,.82)}',
     '.sro-map[data-sro-theme="light"]{--sro-sea:#c8d8e2;--sro-ctl-bg:#ffffff;--sro-ctl-bg2:#f2f4f6;--sro-ctl-fg:#1b2329;--sro-ctl-muted:#5c6973;--sro-ctl-border:#cfd6dc;--sro-accent:#2f7d4f;--sro-sel:#1b2329;--sro-sel-gap:#ffffff;--sro-badge-bg:#1b2329;--sro-badge-fg:#ffffff;--sro-label-bg:rgba(255,255,255,.88)}',
-    '.sro-map[data-sro-theme="night"]{--sro-sea:#000000;--sro-ctl-bg:#0a0303;--sro-ctl-bg2:#140505;--sro-ctl-fg:#b8342d;--sro-ctl-muted:#7a2420;--sro-ctl-border:#3a100e;--sro-accent:#b8342d;--sro-sel:#c23a32;--sro-sel-gap:#000000;--sro-label-bg:rgba(0,0,0,.85)}',
+    '.sro-map[data-sro-theme="night"]{--sro-sea:#000000;--sro-ctl-bg:#0a0303;--sro-ctl-bg2:#140505;--sro-ctl-fg:#b8342d;--sro-ctl-muted:#a8443c;--sro-ctl-border:#3a100e;--sro-accent:#b8342d;--sro-sel:#c23a32;--sro-sel-gap:#000000;--sro-label-bg:rgba(0,0,0,.85)}',
     // tiles: dimmed / tinted per theme (light discipline at night)
     '.sro-map[data-sro-theme="dark"] .sro-tiles{filter:invert(1) hue-rotate(180deg) brightness(.9) contrast(.85) saturate(.45)}',
     '.sro-map[data-sro-theme="night"] .sro-tiles{filter:invert(1) grayscale(1) brightness(.42) sepia(1) hue-rotate(-50deg) saturate(5) contrast(1.1)}',
@@ -659,6 +659,9 @@
         });
         circle.on('click', function (e) { if (!drawing) emit('click:zone', { zone: z, lat: e.latlng.lat, lon: e.latlng.lng }); });
         circle.addTo(groups.zones);
+        // no text label on compact maps: it lands on the truck or the credits there, and the key under
+        // the card map already names closed areas
+        if (opts.compact) return;
         const text = closed ? 'Closed' + (z.label ? ' · ' + z.label : '') : 'Risk · ' + (z.rating || 'Medium') + (z.label ? ' · ' + z.label : '');
         const top = SRO.core.geo.destination({ lat: c[0], lon: c[1] }, 0, z.radiusMi);
         const lm = L.marker([top.lat, top.lon], {

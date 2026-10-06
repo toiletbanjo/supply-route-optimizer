@@ -722,7 +722,7 @@
         });
         setHrs();
         box.appendChild(row = h('div.psg-onhand-row' + (missing ? '.is-invalid' : ''), { 'data-line': String(i) },
-          h('div.psg-onhand-name', h('span.truncate', psg.lineTitle(line)), h('span.small.muted', isNum(rate) ? 'typical ' + qtyText(rate, line.unit) + ' a day' : 'no typical rate')),
+          h('div.psg-onhand-name', h('span.psg-onhand-title', psg.lineTitle(line)), h('span.small.muted', isNum(rate) ? 'typical ' + qtyText(rate, line.unit) + ' a day' : 'no typical rate')),
           h('div.psg-qty-row', stp.el, h('span.psg-unit', CH().unitLabel(line.unit, 2))),
           hrsEl));
       });
