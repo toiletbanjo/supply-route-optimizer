@@ -1206,6 +1206,20 @@ async function main() {
       });
       check('night theme recolors map (coast, casing, zones, background)', night.attr === 'night' && night.coastFill === '#0d0404' && night.casing === '#000000' && night.zoneStroke === '#c0302a' && night.bg === 'rgb(0, 0, 0)', night);
       check('night symbols drawn in dim red, no white', night.red && !night.whiteInSymbols, night);
+      // map controls in muted red (inactive base map button, offline note) stay at least 3:1 at night
+      await helpers(page);
+      const nightCtl = await page.evaluate(() => {
+        const out = [];
+        document.querySelectorAll('#map .sro-basemap button, #map .sro-note').forEach((e) => {
+          if (!e.getClientRects().length) return;
+          const cs = getComputedStyle(e);
+          let bg = cs.backgroundColor, p = e;
+          while (p && /rgba\(\d+, \d+, \d+, 0\)|transparent/.test(bg)) { p = p.parentElement; bg = p ? getComputedStyle(p).backgroundColor : 'rgb(0, 0, 0)'; }
+          out.push([e.className || e.textContent.trim(), +__contrast(cs.color, bg).toFixed(2)]);
+        });
+        return out;
+      });
+      check('night: base map buttons and map note at least 3:1', nightCtl.length >= 2 && nightCtl.every((c) => c[1] >= 3), nightCtl);
       // inline symbols (unit strip, unit card, card map key) are drawn again in the night style: an
       // unfilled dim red frame, not the friendly blue fill filtered to red (red fill reads as hostile)
       const inl = await page.evaluate(() => {
@@ -1292,6 +1306,9 @@ async function main() {
       await page.waitForTimeout(300);
       const mini = await page.evaluate(() => ({ basemapCtl: !!document.querySelector('.sro-basemap'), scale: !!document.querySelector('.leaflet-control-scale'), trucks: document.querySelectorAll('.sro-icon-truck').length, w: document.getElementById('map').clientWidth }));
       check('compact map: no basemap/scale controls, trucks shown', !mini.basemapCtl && !mini.scale && mini.trucks === 4, mini);
+      // zones are drawn, but without text labels (they landed on the truck label and the credits)
+      const miniZones = await page.evaluate(() => ({ zones: document.querySelectorAll('#map .sro-pane-zones path.sro-zone').length, labels: document.querySelectorAll('#map .sro-zone-label').length }));
+      check('compact map: zones drawn, no zone labels', miniZones.zones > 0 && miniZones.labels === 0, miniZones);
       await page.screenshot({ path: path.join(OUT, 'phone-mini-dark.png') });
       await page.evaluate(() => H.map.setTheme('night'));
       await page.screenshot({ path: path.join(OUT, 'phone-mini-night.png') });

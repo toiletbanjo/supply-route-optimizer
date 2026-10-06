@@ -461,6 +461,9 @@ async function runFlow(browser, fileUrl, vp) {
   await act.tap('.modal [data-action="add-item"]');
   await act.tap(V('request') + ' .psg-choice[data-urgency="Urgent"]');
   check(await visible(page, V('request') + ' .psg-onhand-row[data-line="0"]'), 'Urgent asks for on hand per line');
+  // the line title wraps (a long ammunition title at 320px keeps its calibre instead of an ellipsis)
+  const ohTitle = await page.$eval(V('request') + ' .psg-onhand-row[data-line="0"] .psg-onhand-name > :first-child', (e) => { const cs = getComputedStyle(e); return { ws: cs.whiteSpace, to: cs.textOverflow, fits: e.scrollWidth <= e.clientWidth + 1 }; });
+  check(ohTitle.ws !== 'nowrap' && ohTitle.to !== 'ellipsis' && ohTitle.fits, 'on-hand line title wraps, no ellipsis', ohTitle);
   const before2 = (await S(page)).requests.length;
   await act.tap(V('request') + ' .psg-submit');
   check(await visible(page, V('request') + ' .psg-errors'), 'Urgent without on hand: errors shown');
@@ -863,6 +866,7 @@ async function runFlow(browser, fileUrl, vp) {
   }, plan.plan);
   await settle(page);
   check(!!zid && await count(page, c1 + ' .psg-map-track path.sro-zone-closed') === 1, 'card map draws a closed area', zid);
+  check(await count(page, c1 + ' .psg-map-track .sro-zone-label') === 0, 'card map: no closed-area text label (the key names it)');
   check((await text(page, c1 + ' .psg-map-key')).includes('Closed area'), 'card map key adds "Closed area"', await text(page, c1 + ' .psg-map-key'));
   await page.evaluate((id) => window.SRO.app.store.dispatch({ type: 'zone/remove', id }), zid);
   await settle(page);

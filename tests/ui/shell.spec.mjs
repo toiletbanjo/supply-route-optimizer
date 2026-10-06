@@ -389,6 +389,7 @@ async function runViewport(browser, fileUrl, vp) {
     check(!(await visible(page, '#topbar .tb-speed')), 'speed control moves into the clock sheet on phones');
     const tagPh = await notionalTag(page);
     check(tagPh.shown && /notional/i.test(tagPh.text) && tagPh.inside && !tagPh.hit.length, 'NOTIONAL tag stays on phones, clear of the top bar buttons (' + JSON.stringify(tagPh) + ')');
+    check(tagPh.clearOfContent, 'NOTIONAL tag sits above the scrolling content on phones (' + JSON.stringify(tagPh) + ')');
   } else {
     check(await visible(page, '#topbar .tb-speed'), 'speed control visible in the top bar');
   }
@@ -794,7 +795,10 @@ async function notionalTag(page) {
       const q = b.getBoundingClientRect();
       return r.left < q.right - 0.5 && q.left < r.right - 0.5 && r.top < q.bottom - 0.5 && q.top < r.bottom - 0.5;
     }).map((b) => b.className || b.textContent);
-    return { shown: cs.visibility !== 'hidden' && cs.opacity !== '0' && r.width > 20, text: t.textContent.trim(), inside: r.left >= 0 && r.right <= innerWidth && r.top >= 0, hit };
+    // the tag hangs below the bar: it must stay above the role views' content box (no text scrolls under it)
+    const app = document.querySelector('#app');
+    const contentTop = app.getBoundingClientRect().top + parseFloat(getComputedStyle(app).paddingTop);
+    return { shown: cs.visibility !== 'hidden' && cs.opacity !== '0' && r.width > 20, text: t.textContent.trim(), inside: r.left >= 0 && r.right <= innerWidth && r.top >= 0, hit, clearOfContent: r.bottom <= contentTop + 0.5 };
   });
 }
 
@@ -812,8 +816,17 @@ async function edgeCases(browser, fileUrl) {
       check(f.bad.length === 0, role + ': every top bar button is inside the screen and >= 44px' + (f.bad.length ? ' (' + f.bad.join(', ') + ')' : ''));
       const tag320 = await notionalTag(page);
       check(tag320.shown && /notional/i.test(tag320.text) && tag320.inside && !tag320.hit.length, role + ': NOTIONAL tag shown at 320px, clear of the top bar buttons (' + JSON.stringify(tag320) + ')');
+      check(tag320.clearOfContent, role + ': NOTIONAL tag sits above the scrolling content, not over it (' + JSON.stringify(tag320) + ')');
       await page.screenshot({ path: path.join(SHOTS, '320x568-dark-' + role + '.png') });
     }
+    // a switch (planner knobs, force direct) is a 44px tall touch target on phones
+    const sw = await page.evaluate(() => {
+      const i = document.createElement('input'); i.type = 'checkbox'; i.className = 'switch';
+      document.querySelector('#planner-root').appendChild(i);
+      const r = i.getBoundingClientRect(); i.remove();
+      return { w: Math.round(r.width), h: Math.round(r.height) };
+    });
+    check(sw.w >= 44 && sw.h >= 44, 'input.switch is at least 44x44 at 320px (' + sw.w + 'x' + sw.h + ')');
     // planner bottom tabs by touch
     await page.tap('#planner-root .planner-tabbar .tabbar-item[data-tab="map"]');
     await settle(page);
