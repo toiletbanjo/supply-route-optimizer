@@ -24,8 +24,17 @@
   const TRUCK_TYPES = ['tanker', 'cargo'];
   const DEFAULT_CAPACITY = { tanker: 2500, cargo: 10 };
   const METHODS = ['tabu', 'sa', 'aco', 'mip'];
-  // Fallback truck palette (8 colours readable on dark, light and night themes).
-  store.TRUCK_COLORS = ['#4C9AFF', '#F5A623', '#36B37E', '#E55BB0', '#00B8D9', '#FF7452', '#C9B400', '#9F7AEA'];
+  // Truck colors come from SRO.data.scenario.truckColors only (DESIGN.md section 8b); entries are
+  // { hex, name } or plain '#hex'. Without scenario.js (some Node tests) every truck gets one neutral
+  // gray rather than a second palette.
+  const NO_PALETTE_COLOR = '#7A8793';
+  store.truckPalette = function () {
+    const sc = SRO.data && SRO.data.scenario;
+    const list = sc && Array.isArray(sc.truckColors) ? sc.truckColors : [];
+    return list.map(function (c) { return typeof c === 'string' ? c : (c && c.hex) || null; }).filter(Boolean);
+  };
+  // Read-only alias kept for older callers.
+  Object.defineProperty(store, 'TRUCK_COLORS', { get: function () { return store.truckPalette(); }, enumerable: true, configurable: true });
 
   // ---- small helpers -------------------------------------------------------------------------
   function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
@@ -349,13 +358,10 @@
       sc.fleet.forEach(function (t) { const m = re.exec(t.id); if (m) max = Math.max(max, parseInt(m[1], 10)); });
       id = prefix + '-' + (max + 1);
     }
-    const scData = (SRO.data && SRO.data.scenario) || {};
-    // scenario.js palette entries are { hex, name }; plain '#hex' strings work too.
-    const palette = (Array.isArray(scData.truckColors) && scData.truckColors.length ? scData.truckColors : store.TRUCK_COLORS)
-      .map(function (c) { return typeof c === 'string' ? c : (c && c.hex) || null; })
-      .filter(Boolean);
+    const palette = store.truckPalette();
     const used = sc.fleet.map(function (t) { return t.color; });
-    const color = t0.color || palette.find(function (c) { return used.indexOf(c) < 0; }) || palette[sc.fleet.length % palette.length];
+    const color = t0.color || palette.find(function (c) { return used.indexOf(c) < 0; }) ||
+      (palette.length ? palette[sc.fleet.length % palette.length] : NO_PALETTE_COLOR);
     const hubMate = sc.fleet.find(function (t) { return t.hubId === t0.hubId && t.freq; });
     return Object.assign({}, clone(t0), {
       id: id, hubId: t0.hubId, type: type,
@@ -568,14 +574,28 @@
   };
 
   // { planId } approves a plan: it becomes the window's movement schedule, supersedes the
-  // window's (or its parent's) earlier approved plan, sets request statuses and sends trucks out.
+  // window's (or its parent's) earlier approved plan (not one listed in plan.builtOn, see below),
+  // sets request statuses and sends trucks out.
   H['plan/approve'] = function (s, a) {
     const id = arg(a, ['planId', 'id']);
     const plan = s.plans.find(function (p) { return p.id === id; });
     if (!plan) return fail(s, 'Plan ' + id + ' was not found.');
     if (plan.approved) return ok(s, { id: id });
     const now = nowOf(s, a);
-    const prev = s.plans.find(function (p) { return p.id !== id && p.approved && (p.id === plan.parentPlanId || p.windowId === plan.windowId); }) || null;
+    // plan.builtOn (planner engine): approved plans that were live when this plan was made. Their
+    // deliveries were left out of it (it covers only requests they left open), so they stay approved,
+    // and so do re-plans of them. Without this, a second batch planned in the same window would
+    // supersede the first batch's movement schedule.
+    const builtOn = Array.isArray(plan.builtOn) ? plan.builtOn : [];
+    function onTopOf(p) {
+      for (let x = p, n = 0; x && n < 100; n++) {
+        if (builtOn.indexOf(x.id) >= 0) return true;
+        const pid = x.parentPlanId;
+        x = pid ? s.plans.find(function (q) { return q.id === pid; }) : null;
+      }
+      return false;
+    }
+    const prev = s.plans.find(function (p) { return p.id !== id && p.approved && (p.id === plan.parentPlanId || (p.windowId === plan.windowId && !onTopOf(p))); }) || null;
     const plans = s.plans.map(function (p) {
       if (p.id === id) return Object.assign({}, p, { approved: true, approvedAt: now, superseded: false, supersededBy: null });
       if (prev && p.id === prev.id) return Object.assign({}, p, { approved: false, superseded: true, supersededBy: id });

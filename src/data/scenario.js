@@ -12,7 +12,9 @@
 //     fuel) and <Callsign>-2 (cargo, 10 pallets). Each truck has its own notional VHF frequency.
 //   - Truck colors: 8 mid-luminance colors (WCAG contrast >= 3:1 on both black and white, so they read
 //     on dark, light and red-night themes). Red, orange, yellow and gray are left out on purpose:
-//     those are the urgency ring colors.
+//     those are the urgency ring colors. Brown is a lighter, redder #B0765E (was #A86B2A, which sat
+//     close to the night theme's orange urgency rings and was dim on the dark map): about 4.5:1 on
+//     the dark map, 3:1 under the night filter, and well apart from the urgency and truck colors.
 //   - Unit names are real-format but invented. They may coincide with a real unit by chance; no real
 //     unit, location or operational data is used.
 (function (root) {
@@ -38,7 +40,7 @@
     { hex: '#3F9A2E', name: 'Green' },
     { hex: '#8E5AD8', name: 'Purple' },
     { hex: '#C9359A', name: 'Magenta' },
-    { hex: '#A86B2A', name: 'Brown' },
+    { hex: '#B0765E', name: 'Brown' },
     { hex: '#1C9BC7', name: 'Sky' },
     { hex: '#7E8C1C', name: 'Olive' }
   ];

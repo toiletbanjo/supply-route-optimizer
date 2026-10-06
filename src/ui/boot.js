@@ -73,7 +73,13 @@
     SRO.app = app;
     if (root.SRO !== SRO) root.SRO = SRO;
 
-    // modules that want the store before the first render (e.g. the planner engine)
+    // planner engine (DESIGN.md 8b): store wiring, automatic planning, the solver worker (lazy)
+    const engine = SRO.core && SRO.core.engine;
+    if (engine && typeof engine.init === 'function') {
+      try { app.engine = engine.init(store); } catch (e) { if (root.console) root.console.error('Planner engine failed to start', e); }
+    }
+
+    // modules that want the store before the first render
     if (typeof ui._runBootHooks === 'function') ui._runBootHooks(app);
 
     if (!ui.shell || typeof ui.shell.mount !== 'function') { fatal('The app shell (src/ui/shell.js) is missing.'); return app; }

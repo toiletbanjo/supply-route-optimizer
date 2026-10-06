@@ -1,7 +1,33 @@
-// Travel network between grid points (DESIGN.md section 5): base travel matrix (Google or
-// estimate), closed-zone rerouting with Floyd-Warshall, risk units, grid paths, off-grid legs.
-// Runs on the main thread; pure (no DOM). Convoy factor is NOT applied here: minutes are base
-// drive minutes and the solver-instance builder multiplies by settings.convoyFactor.
+// Travel network between grid points (DESIGN.md section 5): base travel matrix, closed-zone
+// rerouting, risk units, grid paths, off-grid legs. Runs on the main thread; pure (no DOM).
+// Convoy factor is NOT applied here: minutes are base drive minutes and the solver-instance
+// builder multiplies by settings.convoyFactor.
+//
+// ---- Time source order (net.source) ------------------------------------------------------
+//   1. 'matrix'    an external time matrix (src/data/time_matrix.json), see below.
+//   2. 'osm-roads' (default when SRO.core.roads and its road graph are loaded): minutes and miles
+//                  of the road-graph route between the two points, via SRO.core.roads.matrix().
+//                  Closed zones are passed to the router as blocked circles, so detours follow
+//                  real roads; no road route = Infinity. Risk units = miles of the drawn road path
+//                  inside each risk circle x its rating value. A pair whose point is more than 5 km
+//                  from any road falls back to the estimate below for that pair only.
+//   3. 'estimate'  shortest path over grid_links.json (haversine x road factor at road speeds),
+//                  closed zones remove links (Floyd-Warshall reroute). Used when the road graph is
+//                  missing, or when opts.source === 'estimate'.
+//
+//   network.build(opts)            grid x grid network (see the build section at the end).
+//   network.pointMatrix(points, opts)
+//        Travel between arbitrary points (hubs, rally points, platoon locations), used by the
+//        planner engine. points: [{ lat, lon, gridId?, onGrid? }] (onGrid: the point IS that grid
+//        point). opts: { zones, riskRatings, source: 'auto' | 'osm-roads' | 'estimate', grid, links,
+//        timeMatrix, cache }.
+//        -> { n, source: 'osm-roads' | 'estimate' | 'matrix', counts: { 'osm-roads', estimate,
+//             unreachable }, minutes[][], miles[][], riskUnits[][] (base minutes; Infinity when
+//             unreachable), sources[i][j] ('osm-roads' | 'estimate' | 'matrix' | null when
+//             unreachable), reachable(i, j), path(i, j) -> { coords: [[lat, lon]...], source,
+//             approximate, unreachable? }, gridPath(i, j) -> [gridId], elapsedMs, zonesKey,
+//             warnings }. Cached (last 4) by points + zone content; treat results as read-only.
+//   network.roadsAvailable()       true when the OSM road graph can route.
 //
 // ---- External time matrix (src/data/time_matrix.json -> SRO.data.time_matrix) -------------
 // DESIGN.md section 5 (revised 2026-10-05): an optional external matrix (OSRM, or Google if its
@@ -17,8 +43,7 @@
 // A null, negative or missing entry in "minutes" means no route was returned; that pair falls
 // back to the link-graph estimate (Infinity when the link graph cannot connect it either). Grid
 // points missing from ids also use the estimate. `estimatedPairs` counts such pairs.
-// net.source is 'matrix' when such a file is used, else 'estimate'. (The 'osm-roads' source of
-// the revised DESIGN, routed on roads_graph.json, is not wired in yet.)
+// net.source is 'matrix' when such a file is used (it wins over 'osm-roads', DESIGN section 5).
 //
 // ---- Road paths (optional) ---------------------------------------------------------------
 // roadPaths is an object keyed 'gridIdA|gridIdB' (the reverse key is used reversed) or a
@@ -478,12 +503,288 @@
     return base;
   }
 
-  // build({ grid, links, timeMatrix, zones, riskRatings, roadPaths, cache })
+  // ---- OSM road matrix between arbitrary points (source 'osm-roads') ----------------------------
+  network.SNAP_MAX_M = 5000;            // farther from every road: that pair uses the estimate
+  network.roadsAvailable = function () {
+    const R = SRO.core.roads;
+    if (!R || typeof R.matrix !== 'function') return false;
+    try { return typeof R.available === 'function' ? !!R.available() : true; } catch (e) { return false; }
+  };
+
+  function normPoint(p) {
+    if (Array.isArray(p)) return { lat: +p[0], lon: +p[1], gridId: null, onGrid: false };
+    const lon = p && p.lon !== undefined ? p.lon : p && p.lng;
+    return { lat: +(p && p.lat), lon: +lon, gridId: p && p.gridId != null ? String(p.gridId) : null, onGrid: !!(p && p.onGrid) };
+  }
+  function r5(x) { return Math.round(x * 1e5) / 1e5; }
+  function pointsKey(pts) {
+    return pts.map(function (p) { return r5(p.lat) + ',' + r5(p.lon) + (p.onGrid ? '@' + p.gridId : ''); }).join(';');
+  }
+  const pmCache = [];
+  const PM_CACHE_MAX = 4;
+  function uniqIds(list) {
+    const out = [];
+    list.forEach(function (x) { if (x != null && out.indexOf(x) < 0) out.push(x); });
+    return out;
+  }
+
+  // Estimate-network endpoint for a point: its grid id when the point is that grid point, else the
+  // point itself (net.between adds the off-grid leg).
+  function endpointFor(net, p) {
+    if (p.onGrid && p.gridId != null && net.index[p.gridId] !== undefined) return p.gridId;
+    return { lat: p.lat, lon: p.lon, gridId: p.gridId || undefined };
+  }
+  function estimateCoords(net, pa, pb, gridPath) {
+    const byId = net.gridById || (net.gridById = (function () {
+      const m = {};
+      ((SRO.data && SRO.data.grid) || []).forEach(function (g) { m[g.id] = g; });
+      return m;
+    })());
+    const out = [[pa.lat, pa.lon]];
+    (gridPath || []).forEach(function (id) {
+      const g = byId[id];
+      if (!g) return;
+      const q = out[out.length - 1];
+      if (q[0] !== g.lat || q[1] !== g.lon) out.push([g.lat, g.lon]);
+    });
+    const q = out[out.length - 1];
+    if (q[0] !== pb.lat || q[1] !== pb.lon) out.push([pb.lat, pb.lon]);
+    if (out.length === 1) out.push(out[0].slice());
+    return out;
+  }
+
+  function estimatePointMatrix(pts, o, riskRatings) {
+    const net = network.build(Object.assign({}, o, { source: 'estimate', riskRatings: riskRatings }));
+    const n = pts.length;
+    const minutes = matrix(n, Infinity), miles = matrix(n, Infinity), riskUnits = matrix(n, Infinity), sources = matrix(n, null);
+    const gp = new Array(n * n);
+    const ends = pts.map(function (p) { return endpointFor(net, p); });
+    let unreachable = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        if (i === j) { minutes[i][j] = 0; miles[i][j] = 0; riskUnits[i][j] = 0; sources[i][j] = net.source; gp[i * n + j] = uniqIds([pts[i].gridId]); continue; }
+        const r = net.between(ends[i], ends[j]);
+        if (!(r.minutes < Infinity)) { unreachable++; gp[i * n + j] = []; continue; }
+        minutes[i][j] = r.minutes; miles[i][j] = r.miles; riskUnits[i][j] = r.riskUnits;
+        sources[i][j] = net.source;
+        gp[i * n + j] = r.gridPath.slice();
+      }
+    }
+    const counts = { 'osm-roads': 0, estimate: 0, matrix: 0, unreachable: unreachable };
+    counts[net.source] = n * (n - 1) - unreachable;
+    return {
+      n: n, points: pts, source: net.source, counts: counts,
+      minutes: minutes, miles: miles, riskUnits: riskUnits, sources: sources,
+      reachable: function (i, j) { return minutes[i][j] < Infinity; },
+      gridPath: function (i, j) { return (gp[i * n + j] || []).slice(); },
+      path: function (i, j) {
+        const ok = minutes[i][j] < Infinity;
+        const coords = ok ? estimateCoords(net, pts[i], pts[j], gp[i * n + j]) : [[pts[i].lat, pts[i].lon], [pts[j].lat, pts[j].lon]];
+        return { coords: coords, source: ok ? net.source : 'straight', approximate: true, unreachable: !ok };
+      },
+      warnings: net.warnings.slice()
+    };
+  }
+
+  // geo.polylineMilesInCircle with a bounding-box reject per segment (road paths have hundreds of
+  // vertices, nearly all far from the circle). coords are [lat, lon] pairs.
+  function milesInCircle(G, coords, rz, box) {
+    let total = 0;
+    for (let k = 1; k < coords.length; k++) {
+      const a = coords[k - 1], b = coords[k];
+      if ((a[0] < box[0] && b[0] < box[0]) || (a[0] > box[1] && b[0] > box[1]) ||
+          (a[1] < box[2] && b[1] < box[2]) || (a[1] > box[3] && b[1] > box[3])) continue;
+      total += G.segmentCircleMiles(a, b, rz, rz.radiusMi);
+    }
+    return total;
+  }
+  network._milesInCircle = function (coords, circle) {
+    const G = geo();
+    const dLat = circle.radiusMi / G.MI_PER_DEG_LAT * 1.02, dLon = dLat / Math.max(0.01, Math.cos(circle.lat * Math.PI / 180));
+    return milesInCircle(G, coords, circle, [circle.lat - dLat, circle.lat + dLat, circle.lon - dLon, circle.lon + dLon]);
+  };
+
+  // SRO.core.roads.matrix for these points and closed circles; the last two are kept so a change to
+  // risk zones only (no closure change) reuses the Dijkstra work.
+  const rmCache = [];
+  function roadMatrix(R, pts, closed) {
+    const key = pointsKey(pts) + '|' + R.closedKey(closed) + '|' + (R.graph && R.graph() ? 'g' : '-');
+    for (let k = 0; k < rmCache.length; k++) if (rmCache[k].key === key) return rmCache[k].m;
+    const m = R.matrix(pts.map(function (p) { return [p.lat, p.lon]; }), { closed: closed });
+    rmCache.unshift({ key: key, m: m });
+    if (rmCache.length > 2) rmCache.pop();
+    return m;
+  }
+
+  function roadPointMatrix(pts, o, riskRatings) {
+    const G = geo(), R = SRO.core.roads;
+    const z = splitZones(o.zones, riskRatings);
+    const n = pts.length;
+    const m = roadMatrix(R, pts, z.closed);
+    let est = null;
+    function estNet() { return est || (est = network.build(Object.assign({}, o, { source: 'estimate', riskRatings: riskRatings }))); }
+    const minutes = matrix(n, Infinity), miles = matrix(n, Infinity), riskUnits = matrix(n, Infinity), sources = matrix(n, null);
+    const estGp = new Map();
+    const counts = { 'osm-roads': 0, estimate: 0, matrix: 0, unreachable: 0 };
+    const kind = new Uint8Array(n * n);      // 1 road route, 2 estimate, 0 unreachable
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        if (i === j) { minutes[i][j] = 0; miles[i][j] = 0; riskUnits[i][j] = 0; sources[i][j] = 'osm-roads'; kind[i * n + j] = 1; continue; }
+        if (m.sources[i][j] === 'osm-roads' && m.reachable[i][j]) {
+          minutes[i][j] = m.minutes[i][j]; miles[i][j] = m.miles[i][j]; riskUnits[i][j] = 0;
+          sources[i][j] = 'osm-roads'; kind[i * n + j] = 1; counts['osm-roads']++;
+          continue;
+        }
+        const r = m.result(i, j);
+        if (r && r.reason === 'no-route') { counts.unreachable++; continue; }   // closures cut every road route
+        // a point far from the road graph (or no graph): this pair uses the link-graph estimate
+        const e = estNet().between(endpointFor(estNet(), pts[i]), endpointFor(estNet(), pts[j]));
+        if (!(e.minutes < Infinity)) { counts.unreachable++; continue; }
+        minutes[i][j] = e.minutes; miles[i][j] = e.miles; riskUnits[i][j] = e.riskUnits;
+        sources[i][j] = 'estimate'; kind[i * n + j] = 2; counts.estimate++;
+        estGp.set(i * n + j, e.gridPath.slice());
+      }
+    }
+    // risk units on road routes: miles of the drawn path inside each risk circle x rating. A route of
+    // length L from A to B can only enter circle c when |A-c| + |c-B| - 2r <= L, so most pairs skip
+    // the path geometry entirely.
+    if (z.risky.length) {
+      const dist = z.risky.map(function (rz) { return pts.map(function (p) { return G.haversineMi(p, rz); }); });
+      const boxes = z.risky.map(function (rz) {       // lat/lon box around each circle (segment quick reject)
+        const dLat = rz.radiusMi / G.MI_PER_DEG_LAT * 1.02, dLon = dLat / Math.max(0.01, Math.cos(rz.lat * Math.PI / 180));
+        return [rz.lat - dLat, rz.lat + dLat, rz.lon - dLon, rz.lon + dLon];
+      });
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          if (i === j || kind[i * n + j] !== 1) continue;
+          let coords = null, rk = 0;
+          for (let k = 0; k < z.risky.length; k++) {
+            const rz = z.risky[k];
+            if (dist[k][i] + dist[k][j] - 2 * rz.radiusMi > miles[i][j] * 1.02 + 0.05) continue;
+            if (!coords) coords = m.paths(i, j) || [[pts[i].lat, pts[i].lon], [pts[j].lat, pts[j].lon]];
+            rk += milesInCircle(G, coords, rz, boxes[k]) * rz.value;
+          }
+          riskUnits[i][j] = rk;
+        }
+      }
+    }
+    return {
+      n: n, points: pts, source: 'osm-roads', counts: counts,
+      minutes: minutes, miles: miles, riskUnits: riskUnits, sources: sources,
+      reachable: function (i, j) { return minutes[i][j] < Infinity; },
+      gridPath: function (i, j) {
+        if (kind[i * n + j] === 2) return (estGp.get(i * n + j) || []).slice();
+        if (kind[i * n + j] === 1) return uniqIds([pts[i].gridId, pts[j].gridId]);
+        return [];
+      },
+      path: function (i, j) {
+        const k = kind[i * n + j];
+        if (k === 1) {
+          const coords = i === j ? [[pts[i].lat, pts[i].lon], [pts[i].lat, pts[i].lon]] : m.paths(i, j);
+          if (coords && coords.length >= 2) return { coords: coords, source: 'osm-roads', approximate: false };
+        }
+        if (k === 2) return { coords: estimateCoords(estNet(), pts[i], pts[j], estGp.get(i * n + j)), source: 'estimate', approximate: true };
+        return { coords: [[pts[i].lat, pts[i].lon], [pts[j].lat, pts[j].lon]], source: 'straight', approximate: true, unreachable: k === 0 };
+      },
+      roadMatrixMs: m.elapsedMs,
+      warnings: est ? est.warnings.slice() : []
+    };
+  }
+
+  network.pointMatrix = function (points, opts) {
+    const t0 = Date.now();
+    const o = Object.assign({}, opts || {});
+    const pts = (points || []).map(normPoint);
+    pts.forEach(function (p, i) { if (!isFinite(p.lat) || !isFinite(p.lon)) throw new Error('network.pointMatrix: point ' + i + ' has no valid location'); });
+    const riskRatings = o.riskRatings || network.DEFAULT_RISK_RATINGS;
+    const data = SRO.data || {};
+    const hasTm = Object.prototype.hasOwnProperty.call(o, 'timeMatrix') || Object.prototype.hasOwnProperty.call(o, 'googleMatrix');
+    const gm = hasTm ? (o.timeMatrix !== undefined ? o.timeMatrix : o.googleMatrix) : (data.time_matrix || data.google_matrix || null);
+    // an external matrix (when present) or a forced estimate goes through the grid network
+    const useRoads = o.source !== 'estimate' && !validGoogle(gm) && network.roadsAvailable();
+    const zk = network.zonesKey(o.zones, riskRatings);
+    const key = (useRoads ? 'R|' : 'E|') + pointsKey(pts) + '|' + zk;
+    const useCache = o.cache !== false;
+    if (useCache) {
+      for (let k = 0; k < pmCache.length; k++) {
+        if (pmCache[k].key === key && pmCache[k].grid === (o.grid || data.grid) && pmCache[k].gm === gm) {
+          const hit = pmCache.splice(k, 1)[0];
+          pmCache.unshift(hit);
+          return hit.value;
+        }
+      }
+    }
+    const out = useRoads ? roadPointMatrix(pts, o, riskRatings) : estimatePointMatrix(pts, o, riskRatings);
+    out.zonesKey = zk;
+    out.elapsedMs = Date.now() - t0;
+    if (useCache) {
+      pmCache.unshift({ key: key, grid: o.grid || data.grid, gm: gm, value: out });
+      if (pmCache.length > PM_CACHE_MAX) pmCache.pop();
+    }
+    return out;
+  };
+
+  // ---- grid network on the OSM road graph ----------------------------------------------------------
+  const roadNetCache = new Map();          // zonesKey + grid identity -> net
+  let roadNetGrid = null;
+  function buildRoadsNet(grid, links, o, riskRatings, useCache) {
+    if (roadNetGrid !== grid) { roadNetCache.clear(); roadNetGrid = grid; }
+    const key = network.zonesKey(o.zones, riskRatings);
+    if (useCache && roadNetCache.has(key)) return roadNetCache.get(key);
+    const ids = grid.map(function (g) { return String(g.id); });
+    const index = {};
+    const warnings = [];
+    ids.forEach(function (id, i) { if (index[id] === undefined) index[id] = i; else warnings.push('duplicate grid id ' + id); });
+    const n = grid.length;
+    const pm = network.pointMatrix(grid.map(function (g) { return { lat: g.lat, lon: g.lon, gridId: g.id, onGrid: true }; }),
+      { zones: o.zones, riskRatings: riskRatings, grid: grid, links: links, timeMatrix: null, cache: useCache });
+    function resolve(x) { return typeof x === 'number' ? (Number.isInteger(x) && x >= 0 && x < n ? x : undefined) : index[x]; }
+    const z = splitZones(o.zones, riskRatings);
+    const zonesForLegs = z.closed.map(function (c) { return Object.assign({}, c, { kind: 'closed' }); })
+      .concat(z.risky.map(function (c) { return Object.assign({}, c, { kind: 'risk' }); }));
+    const net = {
+      ids: ids, index: index, n: n,
+      minutes: pm.minutes, miles: pm.miles, riskUnits: pm.riskUnits,
+      sources: pm.sources,
+      gridPath: function (a, b) {
+        const i = resolve(a), j = resolve(b);
+        if (i === undefined || j === undefined) return [];
+        if (i === j) return [ids[i]];
+        return pm.reachable(i, j) ? pm.gridPath(i, j) : [];
+      },
+      arcRoute: function (a, b) {
+        const i = resolve(a), j = resolve(b);
+        if (i === undefined || j === undefined || !pm.reachable(i, j)) return [];
+        return i === j ? [i] : [i, j];
+      },
+      path: function (a, b) { const i = resolve(a), j = resolve(b); return i === undefined || j === undefined ? null : pm.path(i, j); },
+      source: 'osm-roads', matrixSource: null, fetchedAt: null,
+      estimatedPairs: pm.counts.estimate,
+      base: { minutes: pm.minutes, miles: pm.miles },
+      blockedArcs: 0,
+      closedZoneIds: z.closed.map(function (c) { return c.id; }),
+      riskZoneIds: z.risky.map(function (c) { return c.id; }),
+      zonesKey: key,
+      warnings: warnings.concat(pm.warnings),
+      reachable: function (a, b) { const i = resolve(a), j = resolve(b); return i !== undefined && j !== undefined && pm.minutes[i][j] < Infinity; },
+      offGridLeg: function (point, lopts) {
+        return network.offGridLeg(point, grid, Object.assign({ zones: zonesForLegs, riskRatings: riskRatings }, lopts || {}));
+      },
+      between: function (a, b) { return between(net, a, b); }
+    };
+    if (useCache) roadNetCache.set(key, net);
+    if (roadNetCache.size > ZONE_CACHE_MAX) roadNetCache.delete(roadNetCache.keys().next().value);
+    return net;
+  }
+
+  // build({ grid, links, timeMatrix, zones, riskRatings, roadPaths, cache, source })
   //   grid / links default to SRO.data.grid / SRO.data.grid_links; timeMatrix (legacy name
   //   googleMatrix) defaults to SRO.data.time_matrix, then SRO.data.google_matrix, when neither
-  //   key is given (pass null to force the estimate).
+  //   key is given (pass null to skip it). source: 'auto' (default: matrix, else osm-roads when the
+  //   road graph is loaded, else estimate) or 'estimate' (never the road graph).
   // -> { ids, index, n, minutes[][], miles[][], riskUnits[][], gridPath(i, j) -> [gridId],
-  //      source: 'matrix' | 'estimate', matrixSource, ... } ; i, j may be indexes or grid ids.
+  //      source: 'matrix' | 'osm-roads' | 'estimate', matrixSource, ... } ; i, j may be indexes or
+  //      grid ids. With 'osm-roads' each pair is one road route, so gridPath is [from, to].
   // Unreachable pairs are Infinity in all three matrices and gridPath returns [].
   // Results are cached by input identity and zone content; treat them as read-only.
   network.build = function (opts) {
@@ -497,6 +798,13 @@
     const rp = o.roadPaths || null;
     const riskRatings = o.riskRatings || network.DEFAULT_RISK_RATINGS;
     const useCache = o.cache !== false;
+    if (o.source !== 'estimate' && !validGoogle(gm) && !rp && network.roadsAvailable()) {
+      const rnet = buildRoadsNet(grid, links, o, riskRatings, useCache);
+      if (gm && !validGoogle(gm) && rnet.warnings.indexOf('time matrix ignored: expected { ids, minutes, meters }') < 0) {
+        rnet.warnings.push('time matrix ignored: expected { ids, minutes, meters }');
+      }
+      return rnet;
+    }
     const base = getBase(grid, links, gm, rp, useCache);
     const key = network.zonesKey(o.zones, riskRatings);
     if (useCache && base.zoneCache.has(key)) return base.zoneCache.get(key);
@@ -509,5 +817,5 @@
     return net;
   };
 
-  network.clearCache = function () { baseCache.length = 0; };
+  network.clearCache = function () { baseCache.length = 0; pmCache.length = 0; rmCache.length = 0; roadNetCache.clear(); roadNetGrid = null; };
 })(typeof self !== 'undefined' ? self : globalThis);
