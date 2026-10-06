@@ -29,11 +29,17 @@
 // a ruin-and-refill of the best plan (empty 1-3 random routes, reinsert what is then deferred in a
 // perturbed priority order, cheapest insertion, then the forced refill) followed by a localSearch; on
 // every CFG.constructEvery-th restart the first trial is a fresh construct() with a perturbed job order
-// instead. While the rally limit binds (the best plan uses maxRallyPoints rally points and defers a
-// job that could only go to another one), every CFG.rallyBoundEvery-th trial shakes rally points
-// instead of routes (see ruinRally): no move, route ruin or localSearch empties a whole rally point,
-// so before this such windows kept deferring jobs (Immediate ones too) at 5-10x the reachable total,
-// and the app's 19-sample demo window ended at 4,898-7,520 by seed (now 4,707 on every seed tried).
+// instead. While the best plan uses maxRallyPoints rally points, every CFG.rallyEvery-th trial shakes
+// rally points instead of routes (SRO.solver.ruinRally), and every CFG.rallyBoundEvery-th while the
+// limit binds (SRO.solver.rallyState: a pinned rally point gets nothing, or the plan defers a job that
+// could only go to a rally point it does not use); then the shake trades a rally point for the pin
+// or for that point (SRO.solver.rallySwap; every other such trial for a point a deferred job needs):
+// no move, route ruin or localSearch empties a whole rally point. Before the bound shake such windows
+// kept deferring jobs (Immediate ones too) at 5-10x the reachable total, and the app's 19-sample demo
+// window ended at 4,898-7,520 by seed (then 4,707 on every seed tried). Before the shake at the limit
+// and the swap (rallyEvery was 0), a pinned rally point the 20-request demo window does not need was
+// left unused on 10 of 12 seed x pin runs (+2,000 each), and with maxRallyPoints 2 two seeds of three
+// returned the construct() plan unchanged (124,457 against 119,741).
 // A trial that beats the best plan becomes the best plan (later trials shake that one). The
 // walk resumes from the best trial with an empty tabu list. The work of a restart is charged to the
 // step budget as it is done (its evaluations / neighborhood, scaled by CFG.chargePerEval; no further
@@ -65,7 +71,8 @@
 // tests). result.iterations = steps taken + start-trial and restart work charged (<= params.iterations).
 // history: [{ t: seconds, best: total }], at most one point per CFG.historyMs (the last best in it).
 // extra: { steps, walkEvals (candidates scored by the walk), restarts, trials (start trials included),
-// startTrials, rallyTrials (trials that shook rally points), startTotal (hooks.start's total when
+// startTrials, rallyTrials (trials that shook rally points), swapTrials (of those, rallySwap ones),
+// startTotal (hooks.start's total when
 // given, else construct's), startFrom ('start' | 'construct': the plan the search continued from),
 // tabuBest, polishGain, polishEvals, aspirations, allTabu, nullSkipped, gainBy: { start, walk, restart,
 // polish } } (gainBy: how much each phase lowered the best total; the start trials count as 'restart').
@@ -92,8 +99,9 @@
     startTrials: 12,          // shaken + polished copies of the polished start plan before the walk (charged) ...
     startShare: 0.25,         // ... begun only while the charged work is below this share of params.iterations
     constructEvery: 3,        // every n-th restart begins with a perturbed construct() (0 = never)
-    rallyEvery: 0,            // every n-th trial of a burst shakes rally points instead of routes (0 = never) ...
-    rallyBoundEvery: 2        // ... every n-th while the rally limit binds (see rallyBound)
+    rallyEvery: 4,            // every n-th trial of a burst shakes rally points instead of routes while the plan
+                              // uses maxRallyPoints of them (0 = never) ...
+    rallyBoundEvery: 2        // ... every n-th while the rally limit binds (SRO.solver.rallyState().bound)
   };
 
   function defaultNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
@@ -111,15 +119,7 @@
     return p;
   }
 
-  // The default construct order with each job shifted by a random amount (up to a quarter of the job
-  // count), so restarts try other orders while locked / Immediate jobs still tend to go first.
-  function noisyOrder(instance, rng) {
-    const base = S.constructOrder(instance, rng);
-    const w = mmax(2, base.length / 4);
-    const key = new Float64Array(instance.jobs.length);
-    for (let i = 0; i < base.length; i++) key[base[i]] = i + rng() * w;
-    return base.slice().sort(function (a, b) { return key[a] - key[b]; });
-  }
+  function noisyOrder(instance, rng) { return S.noisyOrder(instance, rng); }   // (localsearch.js)
 
   // sol shaken: empty 1-3 random routes, reinsert what is then deferred in a perturbed order (cheapest
   // insertion that pays), then the forced refill that keeps only chunks worth carrying.
@@ -132,83 +132,6 @@
     for (let a = 0; a < k; a++) routes[nonEmpty[a]] = { vehicle: sol.routes[nonEmpty[a]].vehicle, visits: [] };
     const ins = S.insertJobs(instance, { routes: routes }, noisyOrder(instance, rng), { rng: rng });
     const rf = S.refill(instance, ins.solution, { rng: rng });
-    return { solution: rf.solution, evals: ins.evals + rf.evals };
-  }
-
-  // True when sol uses maxRallyPoints rally points and some (partly) deferred job could only be
-  // delivered at a rally point it does not use: the rally limit binds.
-  function rallyBound(instance, sol) {
-    const P = S.prepare(instance);
-    if (!(P.maxRally < Infinity)) return false;
-    const ctx = S.moves.context(instance, sol);
-    const used = new Uint8Array(P.nN);
-    let nUsed = 0;
-    for (let r = 0; r < sol.routes.length; r++) {
-      const vs = sol.routes[r].visits;
-      for (let v = 0; v < vs.length; v++) {
-        const n = vs[v].node;
-        if (P.isRally[n] && !used[n] && vs[v].jobs.length) { used[n] = 1; nUsed++; }
-      }
-    }
-    if (nUsed < P.maxRally) return false;
-    const dj = ctx.deferredJobs;
-    for (let a = 0; a < dj.length; a++) {
-      const cn = P.jCandNodes[dj[a]];
-      for (let c = 0; c < cn.length; c++) if (P.isRally[cn[c]] && !used[cn[c]]) return true;
-    }
-    return false;
-  }
-
-  // sol shaken around its rally points: 1-2 random rally points it uses (pinned ones too) are closed,
-  // every visit there is removed, and what is then deferred is reinserted (the jobs sol already deferred
-  // first, then the rest; perturbed order, cheapest insertion, forced refill) on a copy of the instance
-  // whose jobs cannot use the closed points, so the freed rally slots go to other points. Returns null
-  // when sol uses no rally point. Why: when maxRallyPoints binds (pinned points, a low limit), a job
-  // whose only candidates are unused rally points stays deferred until a whole rally point is emptied,
-  // which no single move, route ruin or localSearch does. The plan is valid for the real instance (its
-  // candidate lists are supersets of the copy's); the trial's localSearch then runs on the real one.
-  function ruinRally(instance, sol, rng, closedCache) {
-    const P = S.prepare(instance);
-    const used = [], seen = new Uint8Array(P.nN);
-    for (let r = 0; r < sol.routes.length; r++) {
-      const vs = sol.routes[r].visits;
-      for (let v = 0; v < vs.length; v++) {
-        const n = vs[v].node;
-        if (P.isRally[n] && !seen[n] && vs[v].jobs.length) { seen[n] = 1; used.push(n); }
-      }
-    }
-    if (!used.length) return null;
-    used.sort(function (a, b) { return a - b; });
-    rng.shuffle(used);
-    const closed = used.slice(0, mmin(used.length, 1 + rng.int(2))).sort(function (a, b) { return a - b; });
-    const key = closed.join(',');
-    let inst2 = closedCache.get(key);
-    if (!inst2) {
-      const shut = new Uint8Array(P.nN);
-      for (let c = 0; c < closed.length; c++) shut[closed[c]] = 1;
-      const jobs = instance.jobs.map(function (job) {
-        const cs = job.candidates || [];
-        for (let c = 0; c < cs.length; c++) {
-          if (cs[c] && shut[cs[c].node]) return Object.assign({}, job, { candidates: cs.filter(function (x) { return !(x && shut[x.node]); }) });
-        }
-        return job;
-      });
-      inst2 = Object.assign({}, instance, { jobs: jobs });
-      closedCache.set(key, inst2);
-    }
-    for (let c = 0; c < closed.length; c++) seen[closed[c]] = 2;
-    const routes = sol.routes.map(function (rt) {
-      let hit = false;
-      for (let v = 0; v < rt.visits.length && !hit; v++) if (seen[rt.visits[v].node] === 2) hit = true;
-      return hit ? { vehicle: rt.vehicle, visits: rt.visits.filter(function (vi) { return seen[vi.node] !== 2; }) } : rt;
-    });
-    // jobs sol defers go first, so they claim the freed rally slots before the moved ones do
-    const waiting = new Uint8Array(P.nJ), dj = S.moves.context(instance, sol).deferredJobs;
-    for (let a = 0; a < dj.length; a++) waiting[dj[a]] = 1;
-    const order = noisyOrder(instance, rng);
-    const first = order.filter(function (j) { return waiting[j]; }), rest = order.filter(function (j) { return !waiting[j]; });
-    const ins = S.insertJobs(inst2, { routes: routes }, first.concat(rest), { rng: rng });
-    const rf = S.refill(inst2, ins.solution, { rng: rng });
     return { solution: rf.solution, evals: ins.evals + rf.evals };
   }
 
@@ -226,13 +149,12 @@
     const maxIt = p.iterations, tenure = p.tenure, k = p.neighborhood, restartAfter = p.restartAfter;
     const aspiration = !!p.aspiration;
 
-    let evals = 0, it = 0, steps = 0, restarts = 0, trials = 0, startTrials = 0, rallyTrials = 0, phase = 'start', stopReason = null, src = 'start';
+    let evals = 0, it = 0, steps = 0, restarts = 0, trials = 0, startTrials = 0, rallyTrials = 0, swapTrials = 0, phase = 'start', stopReason = null, src = 'start';
     let cur = null, curTotal = Infinity, curFeas = false;
     let best = null, bestTotal = Infinity, bestFeas = false, bestChanged = false, bestPolished = false;
     let lastReport = -Infinity;
     const history = [];
     const gainBy = { start: 0, walk: 0, restart: 0, polish: 0 };
-    const closedCache = new Map();                               // ruinRally's instance copies, per closed set
 
     function report(force) {
       if (!onProgress) return;
@@ -276,7 +198,7 @@
       for (;;) {
         if (evals >= cap || timeUp(limit)) break;
         const st = {};
-        const out = S.localSearch(instance, sol, { rng: rng, maxIters: mmin(CFG.lsChunk, cap - evals), timeLimitMs: mmax(1, limit - now()), stats: st });
+        const out = S.localSearch(instance, sol, { rng: rng, now: now, maxIters: mmin(CFG.lsChunk, cap - evals), timeLimitMs: mmax(1, limit - now()), stats: st });
         evals += (st.evals || 0) + 1;
         const e = S.evaluate(instance, out, COST_ONLY);
         const improved = better(e.total, e.feasible, total, feas);
@@ -295,16 +217,22 @@
     function burst(n, withConstruct, charge, itCap, est, evalCap) {
       let next = null, nextTotal = Infinity, nextFeas = false, nextDone = false;
       const predict = est > 0;
-      let boundOf = null, bound = false;
+      let boundOf = null, rs = null;
       for (let b = 0; b < n && !stopReason && it < itCap && (!predict || it + est <= itCap); b++) {
         const itB = it;
         let cand;
         if (b === 0 && withConstruct) {
           cand = S.construct(instance, { rng: rng, order: noisyOrder(instance, rng) });
         } else {
-          if (boundOf !== best) { boundOf = best; bound = CFG.rallyBoundEvery > 0 && rallyBound(instance, best); }
-          const every = bound ? CFG.rallyBoundEvery : CFG.rallyEvery;
-          let rr = every > 0 && b % every === every - 1 ? ruinRally(instance, best, rng, closedCache) : null;
+          if (boundOf !== best) { boundOf = best; rs = S.rallyState(instance, best); }
+          const every = rs.bound ? CFG.rallyBoundEvery : rs.atCap ? CFG.rallyEvery : 0;
+          let rr = null;
+          if (every > 0 && b % every === every - 1) {
+            // an unused pin, or (every other rally trial) a rally point a deferred job could use: trade
+            // a rally point for it; otherwise close 1-2 random ones
+            rr = rs.pins.length || (rs.bound && rallyTrials % 2 === 0) ? S.rallySwap(instance, best, { rng: rng }) : null;
+            if (rr) swapTrials++; else rr = S.ruinRally(instance, best, rng);
+          }
           if (rr) rallyTrials++; else rr = ruinAndRefill(instance, best, rng);
           cand = rr.solution; evals += rr.evals;
         }
@@ -467,7 +395,7 @@
       solution: best, total: fin.total, feasible: fin.feasible, evals: evals, iterations: it,
       elapsedSec: elapsedSec, stopReason: stopReason, history: history,
       extra: {
-        steps: steps, walkEvals: walkEvals, restarts: restarts, trials: trials, startTrials: startTrials, rallyTrials: rallyTrials, startTotal: startTotal, startFrom: startFrom, tabuBest: tabuBest,
+        steps: steps, walkEvals: walkEvals, restarts: restarts, trials: trials, startTrials: startTrials, rallyTrials: rallyTrials, swapTrials: swapTrials, startTotal: startTotal, startFrom: startFrom, tabuBest: tabuBest,
         polishGain: tabuBest - fin.total, polishEvals: polishEvals, aspirations: aspirations, allTabu: allTabu,
         nullSkipped: nullSkipped, gainBy: gainBy
       }

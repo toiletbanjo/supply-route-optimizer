@@ -50,7 +50,7 @@ test('loader: available() only after ready(); a bad loader rejects; run() withou
 });
 
 test('linearization: on flat periods the model objective of a mapped plan equals its evaluate total; start values satisfy every row; decode round-trips', () => {
-  let checked = 0, splits = 0, pins = 0, rallyLimited = 0, same = 0;
+  let checked = 0, splits = 0, charged = 0, pins = 0, rallyLimited = 0, same = 0;
   for (let seed = 1; seed <= 40; seed++) {
     const inst = mixedInstance(seed);
     const rng = SRO.util.rng(seed);
@@ -72,13 +72,15 @@ test('linearization: on flat periods the model objective of a mapped plan equals
     assert.ok(ed.total <= ev.total + 1e-9 * Math.max(1, ev.total), `seed ${seed}: mapped ${ed.total} vs start ${ev.total}`);
     if (rel(ed.total, ev.total) < 1e-12) same++;
     if (model.stats.chunks > inst.jobs.length) splits++;
+    if (ed.stats.extraChunks > 0) charged++;            // the g / h columns carry evaluate's EXTRA_CHUNK charge
     if (model.pCol.size) pins++;
     if (model.rCol.size) rallyLimited++;
     checked++;
   }
   assert.equal(checked, 40);
   assert.ok(same >= 30, 'mapped plan identical to the start in ' + same + ' of 40');
-  assert.ok(splits > 0 && pins > 0 && rallyLimited > 0, `features covered: splits ${splits}, pinned ${pins}, rally limit ${rallyLimited}`);
+  assert.ok(splits > 0 && charged > 0 && pins > 0 && rallyLimited > 0,
+    `features covered: splits ${splits}, split plans ${charged}, pinned ${pins}, rally limit ${rallyLimited}`);
 });
 
 test('linearization with time-of-day periods: start still feasible and decodes to the same plan; objective close to evaluate', () => {
@@ -154,7 +156,9 @@ test('Phase-1-size instance, 20 s limit: violation-free, no worse than its warm 
   assert.equal(typeof res.extra.mipGap, 'number');
   assert.ok(res.extra.mipGap >= 0 && res.extra.mipGap < 1, 'gap ' + res.extra.mipGap);
   assert.ok(res.extra.dualBound <= res.extra.planModelObjective + 1e-6);
-  assert.ok(['time', 'optimal'].includes(res.stopReason), res.stopReason);
+  assert.ok(['time', 'optimal', 'gap'].includes(res.stopReason), res.stopReason);   // gap: within 1e-6 is optimal
+  assert.equal(res.proof.stopReason, res.stopReason);
+  assert.equal(res.proof.gapTarget, 0);
   assert.ok(wall <= limit * 1.15, 'wall ' + wall);
   if (res.stopReason === 'time') assert.ok(wall >= limit * 0.85, 'wall ' + wall);
   assert.ok(bestSeen >= 1, 'progress carried the best plan');
@@ -166,6 +170,26 @@ test('Phase-1-size instance, 20 s limit: violation-free, no worse than its warm 
     `${res.extra.rows} rows, ${res.extra.cols} cols, ${res.extra.binaries} binaries, start accepted ${res.extra.startAccepted}, nodes ${res.iterations}`);
 });
 
+// HiGHS reports 'Optimal' (code 7) as soon as its gap is within mip_rel_gap, so a stop at the gap target
+// was labelled Optimal. Since 2026-10-06: stopReason 'gap', status 'Within target gap', and result.proof
+// says what was proven.
+test('a stop at the gap target is not called optimal; result.proof says what was proven', () => {
+  const small = (seed) => S.makeTestInstance(seed, { nJobs: 12, nVehicles: 4, nRally: 5, nHubs: 2, maxRallyPoints: 3, flatPeriods: true });
+  const gap = S.methods.mip.run(small(3), mipParams({ timeLimitSec: 20, mipGap: 0.2, warmStart: false, seed: 1 }), {});
+  assert.equal(gap.stopReason, 'gap');
+  assert.equal(gap.extra.status, 'Within target gap');
+  assert.ok(gap.extra.mipGap > 1e-6 && gap.extra.mipGap <= 0.2 + 1e-9, 'gap ' + gap.extra.mipGap);
+  assert.deepEqual(plain(gap.proof), { stopReason: 'gap', gap: gap.extra.mipGap, dualBound: gap.extra.dualBound, gapTarget: 0.2, exactModel: true });
+  const opt = S.methods.mip.run(small(2), mipParams({ timeLimitSec: 20, mipGap: 0.2, warmStart: false, seed: 1 }), {});
+  assert.equal(opt.stopReason, 'optimal');
+  assert.equal(opt.extra.status, 'Optimal');
+  assert.ok(opt.proof.gap <= 1e-6);
+  assert.equal(opt.proof.stopReason, 'optimal');
+  // time-of-day periods: the model is not exact, and the proof says so
+  const timed = S.makeTestInstance(3, { nJobs: 12, nVehicles: 4, nRally: 5, nHubs: 2, maxRallyPoints: 3 });
+  assert.equal(S.methods.mip.run(timed, mipParams({ timeLimitSec: 20, mipGap: 0.2, warmStart: false, seed: 1 }), {}).proof.exactModel, false);
+});
+
 test('shouldStop interrupts the solve promptly and keeps the best plan', () => {
   const inst = phase1(2);
   const start = S.construct(inst);
@@ -175,6 +199,7 @@ test('shouldStop interrupts the solve promptly and keeps the best plan', () => {
   });
   const wall = (performance.now() - t0) / 1000;
   assert.equal(res.stopReason, 'stopped');
+  assert.equal(res.proof.stopReason, 'cancel');
   assert.ok(wall < 3 + 3, 'stopped after ' + wall + ' s');
   assert.ok(res.feasible);
   assert.ok(res.total <= S.evaluate(inst, start).total + 1e-9);

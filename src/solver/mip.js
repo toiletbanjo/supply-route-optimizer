@@ -40,6 +40,8 @@
 //   b_c      binary   lateness (+ slip) of c capped (cost = lateCapShare x its deferral cost x share);
 //                     only when the cap can bind (the latest possible arrival costs more than the cap)
 //   w_q_n    [0,1]    platoon of request q comes to node n (wD x platoonCost)
+//   g_j_v_n  [0,1]    job j delivered by v at n; h_j [0,1] j delivered at all (only for jobs of two or
+//                     more chunks; cost EXTRA_CHUNK x wS x (g - h): evaluate's charge per extra chunk)
 //   r_n      binary   rally node n used (only when maxRallyPoints can bind)
 //   p_n      [0,1]    pinned rally node n receives nothing (pinUnused);   one = 1 carries constant costs
 // Rows: assignment sum z + u = 1; z <= y; y <= sum z (no empty delivery stop); y <= k; flow in = flow out
@@ -48,9 +50,11 @@
 // order o_b >= o_a + 1 - K(1 - x_ab), 0 <= o <= K - 1, on inner arcs that take under a minute (service 0
 // and co-located nodes), where the time rows alone would allow a free closed loop beside the route;
 // lateness L_c >= T_v_n - deadline - M(1 - z) - M' b_c per option and L_c + M' b_c >= sum (minT -
-// deadline)+ z; slip S_c >= T_v_n - prevEta - M(1 - z) - M' b_c per option; platoon w_q_n >= sum_v z_c_v_n per chunk of the request; rally y_v_n <= r_n, x via a rally
-// waypoint <= r_w, sum r <= maxRallyPoints; pinned p_n + sum z_.._n >= 1; identical vehicles (same type,
-// capacity, hub, start node, start time, no locked jobs) are used in index order (k_v >= k_v').
+// deadline)+ z; slip S_c >= T_v_n - prevEta - M(1 - z) - M' b_c per option; platoon w_q_n >= sum_v
+// z_c_v_n per chunk of the request; extra chunks g_j_v_n >= z_c_v_n per chunk of j, h_j <= sum g_j;
+// rally y_v_n <= r_n, x via a rally waypoint <= r_w, sum r <= maxRallyPoints; pinned p_n + sum z_.._n
+// >= 1; identical vehicles (same type, capacity, hub, start node, start time, no locked jobs) are used
+// in index order (k_v >= k_v').
 //
 // Exact pruning only: options/arcs for the wrong vehicle type or lock (or an unlocked job on a preloaded
 // en-route truck, which carries only its own loads), banned or unreachable nodes, rally
@@ -85,9 +89,13 @@
 // the returned plan: (its model objective - dual bound) / its model objective), highsGap, dualBound,
 // modelObjective, planModelObjective, rows, cols, binaries, nnz, chunks, lpBytes, buildSec, solveSec,
 // warmStartSec, startFrom, startTotal, startAccepted, startUsed, startExact, mipBestTotal, source
-// ('start' | 'mip'), nodes, speedFactor, riskFactor, exactModel, firstIncumbentSec, error? }. The HiGHS model
-// is always disposed. When our own deadline check interrupts HiGHS (its time check lags on a busy machine)
-// the status is 'Time limit reached'. When HiGHS itself fails (createModel or run throws: LP parse, wasm
+// ('start' | 'mip'), nodes, speedFactor, riskFactor, exactModel, firstIncumbentSec, error? } and proof =
+// { stopReason: 'optimal' | 'gap' | 'time' | 'cancel' | 'error', gap (extra.mipGap), dualBound,
+// gapTarget, exactModel } (what was proven: the gap is relative to the model, which is exact only with
+// one flat period). stopReason 'optimal' only when the returned plan's gap is at most 1e-6: HiGHS
+// reports 'Optimal' as soon as its gap is within mipGap, and that is stopReason 'gap', status 'Within
+// target gap'. The HiGHS model is always disposed. When our own deadline check interrupts HiGHS (its
+// time check lags on a busy machine) the status is 'Time limit reached'. When HiGHS itself fails (createModel or run throws: LP parse, wasm
 // abort, memory) the start plan is returned with status 'Solve error', extra.error and a warning (in
 // result.warnings); an error in this file's callbacks (decode / evaluate / onProgress) interrupts HiGHS at
 // its next callback and is rethrown. decode() trims a load HiGHS packs over a capacity within its
@@ -109,6 +117,9 @@
     10: 'Unbounded', 11: 'Bound on objective reached', 12: 'Target for objective reached', 13: 'Time limit reached',
     14: 'Iteration limit reached', 15: 'Unknown', 16: 'Solution limit reached', 17: 'Interrupted by user' };
   MIP.STATUS_NAMES = STATUS_NAMES;
+  const OPTIMAL_GAP = 1e-6;                       // a returned plan within this gap of the dual bound is optimal
+  // result.proof.stopReason from the method's stopReason
+  const PROOF_REASON = { optimal: 'optimal', gap: 'gap', time: 'time', stopped: 'cancel' };
 
   function defaultNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
   function toNum(x) { return typeof x === 'bigint' ? Number(x) : (typeof x === 'number' ? x : Number(x)); }
@@ -587,6 +598,25 @@
         if (!wCol.has(key)) wCol.set(key, col('w' + P.jReq[j] + '_' + n, 0, 1, false, P.wD * cost));
       });
     }
+    // extra-chunk columns (evaluate charges EXTRA_CHUNK x wS per positive chunk of a job after its
+    // first; the chunks of a job at one stop are merged, so a job delivered by v at n is one chunk):
+    // for a job with two or more model chunks, g_j_v_n [0,1] (j delivered by v at n) and h_j [0,1] (j
+    // delivered at all); cost xc x (sum g - h), the delivery stops of the job less one
+    const xc = P.wS * (S.EXTRA_CHUNK || 0);
+    const gCol = new Map(), hCol = new Map();      // key (j * nV + v) * nN + n -> col; j -> col
+    if (xc > 0) {
+      const nOf = new I32(nJ);
+      for (let c = 0; c < nC; c++) nOf[chunks[c].job]++;
+      for (let c = 0; c < nC; c++) {
+        const j = chunks[c].job;
+        if (nOf[j] < 2) continue;
+        zc[c].forEach(function (o) {
+          const key = (j * nV + o[0]) * nN + o[1];
+          if (!gCol.has(key)) gCol.set(key, col('g' + j + '_' + o[0] + '_' + o[1], 0, 1, false, xc));
+          if (!hCol.has(j)) hCol.set(j, col('h' + j, 0, 1, false, -xc));   // only with a g to bound it
+        });
+      }
+    }
     // rally columns: rally nodes a vehicle may stop at (deliveries or waypoints)
     const rallyNodes = [];
     {
@@ -723,6 +753,24 @@
         row('pl' + c + '_' + (key % nN), [wCol.get(key)].concat(zs), [1].concat(zs.map(function () { return -1; })), 'G', 0);
       });
     }
+    // extra chunks: g_j_v_n >= z_c_v_n per chunk of the job, h_j <= sum g_j
+    if (gCol.size) {
+      const gsOf = new Map();
+      for (let c = 0; c < nC; c++) {
+        const j = chunks[c].job;
+        zc[c].forEach(function (o) {
+          const g = gCol.get((j * nV + o[0]) * nN + o[1]);
+          if (g === undefined) return;
+          row('gz' + c + '_' + o[0] + '_' + o[1], [g, o[2]], [1, -1], 'G', 0);
+          let m = gsOf.get(j); if (!m) { m = new Set(); gsOf.set(j, m); }
+          m.add(g);
+        });
+      }
+      hCol.forEach(function (h, j) {
+        const gs = Array.from(gsOf.get(j) || []);
+        row('hg' + j, [h].concat(gs), [1].concat(gs.map(function () { return -1; })), 'L', 0);
+      });
+    }
     // rally limit
     if (rCol.size) {
       rCol.forEach(function (r, n) {
@@ -752,6 +800,7 @@
     const model = {
       instance: instance, P: P, factors: factors, chunks: chunks, zc: zc, veh: veh, arcs: arcs,
       kCol: kCol, yCol: yCol, tCol: tCol, oCol: oCol, zAt: zAt, uCol: uCol, LCol: LCol, SCol: SCol, bCol: bCol, wCol: wCol, rCol: rCol, pCol: pCol,
+      gCol: gCol, hCol: hCol,
       oneCol: oneCol, constObj: constObj, groups: groups,
       cols: { name: cName, lb: cLb, ub: cUb, int: cInt, obj: cObj }, colIndex: colIndex, rows: rows,
       stats: {
@@ -852,6 +901,18 @@
       const b = model.bCol[c];
       if (b >= 0 && ((late > 0 ? late * P.jLateW[j] : 0) + (slip > 0 ? slip * P.jSlipW[j] : 0)) * ch.share > model.cols.obj[b]) x[b] = 1;
       else { if (late > 0) x[Lc] = late; if (slip > 0) x[Sc] = slip; }
+    }
+    // extra chunks: the (v, n) each job is delivered at
+    if (model.gCol && model.gCol.size) {
+      for (let c = 0; c < nC; c++) {
+        if (!delivered[c]) continue;
+        const j = chunks[c].job;
+        model.zc[c].forEach(function (o) {
+          if (!(x[o[2]] > 0.5)) return;
+          const g = model.gCol.get((j * nV + o[0]) * nN + o[1]);
+          if (g !== undefined) { x[g] = 1; x[model.hCol.get(j)] = 1; }
+        });
+      }
     }
     // platoon, rally, pinned
     model.wCol.forEach(function (col, key) {
@@ -1054,7 +1115,7 @@
     const rng = SRO.util.rng(p.seed);
     let sol = S.construct(instance, { rng: rng });
     const st = {};
-    sol = S.localSearch(instance, sol, { rng: rng, timeLimitMs: budgetSec * 1000, stats: st });
+    sol = S.localSearch(instance, sol, { rng: rng, now: now, timeLimitMs: budgetSec * 1000, stats: st });
     return { solution: sol, from: 'localsearch', evals: st.evals || 0 };
   }
 
@@ -1279,10 +1340,19 @@
     } else if (typeof extra.highsGap === 'number' && isFinite(extra.highsGap)) extra.mipGap = extra.highsGap;
     if (extra.highsGap != null && !isFinite(extra.highsGap)) extra.highsGap = null;
     if (extra.dualBound != null && !isFinite(extra.dualBound)) extra.dualBound = null;
-    report(1, extra.status + (extra.mipGap != null ? ', proven within ' + (100 * extra.mipGap).toFixed(1) + '%' : ''), true);
+    // HiGHS reports 'Optimal' (7) as soon as its gap is within mip_rel_gap, so 7 with a gap left on the
+    // returned plan is the gap target, not a proof of optimality
+    if (stopReason === 'optimal' && !(extra.mipGap != null && extra.mipGap <= OPTIMAL_GAP)) {
+      stopReason = 'gap'; extra.status = 'Within target gap';
+    }
+    const proof = {
+      stopReason: PROOF_REASON[stopReason] || 'error', gap: extra.mipGap, dualBound: extra.dualBound,
+      gapTarget: gapTarget, exactModel: !!model.exact
+    };
+    report(1, extra.status + (extra.mipGap != null ? (stopReason === 'optimal' ? '' : ', proven within ' + (100 * extra.mipGap).toFixed(1) + '% of the model\'s best') : ''), true);
     return {
       solution: best.solution, total: best.total, feasible: best.feasible, evals: evals, iterations: nodes,
-      elapsedSec: elapsed(), stopReason: stopReason, history: history, extra: extra, warnings: warnings
+      elapsedSec: elapsed(), stopReason: stopReason, history: history, extra: extra, proof: proof, warnings: warnings
     };
   }
 

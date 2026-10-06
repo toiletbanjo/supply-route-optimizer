@@ -38,7 +38,9 @@
 // a start plan with too few worsening proposals (nearly every move helps) is sampled along a downhill
 // walk instead (see autoTemp). Geometric cooling: after every params.itersPerTemp proposals
 // T *= params.coolingRate. A cooling cycle ends when T has fallen to
-// params.stopTempRatio x T0; its final plan gets a short localSearch (CFG.cyclePolish). Then, up to
+// params.stopTempRatio x T0; its final plan gets a short localSearch (CFG.cyclePolish), and while the
+// best plan uses maxRallyPoints rally points it gets CFG.rallyTrials rally-point shakes (see
+// rallyBurst: the walk's moves never trade a whole rally point). Then, up to
 // params.reheats times, T is raised to CFG.reheatFrac x T0 (at least sqrt(stopTempRatio) x T0, so above
 // the stop temperature) and the walk restarts from the best plan so far, polished first with a short
 // localSearch. Defaults (cooling 0.995, 100 proposals per step, stop at 0.001, 2 reheats): 1,379 + 2 x
@@ -70,7 +72,8 @@
 // proposal, plus T0 samples and localSearch). history: [{ t: seconds, best: total }], at most one point
 // per CFG.historyMs. extra: { T0, autoTemp, tStop, reheatTemp, steps, reheatsDone, accepted, acceptRate,
 // uphillAccepted, nullMoves, rejectedViol, movesPerSec, evalsPerSec, annealSec, startTotal, saBest,
-// polishGain, polishEvals, reheatPolishGain, cyclePolishGain, cycleEnds: [{ walk, polished, best }],
+// polishGain, polishEvals, reheatPolishGain, cyclePolishGain, rallyTrials, rallyGain (what the rally
+// shakes lowered the best total by), cycleEnds: [{ walk, polished, best }],
 // budget, samples: { taken, uphill, violations, descended }, startFix: null (construct start) or
 // { violations (of the given plan), removed (chunks/visits taken off), refillGain }, startTrials: null
 // (hooks.start) or { trials, chosen (0 = the default order), gain } }. startTotal is the total of the
@@ -102,7 +105,9 @@
     lsIdleChunks: 2,          // a polish ends after this many chunks in a row without a gain
     polishShare: 0.05,        // share of the time cap held back for the final polish ...
     polishReserveMaxMs: 2000, // ... but at most this many ms
-    maxNullRun: 2000          // this many proposals in a row without an applicable move: converged
+    maxNullRun: 2000,         // this many proposals in a row without an applicable move: converged
+    rallyTrials: 6,           // rally-point shakes of the best plan at each cycle end while it uses maxRallyPoints ...
+    rallyPolishEvals: 20000   // ... each polished with at most this many evaluations
   };
 
   function defaultNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
@@ -320,6 +325,7 @@
             (mps > 0 ? ', ' + fmtInt(mps) + ' moves/s' : '')
           : phase === 'quench' ? 'Polishing the plan at the end of a cooling cycle'
           : phase === 'reheat' ? 'Polishing the best plan before reheating'
+          : phase === 'rally' ? 'Trading rally points (the rally point limit binds)'
           : phase === 'polish' ? 'Polishing the best plan' : 'Done'
       };
       if (bestChanged) { msg.best = best; bestChanged = false; }
@@ -352,7 +358,7 @@
         if (timeUp(limit)) break;
         const st = {};
         const out = S.localSearch(instance, sol, {
-          rng: rng, maxIters: mmin(CFG.lsChunk, maxEvals - used), timeLimitMs: mmax(1, limit - now()), stats: st
+          rng: rng, now: now, maxIters: mmin(CFG.lsChunk, maxEvals - used), timeLimitMs: mmax(1, limit - now()), stats: st
         });
         used += (st.evals || 0) + 1;
         const e = S.evaluate(instance, out, COST_ONLY);
@@ -363,6 +369,45 @@
       }
       evals += used;
       return { solution: sol, total: total, feasible: feas, converged: converged };
+    }
+
+    // At the end of each cooling cycle, while the best plan uses maxRallyPoints rally points: no move
+    // of the walk trades a whole rally point, so CFG.rallyTrials trials shake the best plan's rally
+    // points, each polished, and what is better is kept. Even trials: S.rallySwap while the limit binds
+    // (a pinned rally point gets nothing, or a deferred job could only use a rally point the plan does
+    // not use), else S.ruinRally closing the plan's rally points in turn; odd trials: a random moveRally
+    // (rallyKick). Measured on the 20-request demo window (seeds 20261005, 1, 2), SA otherwise ended
+    // with one more deferred load than tabu and ACO at maxRallyPoints 4 or 6 (51,060 / 15,702 against
+    // 48,238 / 12,880), with one pinned rally point ended above their plan on 8 of 12 pin x seed runs
+    // (a load deferred on 5; now on none), and with one truck per hub ended at 10,254 on 1 of 5 seeds
+    // (10,503 to 11,884 on the others; now 4 of 5).
+    let rallyTrialsDone = 0, rallyGain = 0;
+    // a random moveRally of sol (every visit at one of its rally points moved to another rally point
+    // all those jobs can use), for the polish to settle; null when there is none
+    function rallyKick(sol) {
+      const list = [];
+      S.moves.forEach(instance, sol, function (m) { list.push(m); return false; }, { types: ['moveRally'] });
+      const out = list.length ? S.moves.result(instance, sol, list[rng.int(list.length)]) : null;
+      return out ? { solution: out, evals: 0 } : null;
+    }
+    function rallyBurst() {
+      const ph = phase, before = bestTotal;
+      phase = 'rally';
+      for (let b = 0; ; b++) {
+        const rs = S.rallyState(instance, best);
+        if (!rs.atCap || b >= CFG.rallyTrials || timeUp(searchEndAt)) break;
+        let rr = rs.bound && b % 2 === 0 ? S.rallySwap(instance, best, { rng: rng }) : null;
+        if (!rr && b % 2 === 1) rr = rallyKick(best);
+        if (!rr) rr = S.ruinRally(instance, best, rng, rs.used[rallyTrialsDone % rs.used.length]);
+        if (!rr) break;
+        evals += rr.evals + 1; rallyTrialsDone++;
+        const er = S.evaluate(instance, rr.solution, COST_ONLY);
+        offer(rr.solution, er.total, er.feasible);
+        polish(rr.solution, er.total, er.feasible, CFG.rallyPolishEvals, searchEndAt);
+        report(false);
+      }
+      rallyGain += before - bestTotal;
+      phase = ph;
     }
 
     // ---- start plan and start temperature ----
@@ -472,6 +517,7 @@
         cyclePolishGain += before - bestTotal;
         phase = 'anneal';
       }
+      if (!stopReason) rallyBurst();
       if (!stopReason && reheatsDone >= sch.reheats) stopReason = 'budget';
       if (!stopReason && CFG.reheatPolish && !bestPolished) {
         // reheat from the best plan, polished first
@@ -523,7 +569,7 @@
         rejectedViol: rejectedViol, movesPerSec: mps, evalsPerSec: annealSec > 0 ? annealEvals / annealSec : 0,
         annealSec: annealSec, startTotal: startTotal, saBest: saBest, polishGain: saBest - fin.total,
         polishEvals: polishEvals, reheatPolishGain: reheatPolishGain, cyclePolishGain: cyclePolishGain,
-        cycleEnds: cycleEnds, budget: budget, startFix: startFix, startTrials: startTrials,
+        cycleEnds: cycleEnds, budget: budget, startFix: startFix, startTrials: startTrials, rallyTrials: rallyTrialsDone, rallyGain: rallyGain,
         samples: samples ? { taken: samples.samples, uphill: samples.uphill, violations: samples.violSamples, descended: samples.descended } : null
       }
     };

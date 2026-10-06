@@ -59,6 +59,7 @@ function refEvaluate(inst, sol) {
   const pen = Object.assign({}, REF_PENALTIES, ...Object.entries(inst.penalties || {}).filter(([, x]) => x != null).map(([k, x]) => ({ [k]: x })));
   let miles = 0, risk = 0, stops = 0, trucks = 0, late = 0, nViol = 0;
   const pairs = new Map(), delivered = inst.jobs.map(() => 0), rally = new Set(), usedVeh = new Set(), gotQty = new Set();
+  const chunksOf = inst.jobs.map(() => 0);
   for (const r of (sol && sol.routes) || []) {
     if (!r || !r.visits || !r.visits.length) continue;
     const v = r.vehicle, veh = inst.vehicles[v];
@@ -89,7 +90,7 @@ function refEvaluate(inst, sol) {
         const cand = banned ? null : (job.candidates || []).find((c) => c.node === vi.node);
         if (!cand) nViol++;
         else if (ch.qty > 0) { const key = job.requestId + '|' + vi.node; if (!pairs.has(key)) pairs.set(key, cand.platoonCost || 0); }
-        if (ch.qty > 0) gotQty.add(vi.node);
+        if (ch.qty > 0) { gotQty.add(vi.node); chunksOf[ch.job]++; }
         load += ch.qty; delivered[ch.job] += ch.qty;
         if (ch.qty > 0 && job.deadline != null) {
           const cap = pen.lateCapShare * pen.defer[job.tier] * pen.classFactor[job.classRank];
@@ -116,8 +117,10 @@ function refEvaluate(inst, sol) {
     if ((pa.bannedRally || []).includes(n) || !inst.nodes[n] || inst.nodes[n].kind !== 'rally') continue;
     if (inst.jobs.some((job) => (job.candidates || []).some((c) => c.node === n)) && !gotQty.has(n)) pinned += pen.pinUnused;
   }
+  // a split job: 3 x wS per positive chunk after its first (small-share fix of 2026-10-06)
+  const extra = chunksOf.reduce((a, k) => a + Math.max(0, k - 1), 0);
   const cost = { fuel: w.fuel * miles / pa.mpg, distance: w.distance * 0.5 * miles, risk: w.risk * risk,
-    simplicity: w.simplicity * (5 * stops + 25 * trucks), platoon: w.distance * platoon, lateness: late, deferral, pinned };
+    simplicity: w.simplicity * (5 * stops + 25 * trucks + 3 * extra), platoon: w.distance * platoon, lateness: late, deferral, pinned };
   return { total: Object.values(cost).reduce((a, b) => a + b, 0) + 1e7 * nViol, nViol, cost };
 }
 
@@ -192,13 +195,16 @@ test('review: split deliveries across trucks, platoon dedupe across trucks and l
   close(ev.routes[1].stops[1].arrive, 685); close(ev.routes[1].returnAt, 745);
   close(ev.routes[2].returnAt, 695);
   // miles 185 -> gallons 92.5 -> fuel 277.5; distance 3 x 0.5 x 185 = 277.5; risk 5 x 9 = 45;
-  // simplicity 2 x (5 x 5 stops + 25 x 3 trucks) = 200;
+  // simplicity 2 x (5 x 5 stops + 25 x 3 trucks + 3 x 2 extra chunks: J0 on V0 and V1, J2 on V0 and V1) = 212
+  //   (the extra-chunk charge of 2026-10-06; the zero chunk of J0 at D is no delivery);
   // platoon pairs: (R-1, A) 6 once (J0 on V0, J0 on V1 and J1 on V2 all share it); (R-2, B) 9; (R-2, A) 2;
   //   (R-1, D) only gets a zero chunk, so the platoon never comes: not charged. 17 x 3 = 51.
-  // lateness 7.5; every job fully delivered: deferral 0. total 858.5
+  // lateness 7.5; every job fully delivered: deferral 0. total 870.5
   close(ev.cost.fuel, 277.5); close(ev.cost.distance, 277.5); close(ev.cost.risk, 45);
-  close(ev.cost.simplicity, 200); close(ev.cost.platoon, 51); close(ev.cost.lateness, 7.5); close(ev.cost.deferral, 0);
-  close(ev.total, 858.5);
+  close(ev.cost.simplicity, 212); close(ev.cost.platoon, 51); close(ev.cost.lateness, 7.5); close(ev.cost.deferral, 0);
+  close(ev.total, 870.5);
+  // the later route in solution order carries the extra chunks: V1 2 x (5 x 2 + 25 + 3 x 2) = 82
+  close(ev.routes[0].cost.simplicity, 2 * (5 * 2 + 25)); close(ev.routes[1].cost.simplicity, 82);
   assert.deepEqual(plain(ev.delivered), [12, 1000, 4]);
   assert.deepEqual(plain(ev.deferred), []);
   assert.deepEqual(plain(ev.late), [{ job: 2, minutesLate: 5 }]);

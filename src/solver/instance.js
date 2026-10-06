@@ -270,6 +270,7 @@
     P.vehStamp = new I32(nV);
     P.rallyStamp = new I32(nN);
     P.nodeStamp = new I32(nN);                      // node received a positive quantity this call
+    P.jobStamp = new I32(mmax(1, nJ));              // job got its first positive chunk this call
     P.pairStamp = new I32(mmax(1, nReq * nN));
     return P;
   }

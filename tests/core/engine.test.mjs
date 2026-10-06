@@ -140,6 +140,14 @@ test('candidates: radius in road miles, dismounted <= 5 mi, fixed / directOnly /
   assert.deepEqual(problems(b3.instance), []);
 });
 
+test('a fractional travel radius prints rounded in the build warnings (no float noise)', () => {
+  const s = demoStore().getState();
+  const r0 = s.requests.find((r) => r.mobility === 'mounted' && !r.directOnly);
+  const state = Object.assign({}, s, { requests: s.requests.map((r) => (r === r0 ? Object.assign({}, r, { maxTravelMi: 0.1 + 0.2 }) : r)) });
+  const w = E.buildInstance(state, {}).warnings.filter((x) => x.startsWith(r0.id));
+  assert.ok(w.length && w.every((x) => / within 0\.3 mi by road/.test(x)), JSON.stringify(w));
+});
+
 test('convoy factor scales travel minutes, not miles', () => {
   const st = demoStore();
   st.dispatch({ type: 'settings/update', path: 'convoyFactor', value: 1 });
@@ -953,4 +961,90 @@ test('replan (tabu, SA, ACO): never worse than its warm start or the live best; 
     }
     assert.ok(enroute >= 1, 'a truck is en route');
   }
+});
+
+test('status: elapsedSec moves on its own while the solver posts nothing, and stops when the job ends', async () => {
+  // Before the fix elapsedSec changed only with solver progress: HiGHS posts nothing for 10 s or more
+  // inside a sub-MIP, and the Elapsed counter froze meanwhile.
+  const { ctx, eng } = freshEngine();
+  const W = ctx.solver.worker, handle = W.handle;
+  const SILENT_MS = 1400;
+  let silentFrom = null, silentTo = null;
+  W.handle = (msg, post) => new Promise((resolve) => {
+    silentFrom = performance.now();
+    setTimeout(() => { silentTo = performance.now(); resolve(handle(msg, post)); }, SILENT_MS);
+  });
+  const seen = [];
+  eng.subscribe((s) => seen.push({ at: performance.now(), phase: s.phase, elapsedSec: s.elapsedSec }));
+  await eng.run({ method: 'tabu', params: FAST.tabu });
+  const quiet = seen.filter((s) => silentFrom !== null && s.at > silentFrom && s.at < silentTo);
+  assert.ok(quiet.length >= 2, 'status updates while the solver is silent: ' + quiet.length);
+  for (let i = 1; i < quiet.length; i++) assert.ok(quiet[i].elapsedSec > quiet[i - 1].elapsedSec, 'elapsedSec grows');
+  assert.ok(quiet.every((s) => s.elapsedSec * 1000 <= performance.now()), 'from the job start');
+  const n = seen.length;
+  await new Promise((r) => setTimeout(r, 2 * ctx.core.engine.TICK_MS + 100));
+  assert.equal(seen.length, n, 'no ticks after the job is done');
+  assert.equal(eng.status().phase, 'done');
+});
+
+test('run params go on top of the Advanced-tab knobs: a partial params object changes only what it names', async () => {
+  // Before the fix run({ params: { seed: 7 } }) dropped settings.methodParams.tabu, so the run used the
+  // default 4,000 iterations and 200 moves per step instead of the 300 and 40 the planner set.
+  const { st, eng } = freshEngine();
+  assert.ok(st.dispatch({ type: 'settings/update', path: 'methodParams.tabu', value: { iterations: 300, neighborhood: 40, timeCapSec: 5 } }).ok);
+  const plan = await eng.run({ method: 'tabu', params: { seed: 7 } });
+  assert.equal(plan.params.seed, 7);
+  assert.equal(plan.params.iterations, 300);
+  assert.equal(plan.params.neighborhood, 40);
+  assert.equal(plan.params.timeCapSec, 5);
+  // a full params object still wins over the settings
+  const p2 = await eng.run({ method: 'tabu', params: { iterations: 200, neighborhood: 20, timeCapSec: 5, seed: 3 } });
+  assert.deepEqual([p2.params.iterations, p2.params.neighborhood, p2.params.seed], [200, 20, 3]);
+});
+
+test('estimate: a solver-knob change reuses the instance build; a burst of edits makes one build', async () => {
+  // Before the fix the build cache keyed on the whole scenario, so every Advanced-tab keystroke rebuilt
+  // the instance on the main thread (0.15-0.35 s) before the estimate.
+  const { ctx, st, eng } = freshEngine();
+  const E2 = ctx.core.engine, build = E2.buildInstance;
+  let builds = 0;
+  E2.buildInstance = function () { builds++; return build.apply(this, arguments); };
+  await eng.estimate('tabu', FAST.tabu);
+  assert.equal(builds, 1);
+  for (const it of [500, 600, 700]) {
+    st.dispatch({ type: 'settings/update', path: 'methodParams.tabu', value: { iterations: it, timeCapSec: 5 } });
+    st.dispatch({ type: 'settings/update', path: 'timeLimitSec', value: 120 + it / 100 });
+    const est = await eng.estimate('tabu');
+    assert.ok(est.seconds > 0, JSON.stringify(est));
+  }
+  assert.equal(builds, 1, 'method knobs and the time limit do not rebuild the instance');
+  // a setting the instance depends on rebuilds it, once for a burst of edits
+  const t0 = performance.now();
+  const ests = [];
+  for (const k of [7, 6, 5]) {
+    assert.ok(st.dispatch({ type: 'settings/update', path: 'maxRallyPoints', value: k }).ok);
+    ests.push(eng.estimate('tabu', FAST.tabu));
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  const out = await Promise.all(ests);
+  assert.equal(builds, 2, 'one build for three quick edits');
+  assert.ok(out.every((e) => e.seconds > 0));
+  assert.ok(performance.now() - t0 < E2.ESTIMATE_MAX_WAIT_MS + 5000);
+  const plan = await eng.run({ method: 'tabu', params: FAST.tabu });
+  assert.equal(builds, 2, 'the run reuses the build of the last estimate');
+  assert.ok(plan.rallyPoints.length <= 5, 'built on the last value (' + plan.rallyPoints.length + ' rally points)');
+});
+
+test('decodePlan: mipProof carries what Exact (MIP) proved; null for the heuristics; cancel without a proof', () => {
+  const res = quickSolve(B);
+  assert.equal(E.decodePlan(B, res, { method: 'tabu' }).mipProof, null);
+  const proof = { stopReason: 'gap', gap: 0.004, dualBound: 4700.5, gapTarget: 0.01, exactModel: true };
+  const mip = Object.assign({}, res, { method: 'mip', stopReason: 'gap', proof: proof, extra: { mipGap: 0.004, status: 'Within target gap' } });
+  const plan = E.decodePlan(B, mip, { method: 'mip' });
+  assert.deepEqual(plain(plan.mipProof), proof);
+  assert.equal(plan.stopReason, 'gap');
+  assert.equal(plan.mipStatus, 'Within target gap');
+  const cut = E.decodePlan(B, Object.assign({}, res, { method: 'mip' }), { method: 'mip', cancelled: true });
+  assert.equal(cut.mipProof.stopReason, 'cancel');
+  assert.equal(cut.stopReason, 'cancelled');
 });

@@ -164,12 +164,14 @@ test('period boundary: FIFO travel integrated across periods, time-weighted leg 
   close(ev.cost.lateness, (arrive2 - 1200) * 3 * 0.4);
   close(ev.cost.lateness, 19.714285714285715, '', 1e-9);
   assert.equal(ev.late.length, 1); close(ev.late[0].minutesLate, arrive2 - 1200);
-  // fuel 3 x 47.5 = 142.5; distance 3 x 0.5 x 95 = 142.5; risk 5 x 8.24348 = 41.217; simplicity 2 x (5 x 2 + 25) = 70;
+  // fuel 3 x 47.5 = 142.5; distance 3 x 0.5 x 95 = 142.5; risk 5 x 8.24348 = 41.217;
+  // simplicity 2 x (5 x 2 + 25 + 3 for J0's second chunk) = 76 (the extra-chunk charge of 2026-10-06);
   // platoon 3 x (5 at R1 + 0 at D1) = 15; deferral J1 200 x 0.9 = 180 + J2 5000 x 0.85 = 4250 -> 4430
   close(ev.cost.fuel, 142.5); close(ev.cost.distance, 142.5); close(ev.cost.risk, 5 * (2.4 + 4 * rf2 + 2.4));
-  close(ev.cost.simplicity, 70); close(ev.cost.platoon, 15); close(ev.cost.deferral, 4430);
-  close(ev.total, 142.5 + 142.5 + 5 * (4.8 + 4 * rf2) + 70 + 15 + (arrive2 - 1200) * 1.2 + 4430, 1e-12);
-  close(ev.total, 4860.931677018633, '', 1e-12);   // 285 + 41.217 + 70 + 15 + 19.714 + 4430
+  close(ev.cost.simplicity, 76); close(ev.cost.platoon, 15); close(ev.cost.deferral, 4430);
+  assert.equal(ev.stats.extraChunks, 1);
+  close(ev.total, 142.5 + 142.5 + 5 * (4.8 + 4 * rf2) + 76 + 15 + (arrive2 - 1200) * 1.2 + 4430, 1e-12);
+  close(ev.total, 4866.931677018633, '', 1e-12);   // 285 + 41.217 + 76 + 15 + 19.714 + 4430
 });
 
 test('preloaded en-route truck, partial delivery (deferral share), platoon cost per distinct (request, node)', () => {
@@ -368,4 +370,25 @@ test('explainDeferred: capacity (compatible trucks full)', () => {
   const sol = { routes: [{ vehicle: 1, visits: [visit(1, [1, 4]), visit(3, [2, 6])] }] };
   const e = reasonOf(inst, sol, 3);
   assert.equal(e.reason, 'capacity'); assert.equal(e.detail, 'trucks-full');
+});
+
+test('explainDeferred: the trucks-full note rounds loads to one decimal and puts the unit in the plural', () => {
+  const full = (edit, sol, job) => reasonOf(hand(edit), sol, job).note;
+  const j3 = (group, qty, unit) => ({ id: 'J3', requestId: 'R-3', group, qty, unit, tier: 0, classRank: 4, deadline: 900, hardDeadline: false,
+    candidates: [{ node: 3, platoonMiles: 1, platoonCost: 0.5 }], lockedTruck: null });
+  // 0.1 + 0.2 pallets on board = 0.30000000000000004 (the audit saw "9.999999999999998 of 10 pallet loaded")
+  let note = full((i) => { i.vehicles[1].capacity = 0.3; i.jobs[1].qty = 0.1; i.jobs[2].qty = 0.2; i.jobs.push(j3('cargo', 5, 'pallet')); },
+    { routes: [{ vehicle: 1, visits: [visit(1, [1, 0.1]), visit(3, [2, 0.2])] }] }, 3);
+  assert.match(note, /full \(0\.3 of 0\.3 pallets loaded\)\.$/, note);
+  note = full((i) => { i.vehicles[1].capacity = 1; i.jobs[1].qty = 0.25; i.jobs[2].qty = 0.75; i.jobs.push(j3('cargo', 5, 'pallet')); },
+    { routes: [{ vehicle: 1, visits: [visit(1, [1, 0.25]), visit(3, [2, 0.75])] }] }, 3);
+  assert.match(note, /\(1 of 1 pallet loaded\)/, note);
+  // fuel: gallons with a thousands separator, 'gal' as it is
+  note = full((i) => { i.jobs[0].qty = 2500; i.jobs.push(j3('fuel', 300, 'gal')); },
+    { routes: [{ vehicle: 0, visits: [visit(2, [0, 2500])] }] }, 3);
+  assert.match(note, /tanker that could carry it is full \(2,500 of 2,500 gal loaded\)/, note);
+  // a job without a unit: pallets for cargo
+  note = full((i) => { i.jobs.push(Object.assign(j3('cargo', 5), { unit: undefined })); },
+    { routes: [{ vehicle: 1, visits: [visit(1, [1, 4]), visit(3, [2, 6])] }] }, 3);
+  assert.match(note, /\(10 of 10 pallets loaded\)/, note);
 });

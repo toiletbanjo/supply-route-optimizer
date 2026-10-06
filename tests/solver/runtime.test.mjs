@@ -296,7 +296,11 @@ test('estimate: probe on a stub with known timing is close (1.5x even on a busy 
   const ec = S.estimate(inst, 'tabu', { iterations: 100000, timeCapSec: 5 }, settings);
   assert.equal(ec.capped, true);
   assert.equal(ec.seconds, 5);
-  assert.ok(ec.high >= 5 && ec.high <= 5.5);
+  assert.equal(ec.high, 5, 'the range ends at the cap (the run stops there)');
+  // below the cap too: about 3.6 s here (5 s is the smallest cap), and 1.5x that would be past it
+  const en = S.estimate(inst, 'tabu', { iterations: 3500, timeCapSec: 5 }, settings);
+  assert.equal(en.capSec, 5);
+  assert.ok(en.high <= 5 && en.seconds <= en.high, JSON.stringify([en.seconds, en.high]));
   assert.match(ec.basis, /stops at 5\.0 s|stops at 5 s/);
   S.estimate.clearCache(inst);
   assert.equal(S.estimate(inst, 'tabu', { iterations: 6000 }, settings).probe.cached, false);
@@ -327,17 +331,17 @@ test('estimate: MIP = its time limit (warm start inside it, as mip.js runs); bas
   assert.equal(e.source, 'limit');
   assert.equal(e.probe.limitSec, 60);
   assert.equal(e.probe.warmSec, 6);                      // min(10, max(2, 10% of 60), 30)
-  assert.equal(e.seconds, 60 + e.probe.overheadSec);
+  assert.equal(e.seconds, 60);
   assert.match(e.basis, /time limit/);
   assert.match(e.basis, /first 6 s of it go to a quick tabu search/);
   assert.match(e.basis, /proven gap/);
   assert.match(e.basis, /1%/);
-  assert.ok(e.low < e.seconds && e.high > e.seconds);
+  assert.ok(e.low < e.seconds && e.high === e.seconds, 'up to the limit, not past it');
   assert.equal(S.estimate(inst, 'mip', { timeLimitSec: 300 }, {}).probe.warmSec, 10);
   assert.equal(S.estimate(inst, 'mip', { timeLimitSec: 5 }, {}).probe.warmSec, 2);
   const cold = S.estimate(inst, 'mip', { timeLimitSec: 60, warmStart: false }, {});
   assert.equal(cold.probe.warmSec, 0);
-  assert.equal(cold.seconds, 60 + cold.probe.overheadSec);
+  assert.equal(cold.seconds, 60);
   const seeded = S.estimate(inst, 'mip', { timeLimitSec: 60 }, {}, { hasStart: true });
   assert.equal(seeded.probe.warmSec, 0);
   assert.match(seeded.basis, /starting from the best heuristic plan/);
@@ -351,7 +355,7 @@ test('estimate: MIP = its time limit (warm start inside it, as mip.js runs); bas
   assert.equal(many.perMethod.length, 2);
   assert.equal(many.perMethod[1].probe.warmSec, 0);
   assert.ok(Math.abs(many.seconds - many.perMethod[0].seconds - many.perMethod[1].seconds) < 1e-9);
-  assert.equal(many.perMethod[1].seconds, 30 + many.perMethod[1].probe.overheadSec);
+  assert.equal(many.perMethod[1].seconds, 30);
 });
 
 test('estimate: rough model when the method is not loaded (main thread)', () => {
@@ -368,7 +372,7 @@ test('estimate: rough model when the method is not loaded (main thread)', () => 
     assert.ok(e.probe.evalRate > 1000, m + ' rate ' + e.probe.evalRate);
   }
   const mip = S.estimate(inst, 'mip', { timeLimitSec: 30, warmStart: false }, {});
-  assert.equal(mip.seconds, 30 + mip.probe.overheadSec);
+  assert.equal(mip.seconds, 30);
 });
 
 // ---- real methods ------------------------------------------------------------------------------

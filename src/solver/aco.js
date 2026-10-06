@@ -520,7 +520,7 @@
       const tl = now();
       const st = {};
       const out = S.localSearch(instance, sol, {
-        rng: rng, maxIters: maxEvals, timeLimitMs: mmax(1, limit - now()), ruinRoutes: CFG.lsRuin, stats: st
+        rng: rng, now: now, maxIters: maxEvals, timeLimitMs: mmax(1, limit - now()), ruinRoutes: CFG.lsRuin, stats: st
       });
       const used = (st.evals || 0) + 1;
       evals += used; lsEvals += used;

@@ -223,6 +223,7 @@ function refEvaluate(inst, sol) {
   const okIdx = (x, n) => Number.isInteger(x) && x >= 0 && x < n;
   let nViol = 0, miles = 0, risk = 0, stops = 0, trucks = 0, lateness = 0, stability = 0;
   const delivered = inst.jobs.map(() => 0), lateMax = inst.jobs.map(() => 0), pairs = new Map(), rally = new Set(), used = new Set(), gotQty = new Set();
+  const chunksOf = inst.jobs.map(() => 0);
   for (const r of (sol && sol.routes) || []) {
     if (!r || !r.visits || !r.visits.length) continue;
     if (!okIdx(r.vehicle, inst.vehicles.length)) { nViol++; continue; }
@@ -257,6 +258,7 @@ function refEvaluate(inst, sol) {
         load += q; delivered[ch.job] += q;
         if (q > 0) {
           gotQty.add(vi.node);
+          chunksOf[ch.job]++;
           const late = arrive - job.deadline;
           // ETA slip (contract of 2026-10-06): lateness + slip share the lateness cap; lateness first
           const slip = typeof job.prevEta === 'number' && job.slipPerMin > 0 ? arrive - job.prevEta : 0;
@@ -287,7 +289,9 @@ function refEvaluate(inst, sol) {
   let platoon = 0;
   for (const c of pairs.values()) platoon += c;
   const cost = {
-    fuel: w.fuel * miles / pa.mpg, distance: w.distance * 0.5 * miles, risk: w.risk * risk, simplicity: w.simplicity * (5 * stops + 25 * trucks),
+    // a split job: 3 x wS per positive chunk after its first (small-share fix of 2026-10-06)
+    fuel: w.fuel * miles / pa.mpg, distance: w.distance * 0.5 * miles, risk: w.risk * risk,
+    simplicity: w.simplicity * (5 * stops + 25 * trucks + 3 * chunksOf.reduce((a, k) => a + Math.max(0, k - 1), 0)),
     platoon: w.distance * platoon, lateness, stability, deferral, pinned: pen.pinUnused * pinnedUnused.length
   };
   const late = lateMax.map((m, job) => ({ job, minutesLate: m })).filter((x) => x.minutesLate > 0);

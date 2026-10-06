@@ -23,6 +23,11 @@
 //   merge      { r1, v1, r2, v2 }                 fold visit (r2,v2) into visit (r1,v1) at the same node
 //   cross      { r1, i, r2, k }                   exchange route tails: r1 = r1[0..i) + r2[k..), r2 = r2[0..k) + r1[i..)
 //   exchange   { r1, v1, r2, v2 }                 swap the positions of two whole visits
+//   moveRally  { u, w }                           move every visit at rally node u to rally node w, a
+//                                                 candidate of every job there (localSearch sweeps only,
+//                                                 swept last and only while the plan uses maxRallyPoints
+//                                                 rally points; never sampled, so the walks' move mix is
+//                                                 unchanged)
 //
 // Tabu attributes (set by moves.describe / neighbors): move.adds and move.drops are lists of strings
 //   'j<job>v<vehicle>n<node>'  job delivered by vehicle at node      'j<job>d'  job (partly) deferred
@@ -41,10 +46,15 @@
   const COST_ONLY = { costOnly: true };
   const EMPTY = [];
   const FRACTIONS = [0.25, 1 / 3, 0.5, 2 / 3, 0.75];
+  const PIN_TRIES = 1;            // pin repairs tried per localSearch end phase while a pin gets nothing
+  const MIN_SHARE = 0.1;          // smallest new chunk a random move makes by filling a truck's last room (share of the job; see sliverOf)
 
   M.TYPES = ['relocate', 'split', 'insert', 'defer', 'replace', 'swap', 'twoOpt', 'orOpt', 'changeNode', 'merge', 'cross', 'exchange'];
   M.WEIGHTS = { relocate: 22, split: 6, insert: 12, defer: 3, replace: 6, swap: 12, twoOpt: 8, orOpt: 10, changeNode: 10, merge: 5, cross: 6, exchange: 6 };
   M.SWEEP_TYPES = ['relocate', 'insert', 'replace', 'swap', 'twoOpt', 'orOpt', 'changeNode', 'merge', 'cross', 'exchange', 'defer'];
+  // swept after SWEEP_TYPES, outside their shuffle, so the random stream (and so every search on a plan
+  // below the rally limit, where moveRally enumerates nothing) is the same as without it
+  M.SWEEP_LAST = ['moveRally'];
 
   // ---- copy-on-write helpers ---------------------------------------------------------------------
   function cr(route) { return { vehicle: route.vehicle, visits: route.visits.slice() }; }
@@ -219,6 +229,25 @@
     return out;
   };
 
+  // Every visit at rally node u goes to w. With w unused the rally count stays the same, so this trades
+  // a whole rally point (changeNode cannot while another truck still stops at u and the limit binds);
+  // with w in use it frees a rally slot.
+  BUILD.moveRally = function (P, routes, m) {
+    if (!okNode(P, m.u) || !okNode(P, m.w) || m.u === m.w) return null;
+    let out = null;
+    for (let r = 0; r < routes.length; r++) {
+      const vs = routes[r].visits;
+      let R = null;
+      for (let s = 0; s < vs.length; s++) {
+        if (vs[s].node !== m.u) continue;
+        if (!out) out = routes.slice();
+        if (!R) { R = cr(routes[r]); out[r] = R; }
+        R.visits[s] = { node: m.w, jobs: vs[s].jobs };
+      }
+    }
+    return out;
+  };
+
   function build(P, routes, m) {
     const f = m && BUILD[m.type];
     return f ? f(P, routes, m) : null;
@@ -335,11 +364,32 @@
     return qty * f;
   }
 
+  // Small shares. A random move that fills a truck's last bit of room splits a job into a sliver (10 +
+  // 390 gal at one node 13 h apart, 670 + 30 gal, 0.9 + 0.7 + 0.1 pallets, measured under tight
+  // capacities), which the walks of tabu and SA then carry along. So pickTarget skips a target whose new
+  // chunk would be under MIN_SHARE of the job (a fill below what was asked, or a split piece), unless the
+  // piece joins a chunk of the job already at that visit, or no other truck that may carry the job has
+  // room for MIN_SHARE of it (then only a small fill carries more). Moving or inserting all of `want` is
+  // always allowed, and the sweeps (eachTarget) still take a sliver that lowers the total, EXTRA_CHUNK
+  // included: rejecting those too left 50 gal of a 1,900 gal job deferred on a roomy instance, where
+  // moving 50 gal of another job made room for it.
+  function sliverOf(ctx, j, want, q, part) {
+    const P = ctx.P, eps = P.jEps[j], minQ = MIN_SHARE * P.jQty[j];
+    return q > eps && q < minQ - eps && (part || q < want - eps);
+  }
+  function roomElsewhere(ctx, j, rs, srcR) {
+    const P = ctx.P, need = MIN_SHARE * P.jQty[j] - P.jEps[j];
+    for (let a = 0; a < rs.length; a++) if (rs[a] !== srcR && freeCap(ctx, rs[a]) >= need) return true;
+    return false;
+  }
+  function carries(vi, j) { for (let c = 0; c < vi.jobs.length; c++) if (vi.jobs[c].job === j) return true; return false; }
+
   // Random target for `want` of job j: { r2, v2, p2, n2, q } or null. srcR/srcV exclude the source visit;
-  // freed is the source's rally node when the move empties it.
-  function pickTarget(ctx, rng, j, want, srcR, srcV, freed) {
+  // freed is the source's rally node when the move empties it; part: `want` is part of a chunk (split).
+  function pickTarget(ctx, rng, j, want, srcR, srcV, freed, part) {
     const P = ctx.P, rs = compatRoutes(ctx, j), cands = P.jCandNodes[j];
     if (!rs.length || !cands.length) return null;
+    let room = -1;                                 // roomElsewhere, once needed
     for (let attempt = 0; attempt < 6; attempt++) {
       const r2 = rs[rng.int(rs.length)];
       let q = want;
@@ -348,15 +398,21 @@
         if (free <= P.jEps[j]) continue;
         q = mmin(want, free);
       }
+      let mergeOnly = false;
+      if (sliverOf(ctx, j, want, q, part)) {
+        if (room < 0) room = roomElsewhere(ctx, j, rs, srcR) ? 1 : 0;
+        mergeOnly = room === 1;
+      }
       const vs = ctx.routes[r2].visits, L = vs.length;
-      if (L > 0 && rng() < 0.5) {
+      if (L > 0 && (mergeOnly || rng() < 0.5)) {
         const s0 = rng.int(L);
         for (let x = 0; x < L; x++) {
           const s = (s0 + x) % L;
           if (r2 === srcR && s === srcV) continue;
-          if (P.cand[j * P.nN + vs[s].node] >= 0) return { r2: r2, v2: s, p2: -1, n2: vs[s].node, q: q };
+          if (P.cand[j * P.nN + vs[s].node] >= 0 && (!mergeOnly || carries(vs[s], j))) return { r2: r2, v2: s, p2: -1, n2: vs[s].node, q: q };
         }
       }
+      if (mergeOnly) continue;
       const c0 = rng.int(cands.length);
       for (let x = 0; x < cands.length; x++) {
         const n2 = cands[(c0 + x) % cands.length];
@@ -365,7 +421,9 @@
     }
     return null;
   }
-  // Enumerates every target for `want` of job j; f(r2, v2, p2, n2, q) returns true to stop.
+  // Enumerates every target for `want` of job j; f(r2, v2, p2, n2, q) returns true to stop. No
+  // small-share rule here: a sweep takes a sliver only when it lowers the total (EXTRA_CHUNK included),
+  // and it then often makes room for a whole job (50 gal of one job moved so another is not deferred).
   function eachTarget(ctx, j, want, srcR, srcV, freed, f) {
     const P = ctx.P, rs = compatRoutes(ctx, j), cands = P.jCandNodes[j], nN = P.nN;
     for (let a = 0; a < rs.length; a++) {
@@ -413,8 +471,10 @@
     const a = randomChunk(ctx, rng);
     const ch = ctx.routes[a.r].visits[a.v].jobs[a.c];
     if (!(ch.qty > 2 * ctx.P.jEps[ch.job])) return null;
-    const t = pickTarget(ctx, rng, ch.job, splitQty(rng, ch.qty), a.r, a.v, -1);
+    const t = pickTarget(ctx, rng, ch.job, splitQty(rng, ch.qty), a.r, a.v, -1, true);
     if (!t || !(t.q > 0) || t.q >= ch.qty) return null;
+    // nor a sliver left behind (a split is never needed to carry more)
+    if (ch.qty - t.q < MIN_SHARE * ctx.P.jQty[ch.job] - ctx.P.jEps[ch.job]) return null;
     return { type: 'split', r1: a.r, v1: a.v, c1: a.c, q: t.q, r2: t.r2, v2: t.v2, p2: t.p2, n2: t.n2 };
   };
   GEN.insert = function (ctx, rng) {
@@ -774,10 +834,38 @@
     return false;
   };
 
-  // Calls cb(move) for every move of the given types (default SWEEP_TYPES) on sol; cb returns true to stop.
+  ENUM.moveRally = function (ctx, cb) {
+    const P = ctx.P, nN = P.nN;
+    // only while the plan uses maxRallyPoints rally points: below the limit changeNode opens a new
+    // point visit by visit (and sweeping this as well made every polish longer for nothing)
+    if (!ctx.rallyDistinct || !(ctx.rallyDistinct >= P.maxRally)) return false;
+    const done = new Uint8Array(nN);
+    for (let kv = 0; kv < ctx.nVis; kv++) {
+      const u = ctx.routes[ctx.viR[kv]].visits[ctx.viV[kv]].node;
+      if (!P.isRally[u] || done[u]) continue;
+      done[u] = 1;
+      // rally nodes every job delivered at u may use
+      let common = null;
+      for (let k2 = kv; k2 < ctx.nVis; k2++) {
+        const vi = ctx.routes[ctx.viR[k2]].visits[ctx.viV[k2]];
+        if (vi.node !== u) continue;
+        for (let c = 0; c < vi.jobs.length; c++) {
+          const j = vi.jobs[c].job;
+          if (!common) { common = []; const cn = P.jCandNodes[j]; for (let a = 0; a < cn.length; a++) if (P.isRally[cn[a]] && cn[a] !== u) common.push(cn[a]); }
+          else common = common.filter(function (n) { return P.cand[j * nN + n] >= 0; });
+        }
+      }
+      if (!common) continue;
+      for (let a = 0; a < common.length; a++) if (cb({ type: 'moveRally', u: u, w: common[a] })) return true;
+    }
+    return false;
+  };
+
+  // Calls cb(move) for every move of the given types (default SWEEP_TYPES and SWEEP_LAST) on sol; cb
+  // returns true to stop.
   M.forEach = function (instance, sol, cb, opts) {
     const ctx = (opts && opts.ctx) || M.context(instance, sol);
-    const types = (opts && opts.types) || M.SWEEP_TYPES;
+    const types = (opts && opts.types) || M.SWEEP_TYPES.concat(M.SWEEP_LAST);
     for (let i = 0; i < types.length; i++) {
       const f = ENUM[types[i]];
       if (f && f(ctx, cb)) return true;
@@ -808,6 +896,7 @@
       case 'merge': return 'merge:' + m.r2 + '.' + m.v2 + '>' + m.r1 + '.' + m.v1;
       case 'cross': return 'cross:' + m.r1 + '.' + m.i + '~' + m.r2 + '.' + m.k;
       case 'exchange': return 'exchange:' + m.r1 + '.' + m.v1 + '~' + m.r2 + '.' + m.v2;
+      case 'moveRally': return 'moveRally:' + m.u + '>' + m.w;
       default: return String(m.type);
     }
   }
@@ -875,6 +964,16 @@
         for (let c = 0; c < vi.jobs.length; c++) { drops.push(A(vi.jobs[c].job, veh[m.r], vi.node)); adds.push(A(vi.jobs[c].job, veh[m.r], m.n)); }
         break;
       }
+      case 'moveRally': {
+        for (let r = 0; r < routes.length; r++) {
+          const vs = routes[r].visits;
+          for (let v = 0; v < vs.length; v++) {
+            if (vs[v].node !== m.u) continue;
+            for (let c = 0; c < vs[v].jobs.length; c++) { drops.push(A(vs[v].jobs[c].job, veh[r], m.u)); adds.push(A(vs[v].jobs[c].job, veh[r], m.w)); }
+          }
+        }
+        break;
+      }
       case 'merge': {
         const src = routes[m.r2].visits[m.v2];
         if (m.r1 !== m.r2) {
@@ -937,18 +1036,225 @@
     return out;
   };
 
+  // ---- rally-point compound moves (tabu and SA restarts, the end phase of every localSearch) ------
+  // No single move, route ruin or refill empties a whole rally point. So while the plan uses
+  // maxRallyPoints rally points, a job whose only pickup points are unused rally points stays deferred
+  // and a pinned rally point the plan does not use (pinUnused each) stays unused. These moves trade
+  // whole rally points.
+
+  // Copy of instance whose jobs cannot use the `closed` nodes (sorted list) and whose job onlyJob (when
+  // given) can only use onlyNode; cached per instance (while its top-level fields are the same objects)
+  // and key. A plan built on the copy is valid for the real instance: its candidate lists are subsets.
+  const closedCopies = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function closedCopy(instance, P, closed, onlyJob, onlyNode) {
+    let entry = closedCopies ? closedCopies.get(instance) : null;
+    if (entry) for (const f in instance) if (instance[f] !== entry.src[f]) { entry = null; break; }
+    if (!entry) { entry = { src: Object.assign({}, instance), map: new Map() }; if (closedCopies) closedCopies.set(instance, entry); }
+    const key = closed.join(',') + (onlyJob != null ? '|' + onlyJob + '>' + onlyNode : '');
+    let inst2 = entry.map.get(key);
+    if (inst2) return inst2;
+    const shut = new Uint8Array(P.nN);
+    for (let c = 0; c < closed.length; c++) shut[closed[c]] = 1;
+    const jobs = instance.jobs.map(function (job, j) {
+      const cs = job.candidates || [];
+      if (j === onlyJob) return Object.assign({}, job, { candidates: cs.filter(function (x) { return x && x.node === onlyNode; }) });
+      for (let c = 0; c < cs.length; c++) {
+        if (cs[c] && shut[cs[c].node]) return Object.assign({}, job, { candidates: cs.filter(function (x) { return !(x && shut[x.node]); }) });
+      }
+      return job;
+    });
+    inst2 = Object.assign({}, instance, { jobs: jobs });
+    entry.map.set(key, inst2);
+    return inst2;
+  }
+  function withoutNodes(routes, shut, moved) {   // routes minus every visit at a shut node (moved[job] = 1 for their jobs)
+    return routes.map(function (rt) {
+      let hit = false;
+      for (let v = 0; v < rt.visits.length; v++) {
+        if (!shut[rt.visits[v].node]) continue;
+        hit = true;
+        if (moved) { const js = rt.visits[v].jobs; for (let c = 0; c < js.length; c++) moved[js[c].job] = 1; }
+      }
+      return hit ? { vehicle: rt.vehicle, visits: rt.visits.filter(function (vi) { return !shut[vi.node]; }) } : rt;
+    });
+  }
+
+  // The default construct order with each job shifted by a random amount (up to a quarter of the job
+  // count), so a shake tries another order while locked / Immediate jobs still tend to go first.
+  function noisyOrder(instance, rng) {
+    const base = S.constructOrder(instance, rng);
+    const w = mmax(2, base.length / 4);
+    const key = new F64(instance.jobs.length);
+    for (let i = 0; i < base.length; i++) key[base[i]] = i + rng() * w;
+    return base.slice().sort(function (a, b) { return key[a] - key[b]; });
+  }
+  S.noisyOrder = noisyOrder;
+
+  // Rally points of sol: { used: [node] (ascending), share: job shares delivered at each node, atCap
+  // (maxRallyPoints in use), pins: pinned rally points some job could use that get nothing, bound: at
+  // the cap with an unused pin, or with a (partly) deferred job that could use a rally point sol does
+  // not use }.
+  S.rallyState = function (instance, sol) {
+    const P = S.prepare(instance);
+    const routes = (sol && sol.routes) || EMPTY;
+    const seen = new Uint8Array(P.nN), got = new Uint8Array(P.nN), share = new F64(P.nN), used = [];
+    for (let r = 0; r < routes.length; r++) {
+      const vs = routes[r].visits;
+      for (let v = 0; v < vs.length; v++) {
+        const n = vs[v].node, js = vs[v].jobs;
+        if (!js.length || !okNode(P, n)) continue;
+        for (let c = 0; c < js.length; c++) {
+          if (js[c].qty > 0) got[n] = 1;
+          if (js[c].job >= 0 && js[c].job < P.nJ) share[n] += js[c].qty * P.jInvQty[js[c].job];
+        }
+        if (P.isRally[n] && !seen[n]) { seen[n] = 1; used.push(n); }
+      }
+    }
+    used.sort(function (a, b) { return a - b; });
+    const pins = [];
+    for (let a = 0; a < P.pinNodes.length; a++) if (!got[P.pinNodes[a]]) pins.push(P.pinNodes[a]);
+    const atCap = P.maxRally < Infinity && used.length >= P.maxRally;
+    let bound = atCap && pins.length > 0;
+    if (atCap && !bound) {
+      const dj = M.context(instance, sol).deferredJobs;
+      for (let a = 0; a < dj.length && !bound; a++) {
+        const cn = P.jCandNodes[dj[a]];
+        for (let c = 0; c < cn.length; c++) if (P.isRally[cn[c]] && !seen[cn[c]]) { bound = true; break; }
+      }
+    }
+    return { used: used, share: share, atCap: atCap, pins: pins, bound: bound };
+  };
+
+  // sol shaken around its rally points: 1-2 random rally points it uses (pinned ones too; with `must`,
+  // a rally point sol uses, that one and every other time one more) are closed, every visit there is
+  // removed, and what is then deferred is reinserted (the jobs sol already deferred first, then the
+  // rest; perturbed order, cheapest insertion, forced refill) on a copy of the instance whose jobs
+  // cannot use the closed points, so the freed rally slots go to other points. The caller polishes the
+  // result on the real instance. -> { solution, evals } or null when sol uses no rally point.
+  S.ruinRally = function (instance, sol, rng, must) {
+    const P = S.prepare(instance);
+    let used = S.rallyState(instance, sol).used;
+    if (!used.length) return null;
+    let closed;
+    if (must != null && used.indexOf(must) >= 0) {
+      // `must` and, every other time, one more at random
+      used = used.filter(function (n) { return n !== must; });
+      closed = [must];
+      if (used.length && rng() < 0.5) closed.push(used[rng.int(used.length)]);
+      closed.sort(function (a, b) { return a - b; });
+    } else {
+      rng.shuffle(used);
+      closed = used.slice(0, mmin(used.length, 1 + rng.int(2))).sort(function (a, b) { return a - b; });
+    }
+    const shut = new Uint8Array(P.nN);
+    for (let c = 0; c < closed.length; c++) shut[closed[c]] = 1;
+    const inst2 = closedCopy(instance, P, closed);
+    const routes = withoutNodes(sol.routes, shut, null);
+    // jobs sol defers go first, so they claim the freed rally slots before the moved ones do
+    const waiting = new Uint8Array(P.nJ), dj = M.context(instance, sol).deferredJobs;
+    for (let a = 0; a < dj.length; a++) waiting[dj[a]] = 1;
+    const order = noisyOrder(instance, rng);
+    const first = order.filter(function (j) { return waiting[j]; }), rest = order.filter(function (j) { return !waiting[j]; });
+    const ins = S.insertJobs(inst2, { routes: routes }, first.concat(rest), { rng: rng });
+    const rf = S.refill(inst2, ins.solution, { rng: rng });
+    return { solution: rf.solution, evals: ins.evals + rf.evals };
+  };
+
+  // Rally swap: sol with a rally point it does not use opened, by trading one it uses when it is at
+  // maxRallyPoints. The point to open: an unused pinned rally point (pin repair), else, while the limit
+  // binds, a rally point some job sol defers could use (opts.pinsOnly: pins only). One job that can use
+  // it is taken off the plan: one moved off the closed point when one can use it, else one of the three
+  // (deferred ones, unless it is a pin) with the cheapest platoon trip to it. When sol is at the
+  // limit, a rally point it uses that is not pinned is closed, every visit there removed. That job (on
+  // the opened point only), the moved jobs and the jobs sol defers are then reinserted in that order
+  // (cheapest insertion) on a copy of the instance whose jobs cannot use the closed point, and the
+  // forced refill follows. Each rally point that could be closed is tried and the cheapest result kept:
+  // the point that is cheapest to give up (its jobs fit at the points still open) is often not the
+  // least-loaded one. The caller polishes the result on the real instance. opts: { rng, maxEvals,
+  // pinsOnly, target (the point to open, when it is one of those) }. -> { solution, evals, opened,
+  // closed (node or -1), pin (bool) } or null (nothing to open, or every rally point in use is pinned).
+  S.rallySwap = function (instance, sol, opts) {
+    opts = opts || {};
+    const P = S.prepare(instance), nN = P.nN;
+    if (opts.pinsOnly && !P.pinNodes.length) return null;
+    const rng = opts.rng || SRO.util.rng(1);
+    if (!S.isNormalized(instance, sol)) sol = S.normalize(instance, sol);
+    const st = S.rallyState(instance, sol);
+    const waiting = new Uint8Array(P.nJ), dj = M.context(instance, sol).deferredJobs;
+    for (let a = 0; a < dj.length; a++) waiting[dj[a]] = 1;
+    let targets = st.pins;
+    const pin = targets.length > 0;
+    if (!pin) {
+      if (opts.pinsOnly || !st.bound) return null;
+      const inUse = new Uint8Array(nN), seen = new Uint8Array(nN);
+      for (let a = 0; a < st.used.length; a++) inUse[st.used[a]] = 1;
+      targets = [];
+      for (let a = 0; a < dj.length; a++) {
+        const cn = P.jCandNodes[dj[a]];
+        for (let c = 0; c < cn.length; c++) if (P.isRally[cn[c]] && !inUse[cn[c]] && !seen[cn[c]]) { seen[cn[c]] = 1; targets.push(cn[c]); }
+      }
+      targets.sort(function (a, b) { return a - b; });
+      if (!targets.length) return null;
+    }
+    const w = targets.indexOf(opts.target) >= 0 ? opts.target : targets[rng.int(targets.length)];
+    const able = [];
+    for (let j = 0; j < P.nJ; j++) if (P.cand[j * nN + w] >= 0 && P.jLockV[j] !== -2) able.push(j);
+    able.sort(function (a, b) { return P.candCost[a * nN + w] - P.candCost[b * nN + w] || a - b; });
+    const free = pin ? able : able.filter(function (j) { return waiting[j]; });
+    if (!free.length) return null;
+    const near = free[rng.int(mmin(3, free.length))];
+    const closeable = st.atCap ? st.used.filter(function (n) { return !P.pinned[n]; }) : [-1];
+    if (!closeable.length) return null;
+    const order = noisyOrder(instance, rng);
+    const maxEvals = opts.maxEvals != null ? opts.maxEvals : Infinity;
+    let evals = 0, best = null, bestE = null, bestClosed = -1;
+    for (let k = 0; k < closeable.length && evals < maxEvals; k++) {
+      const closed = closeable[k];
+      const moved = new Uint8Array(P.nJ), shut = new Uint8Array(nN);
+      if (closed >= 0) shut[closed] = 1;
+      let routes = closed >= 0 ? withoutNodes(sol.routes, shut, moved) : sol.routes;
+      let seed = near;
+      for (let a = 0; a < able.length; a++) if (moved[able[a]]) { seed = able[a]; break; }
+      routes = routes.map(function (rt) {             // the seed job off the plan
+        let hit = false;
+        for (let v = 0; v < rt.visits.length && !hit; v++) for (let c = 0; c < rt.visits[v].jobs.length; c++) if (rt.visits[v].jobs[c].job === seed) { hit = true; break; }
+        if (!hit) return rt;
+        const visits = [];
+        for (let v = 0; v < rt.visits.length; v++) {
+          const vi = rt.visits[v], js = vi.jobs.filter(function (x) { return x.job !== seed; });
+          if (js.length === vi.jobs.length) visits.push(vi); else if (js.length) visits.push({ node: vi.node, jobs: js });
+        }
+        return { vehicle: rt.vehicle, visits: visits };
+      });
+      const inst2 = closedCopy(instance, P, closed >= 0 ? [closed] : [], seed, w);
+      const list = [seed].concat(order.filter(function (j) { return j !== seed && moved[j]; }), order.filter(function (j) { return j !== seed && !moved[j] && waiting[j]; }));
+      const ins = S.insertJobs(inst2, { routes: routes }, list, { rng: rng, maxEvals: maxEvals - evals });
+      const rf = S.refill(inst2, ins.solution, { rng: rng, maxEvals: mmax(1, maxEvals - evals - ins.evals) });
+      const e = S.evaluate(instance, rf.solution, COST_ONLY);
+      evals += ins.evals + rf.evals + 1;
+      if (!best || (e.feasible && !bestE.feasible) || (e.feasible === bestE.feasible && e.total < bestE.total)) { best = rf.solution; bestE = e; bestClosed = closed; }
+    }
+    return { solution: best, evals: evals, opened: w, closed: bestClosed, pin: pin };
+  };
+  // Pin repair: rallySwap for unused pinned rally points only (every localSearch end phase uses it).
+  S.pinRepair = function (instance, sol, opts) { return S.rallySwap(instance, sol, Object.assign({}, opts, { pinsOnly: true })); };
+
   // ---- local search ---------------------------------------------------------------------------
-  function now() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
+  function clockNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 
   // First-improvement descent. Alternates a random phase (sample moves, take any improvement, stop
-  // after `patience` misses in a row) with a full systematic sweep over SWEEP_TYPES (take the first
-  // improving move, then back to the random phase). When a sweep finds nothing it tries compound moves
-  // unless opts.refill is false: forced insertion of every deferred job (SRO.solver.insertJobs with
-  // force) followed by a short nested descent, then the same after emptying one route ("ruin and
-  // refill", up to ruinRoutes routes). Ends at a local optimum of all of these, or when maxIters evaluations / timeLimitMs are
-  // used. Never returns a worse plan than its input, and never makes a violation-free plan infeasible.
+  // after `patience` misses in a row) with a full systematic sweep over SWEEP_TYPES then SWEEP_LAST
+  // (take the first improving move, then back to the random phase). When a sweep finds nothing it
+  // tries compound moves unless opts.refill is false: while a pinned rally point gets nothing, up to
+  // PIN_TRIES pin repairs (SRO.solver.pinRepair) each followed by a short nested descent; then forced
+  // insertion of every deferred job (SRO.solver.insertJobs with force) and the same descent, then the
+  // same after emptying one route ("ruin and refill", up to ruinRoutes routes). Ends at a local optimum
+  // of all of these, or when maxIters evaluations / timeLimitMs are used. Never returns a worse plan
+  // than its input, and never makes a violation-free plan infeasible.
   //   opts: { rng, seed, maxIters (default 100000), timeLimitMs (default 10000), patience, types,
-  //           refill (default true), ruinRoutes (routes emptied and refilled per end phase, default 3), stats }
+  //           refill (default true), ruinRoutes (routes emptied and refilled per end phase, default 3),
+  //           stats, now (the clock timeLimitMs runs on, in ms; the methods pass hooks.now; default
+  //           performance.now) }
   // Returns a normalized solution (for a malformed input that normalizing made worse and the search
   // could not beat, a shallow copy of the input); empty visits are dropped when that lowers the total.
   // opts.stats (an object) receives { evals, improvements, sweeps,
@@ -958,6 +1264,7 @@
     const P = S.prepare(instance);
     const rng = opts.rng || SRO.util.rng(opts.seed || 1);
     const maxIters = opts.maxIters != null ? opts.maxIters : 100000;
+    const now = typeof opts.now === 'function' ? opts.now : clockNow;
     const t0 = now(), deadline = t0 + (opts.timeLimitMs != null ? opts.timeLimitMs : 10000);
     const sweepTypes = opts.types || M.SWEEP_TYPES;
 
@@ -1016,7 +1323,7 @@
       sweeps++;
       ctx = M.context(instance, sol);
       let found = null, foundEval = null;
-      const types = rng.shuffle(sweepTypes.slice());
+      const types = rng.shuffle(sweepTypes.slice()).concat(opts.types ? EMPTY : M.SWEEP_LAST);
       const stopAt = function (m) {
         const nr = build(P, ctx.routes, m);
         evals++;
@@ -1033,9 +1340,29 @@
       }
       if (timeUp) break;
       if (!found && useRefill && S.refill) {
-        // compound moves: refill (forced insertion of every deferred job + short descent), then
-        // "empty one route and refill" for up to ruinRoutes routes in random order
-        const tries = [-1].concat(rng.shuffle(ctx.nonEmpty.slice()).slice(0, ruinRoutes));
+        // a short nested descent (which can defer again whatever does not pay) of a compound move's
+        // plan before judging it
+        const judge = function (start) {
+          const st = {};
+          const pol = S.localSearch(instance, start, {
+            rng: rng, refill: false, stats: st, now: now, timeLimitMs: mmax(0, deadline - now()),
+            maxIters: mmin(maxIters - evals, 20 * (ctx.nCh + ctx.nVis + 10))
+          });
+          evals += st.evals || 0;
+          const e = S.evaluate(instance, pol, COST_ONLY);
+          if (better(e)) { found = pol; foundEval = e; refills++; }
+        };
+        // compound moves: pin repair while a pinned rally point gets nothing (it may need a whole rally
+        // point traded for it, see pinRepair), refill (forced insertion of every deferred job + short
+        // descent), then "empty one route and refill" for up to ruinRoutes routes in random order
+        for (let a = 0; a < PIN_TRIES && P.pinNodes.length && !found && evals < maxIters; a++) {
+          if (now() > deadline) { timeUp = true; break; }
+          const pr = S.pinRepair(instance, sol, { rng: rng, maxEvals: maxIters - evals });
+          if (!pr) break;
+          evals += pr.evals;
+          judge(pr.solution);
+        }
+        const tries = found || timeUp ? [] : [-1].concat(rng.shuffle(ctx.nonEmpty.slice()).slice(0, ruinRoutes));
         for (let a = 0; a < tries.length && !found && evals < maxIters; a++) {
           if (now() > deadline) { timeUp = true; break; }
           let start = sol;
@@ -1044,21 +1371,13 @@
             out[tries[a]] = { vehicle: sol.routes[tries[a]].vehicle, visits: [] };
             start = { routes: out };
           }
-          // forced insertion of everything deferred (uphill allowed), then a short nested descent
-          // (which can defer again whatever does not pay) before judging it
+          // forced insertion of everything deferred (uphill allowed), then the short descent
           const c2 = M.context(instance, start);
           if (!c2.deferredJobs.length) continue;
           const rf = S.insertJobs(instance, start, c2.deferredJobs, { rng: rng, force: true, maxEvals: maxIters - evals });
           evals += rf.evals;
           if (rf.solution.routes === start.routes) continue;
-          const st = {};
-          const pol = S.localSearch(instance, rf.solution, {
-            rng: rng, refill: false, stats: st, timeLimitMs: mmax(0, deadline - now()),
-            maxIters: mmin(maxIters - evals, 20 * (ctx.nCh + ctx.nVis + 10))
-          });
-          evals += st.evals || 0;
-          const e = S.evaluate(instance, pol, COST_ONLY);
-          if (better(e)) { found = pol; foundEval = e; refills++; }
+          judge(rf.solution);
         }
         if (timeUp) break;
       }

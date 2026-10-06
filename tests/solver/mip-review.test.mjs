@@ -189,6 +189,8 @@ test('decode never overfills a truck: a sliver chunk HiGHS packs within its tole
   assert.ok(opt, 'truck 0 may carry the eps chunk at its first stop');
   const x = Float64Array.from(model.startValues);
   x[opt[2]] = 1; x[model.uCol[c]] = 0;
+  // job 3 is then delivered at two stops: the extra-chunk columns follow (evaluate charges that chunk)
+  x[model.gCol.get((3 * inst.vehicles.length + 0) * inst.nodes.length + node(0))] = 1;
   const bad = S.mip.checkValues(model, x, 1e-6);
   assert.deepEqual(plain(bad), [], 'within a 1e-6 tolerance these values are feasible');
   const sol = S.mip.decode(model, x);

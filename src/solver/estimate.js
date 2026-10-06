@@ -4,8 +4,9 @@
 //   SRO.solver.estimate(instance, method, params, settings, opts)
 //     -> { method, seconds, low, high, basis, capped, capSec, source: 'probe' | 'model' | 'limit',
 //          probe: { ms, iterations, budget, setupMs, perIterMs, evalRate, cached, rawSec } }
-//     seconds = expected wall time; low..high = the likely range; rawSec = before the timeCapSec cap.
-//     MIP: probe = { warmSec, limitSec, overheadSec }.
+//     seconds = expected wall time; low..high = the likely range, never past the time cap (a run stops
+//     there); rawSec = before the timeCapSec cap.
+//     MIP: probe = { warmSec, limitSec }; seconds = high = the limit.
 //   SRO.solver.estimateMany(instance, methods, paramsByMethod, settings, opts)
 //     -> { seconds, low, high, basis, perMethod: [estimate] }   (compare mode: run one after another,
 //        MIP seeded by the heuristics, so it has no warm-start phase of its own)
@@ -103,7 +104,6 @@
   // ... and has reported at least this many iterations (ACO asks shouldStop once per ant, so 100 calls
   // were only 4-5 rounds, the first of them 2-3x slower than the rest).
   const PROBE_MIN_ITERS = 10;
-  const MIP_OVERHEAD_SEC = 0.5;        // final decode, evaluate and dispose after the time limit
   const MIP_WARM_CAP_SEC = 10;         // mip.js caps its own warm-start tabu pass at 10 s
 
   // ---- small text helpers (format.js is main-thread only) ---------------------------------------
@@ -373,15 +373,17 @@
     let limit = p.timeLimitSec > 0 ? p.timeLimitSec : 300;
     if (p.timeCapSec > 0) limit = mmin(limit, p.timeCapSec);
     const warm = p.warmStart && !opts.hasStart ? mmin(MIP_WARM_CAP_SEC, mmax(2, 0.1 * limit), 0.5 * limit) : 0;
-    const seconds = limit + MIP_OVERHEAD_SEC;
+    // the decode and evaluate after the limit take a fraction of a second; "up to" the limit is what
+    // the planner set and reads, so the range ends there
+    const seconds = limit;
     const gapPct = mround(p.mipGap * 1000) / 10;
     const basis = 'Runs until its ' + secs(limit) + ' time limit' +
       (warm ? ' (the first ' + secs(warm) + ' of it go to a quick tabu search for a starting plan)' : opts.hasStart ? ', starting from the best heuristic plan' : '') +
       ', then reports the best plan found and its proven gap (how far it could be from the best possible plan). ' +
       'It stops sooner only if that gap falls to ' + gapPct + '%' + (p.mipGap === 0 ? ' (a proof of the best plan)' : '') + '.';
     return {
-      method: 'mip', seconds: seconds, low: mmin(limit, warm + 1), high: seconds + 1, basis: basis,
-      capped: true, capSec: limit, source: 'limit', probe: { warmSec: warm, limitSec: limit, overheadSec: MIP_OVERHEAD_SEC }
+      method: 'mip', seconds: seconds, low: mmin(limit, warm + 1), high: seconds, basis: basis,
+      capped: true, capSec: limit, source: 'limit', probe: { warmSec: warm, limitSec: limit }
     };
   }
 
@@ -508,9 +510,9 @@
     const seconds = capped ? cap : raw;
     const spread = source === 'probe' ? 1.5 : 2.5;
     let low = seconds / spread, high = seconds * spread;
-    if (isFinite(cap)) {
-      high = mmin(high, cap + 0.5);
-      if (capped) { low = mmin(cap, raw / spread); high = cap + 0.5; }
+    if (isFinite(cap)) {                         // the run stops at the cap, so the range does too
+      high = mmin(high, cap);
+      if (capped) { low = mmin(cap, raw / spread); high = cap; }
     }
     if (capped && isFinite(raw)) basis += ' That is more than the ' + secs(cap) + ' limit, so it stops at ' + secs(cap) + ' with the best plan found by then.';
     else if (isFinite(cap) && isFinite(raw)) basis += ' It stops early at the ' + secs(cap) + ' limit if it gets there first.';

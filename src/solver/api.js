@@ -190,7 +190,7 @@
     const explain = S.explainDeferred ? S.explainDeferred(instance, evaluation) : [];
     const warnings = [];
     if (typeof res.total === 'number' && mabs(res.total - evaluation.total) > 1e-6 * mmax(1, mabs(evaluation.total))) {
-      warnings.push(labelOf(method) + ' reported a total of ' + res.total + ' but the plan evaluates to ' + evaluation.total + '; the evaluated total is used.');
+      warnings.push(labelOf(method) + ' reported a total of ' + res.total.toFixed(1) + ' but the plan evaluates to ' + evaluation.total.toFixed(1) + '; the evaluated total is used.');
     }
     const out = {};
     for (const k in res) if (Object.prototype.hasOwnProperty.call(res, k)) out[k] = res[k];

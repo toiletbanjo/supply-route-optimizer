@@ -36,6 +36,8 @@
 //       rally point no platoon can reach. plan.violations = [{ code, detail }] (evaluate's).
 //       plan.rallyPoints / stats.rallyPoints cover the whole window (done stops too); stats count what is
 //       planned from now on, plan.windowStats the whole window (done + planned) for a re-plan.
+//       plan.mipProof = what Exact (MIP) proved ({ stopReason 'optimal' | 'gap' | 'time' | 'cancel' |
+//       'error', gap, dualBound, gapTarget, exactModel }; null for the heuristics).
 //   engine.contingencyStart(build) -> solution | null   (the adjusted old plan, a warm start)
 //   engine.shouldPlan(state) -> bool   (the trigger rule for automatic planning; replaceable)
 //   engine.pendingRequests(state), engine.activePlan(state), engine.legCoords(leg), engine.mapRoutes(plan)
@@ -47,11 +49,15 @@
 //       the heuristics run on the main thread (the page freezes while they run; Exact (MIP) is off).
 //   engine.status() -> { phase: 'idle' | 'preparing' | 'estimating' | 'running' | 'done' | 'error' |
 //       'cancelled', kind, method, methods, methodIndex, fraction, bestCost, elapsedSec, message,
-//       history: [{ t, best }], error, highsReady, mode, planId, planIds }
+//       history: [{ t, best }], error, highsReady, mode, planId, planIds }. While a job runs,
+//       elapsedSec is refreshed every TICK_MS even when the solver posts nothing.
 //   engine.subscribe(fn) -> unsubscribe     fn(status) on every change. Progress is NOT dispatched to
 //       the store (that would write localStorage every 250 ms); only finished plans are.
-//   engine.estimate(method | [methods], params?) -> Promise<{ seconds, low, high, basis }>
-//   engine.run({ method, params, windowId, timeCapSec }) -> Promise<Plan>
+//   engine.estimate(method | [methods], params?) -> Promise<{ seconds, low, high, basis }>  reuses
+//       the cached instance build (its key leaves out method, methodParams and timeLimitSec); a new
+//       build waits until the inputs settle (ESTIMATE_SETTLE_MS, at most ESTIMATE_MAX_WAIT_MS).
+//   engine.run({ method, params, windowId, timeCapSec }) -> Promise<Plan>  params on top of
+//       settings.methodParams[method] (a partial params object changes only the knobs it names)
 //   engine.compare(methods, { params, timeCapSec }) -> Promise<Plan[]>  one stored Plan per method
 //   engine.cancel() -> Promise<Plan | Plan[] | null>  terminates the worker, stores the best plan so far
 //       with cancelled: true, restarts the worker on next use
@@ -70,6 +76,9 @@
   E.HORIZON_HOURS = 72;
   E.PATH_PRECISION = 5;
   E.WARM_DELAY_MS = 1500;
+  E.TICK_MS = 500;                    // status().elapsedSec is refreshed at least this often while a job runs
+  E.ESTIMATE_SETTLE_MS = 250;         // an estimate on changed inputs waits until they have not changed for this long ...
+  E.ESTIMATE_MAX_WAIT_MS = 1500;      // ... but at most this long
   E.DEFAULT_ETA_SLIP_PER_MIN = 1;     // re-plan cost per minute a load arrives after its approved ETA
   E.GROUPS = ['fuel', 'cargo'];
 
@@ -84,6 +93,7 @@
   function clone(x) { return SRO.util.deepClone(x); }
   function S() { return SRO.solver; }
   function fmt() { return SRO.core.format; }
+  function miText(x) { return fmt().qty(Math.round(x * 10) / 10, 'mi'); }   // a radius in a warning: '12.5 mi', '50 mi'
   function geo() { return SRO.core.geo; }
   function wallNow() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
   function userError(msg, code) { const e = new Error(msg); e.code = code || 'engine'; e.userFacing = true; return e; }
@@ -456,11 +466,11 @@
       inRange.sort(function (a, b) { return a.platoonMiles - b.platoonMiles || a.p - b.p; });
       const keep = inRange.filter(function (c, i) { return i < maxC || c.hint || pinned[c.gridId]; });
       if (hintId && !keep.some(function (c) { return c.hint; })) {
-        warnings.push(r.id + ': the requested pickup point is not a usable rally point within ' + m.radius + ' mi by road; the solver picks another.');
+        warnings.push(r.id + ': the requested pickup point is not a usable rally point within ' + miText(m.radius) + ' by road; the solver picks another.');
       }
       if (!keep.length) {
         const reach = Object.keys(hubPt).some(function (h) { return pm.minutes[hubPt[h]][d] < INF && pm.minutes[d][hubPt[h]] < INF; });
-        warnings.push(r.id + ' (' + (r.unitName || r.designator || r.id) + '): no rally point within ' + m.radius + ' mi by road, so it is delivered direct' +
+        warnings.push(r.id + ' (' + (r.unitName || r.designator || r.id) + '): no rally point within ' + miText(m.radius) + ' by road, so it is delivered direct' +
           (reach ? '.' : ', but no road from a hub reaches it (closed road), so it waits for the next window.'));
         candByReq[r.id] = { list: [direct], fallback: true, mob: m };
         return;
@@ -1171,6 +1181,10 @@
       runtimeSec: rd(runtimeSec),
       mipGap: typeof ex.mipGap === 'number' ? ex.mipGap : null,
       mipStatus: ex.status != null ? ex.status : null,
+      // what Exact (MIP) proved: { stopReason: 'optimal' | 'gap' | 'time' | 'cancel' | 'error', gap,
+      // dualBound, gapTarget, exactModel } (mip.js result.proof); null for the heuristics
+      mipProof: res.proof ? Object.assign({}, res.proof) : (m.cancelled && (m.method || res.method) === 'mip'
+        ? { stopReason: 'cancel', gap: null, dualBound: null, gapTarget: null, exactModel: null } : null),
       stopReason: m.cancelled ? 'cancelled' : (res.stopReason || null),
       cancelled: !!m.cancelled,
       parentPlanId: maps.parentPlanId || null,
@@ -1269,7 +1283,7 @@
 
   // ==== runtime: status, worker client, jobs ========================================================
   const rt = {
-    store: null, unsub: null, opts: {}, listeners: [], client: null, job: null, buildCache: null, autoKey: null, jobSeq: 0,
+    store: null, unsub: null, opts: {}, listeners: [], client: null, job: null, buildCache: null, pendingBuild: null, autoKey: null, jobSeq: 0,
     status: { phase: 'idle', kind: null, method: null, methods: null, methodIndex: null, fraction: 0, bestCost: null, elapsedSec: 0,
       message: '', history: [], error: null, highsReady: null, mode: null, planId: null, planIds: [] }
   };
@@ -1422,18 +1436,38 @@
     const set = state.scenario.settings || {};
     return { timeLimitSec: num(set.timeLimitSec, 300), methodParams: clone(set.methodParams || {}), method: set.method };
   }
+  // The Advanced-tab knobs (settings.methodParams[method]) with o.params on top: a partial o.params
+  // ({ seed: 7 }) changes only the knobs it names.
   function paramsFor(state, method, o) {
     const set = state.scenario.settings || {};
-    const base = (o && o.params && (o.params[method] || (typeof o.params === 'object' && !Array.isArray(o.params) && !o.params.tabu && !o.params.sa && !o.params.aco && !o.params.mip ? o.params : null))) ||
-      (set.methodParams && set.methodParams[method]) || {};
-    const p = Object.assign({}, base);
+    const given = (o && o.params && (o.params[method] || (typeof o.params === 'object' && !Array.isArray(o.params) && !o.params.tabu && !o.params.sa && !o.params.aco && !o.params.mip ? o.params : null))) || {};
+    const p = Object.assign({}, (set.methodParams && set.methodParams[method]) || {}, given);
     if (o && isNum(o.timeCapSec)) { p.timeCapSec = o.timeCapSec; if (method === 'mip') p.timeLimitSec = o.timeCapSec; }
     return p;
   }
+  // What an instance build depends on: the settings the solver reads only (method, its knobs, the
+  // time limit) are left out, so changing a knob in the Advanced tab reuses the cached build (0.15-0.35 s
+  // on the main thread otherwise).
+  const SOLVER_ONLY_SETTINGS = { method: true, methodParams: true, timeLimitSec: true };
+  let sigMemo = { set: null, sig: '' };
+  function settingsSig(set) {
+    if (set !== sigMemo.set) {
+      const rest = {};
+      Object.keys(set || {}).forEach(function (k) { if (!SOLVER_ONLY_SETTINGS[k]) rest[k] = set[k]; });
+      sigMemo = { set: set, sig: JSON.stringify(rest) };
+    }
+    return sigMemo.sig;
+  }
+  function buildKey(state, o) {
+    const sc = state.scenario || {};
+    return [state.requests, state.plans, Math.floor(num(state.clock && state.clock.simMin, 0)), sc.fleet, sc.hubs, sc.rally, sc.zones,
+      settingsSig(sc.settings), !!o.contingency, o.windowId || '', o.parentPlanId || ''];
+  }
+  function sameKey(a, b) { return !!a && !!b && a.length === b.length && a.every(function (x, i) { return x === b[i]; }); }
   function getBuild(state, o) {
-    const key = [state.requests, state.scenario, state.plans, Math.floor(num(state.clock && state.clock.simMin, 0)), !!o.contingency, o.windowId || '', o.parentPlanId || ''];
+    const key = buildKey(state, o);
     const c = rt.buildCache;
-    if (c && c.key.length === key.length && c.key.every(function (x, i) { return x === key[i]; })) return c.value;
+    if (c && sameKey(c.key, key)) return c.value;
     const value = E.buildInstance(state, { contingency: !!o.contingency, windowId: o.windowId, parentPlanId: o.parentPlanId });
     if (o.contingency) {
       const pid = value.maps.parentPlanId;
@@ -1473,6 +1507,19 @@
       fraction: 0, bestCost: null, elapsedSec: 0, message: 'Routing on the road network...', history: [], error: null, planId: null, planIds: [] });
 
     function elapsed() { return (wallNow() - job.started) / 1000; }
+    // The Elapsed counter moves on its own: HiGHS can post nothing for 10 s or more while it works
+    // inside a sub-MIP or a cut round, and a view should not look frozen meanwhile.
+    function tick() {
+      job.tick = null;
+      if (job.done || job.cancelled || rt.job !== job) return;
+      setStatus({ elapsedSec: elapsed() });
+      armTick();
+    }
+    function armTick() {
+      job.tick = setTimeout(tick, E.TICK_MS);
+      if (job.tick && typeof job.tick.unref === 'function') job.tick.unref();   // (Node: never keeps a test alive)
+    }
+    armTick();
     function onProgress(p) {
       if (job.cancelled || job.done) return;
       if (p.best) { job.best = p.best; job.bestMethod = p.method || job.method; }
@@ -1541,6 +1588,7 @@
       });
     }).then(function (out) {
       job.done = true;
+      if (job.tick) { clearTimeout(job.tick); job.tick = null; }
       rt.job = null;
       const plans = job.plans;
       const last = plans[plans.length - 1] || null;
@@ -1556,6 +1604,7 @@
     }, function (err) {
       if (job.cancelled) return finishCancelled(job);
       job.done = true;
+      if (job.tick) { clearTimeout(job.tick); job.tick = null; }
       rt.job = null;
       setStatus({ phase: 'error', error: (err && err.message) || String(err), message: (err && err.message) || 'The solver stopped with an error.', elapsedSec: elapsed() });
       throw err;
@@ -1571,6 +1620,7 @@
   // Cancel: the plan found so far is kept (stored with cancelled: true).
   function finishCancelled(job) {
     job.done = true;
+    if (job.tick) { clearTimeout(job.tick); job.tick = null; }
     rt.job = null;
     const elapsedSec = (wallNow() - job.started) / 1000;
     let out = null;
@@ -1628,13 +1678,36 @@
   };
   E.busy = function () { return !!rt.job; };
 
+  // The instance an estimate runs on. A cached build is used at once; otherwise the build waits until
+  // its inputs have not changed for ESTIMATE_SETTLE_MS (at most ESTIMATE_MAX_WAIT_MS), so a burst of
+  // edits (typing in a settings field) makes one main-thread build instead of one per keystroke, and
+  // the estimates asked meanwhile share it.
+  function estimateBuild() {
+    const st0 = getStore().getState();
+    let key = buildKey(st0, {});
+    if (rt.buildCache && sameKey(rt.buildCache.key, key)) return Promise.resolve({ state: st0, build: rt.buildCache.value });
+    if (rt.pendingBuild) return rt.pendingBuild;
+    const t0 = wallNow(), store = rt.store;
+    const pb = rt.pendingBuild = new Promise(function (resolve, reject) {
+      function settle() {
+        if (rt.store !== store) { if (rt.pendingBuild === pb) rt.pendingBuild = null; reject(userError('The planner engine was restarted.', 'no-store')); return; }
+        const st = store.getState(), k2 = buildKey(st, {});
+        if (!sameKey(k2, key) && wallNow() - t0 < E.ESTIMATE_MAX_WAIT_MS) { key = k2; setTimeout(settle, E.ESTIMATE_SETTLE_MS); return; }
+        if (rt.pendingBuild === pb) rt.pendingBuild = null;
+        try { resolve({ state: st, build: getBuild(st, {}) }); } catch (e) { reject(e); }
+      }
+      setTimeout(settle, E.ESTIMATE_SETTLE_MS);
+    });
+    return pb;
+  }
+
   E.estimate = function (method, params) {
-    let state;
-    try { state = getStore().getState(); } catch (e) { return Promise.reject(e); }
+    try { getStore(); } catch (e) { return Promise.reject(e); }
+    return estimateBuild().then(function (b) { return estimateOn(b.state, b.build, method, params); });
+  };
+  function estimateOn(state, build, method, params) {
     const multi = Array.isArray(method);
     const methods = multi ? method : [method || state.scenario.settings.method || 'tabu'];
-    let build;
-    try { build = getBuild(state, {}); } catch (e) { return Promise.reject(e); }
     if (!build.instance.jobs.length) return Promise.resolve({ seconds: 0, low: 0, high: 0, basis: 'No requests are waiting for a plan.' });
     const settings = solverSettings(state);
     const pBy = {};
@@ -1659,7 +1732,7 @@
         if (e && e.code === 'cancelled') return local();
         throw e;
       });
-  };
+  }
 
   // Methods the picker can offer, with availability (Exact (MIP) needs HiGHS in the worker).
   E.methods = function () {
@@ -1701,7 +1774,7 @@
     if (rt.unsub) rt.unsub();
     rt.store = store;
     rt.opts = opts || {};
-    rt.buildCache = null;
+    rt.buildCache = null; rt.pendingBuild = null;
     rt.autoKey = null;
     rt.unsub = store.subscribe(function (state) { onState(state); });
     if (rt.opts.warm !== false && root.document) {
@@ -1714,7 +1787,7 @@
   E._reset = function () {
     if (rt.unsub) rt.unsub();
     if (rt.client) rt.client.terminate();
-    rt.store = null; rt.unsub = null; rt.client = null; rt.job = null; rt.buildCache = null; rt.autoKey = null; rt.listeners.length = 0;
+    rt.store = null; rt.unsub = null; rt.client = null; rt.job = null; rt.buildCache = null; rt.pendingBuild = null; rt.autoKey = null; rt.listeners.length = 0;
     rt.status = { phase: 'idle', kind: null, method: null, methods: null, methodIndex: null, fraction: 0, bestCost: null, elapsedSec: 0, message: '', history: [], error: null, highsReady: null, mode: null, planId: null, planIds: [] };
   };
 })(typeof self !== 'undefined' ? self : globalThis);
