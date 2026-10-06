@@ -19,6 +19,12 @@
   const ui = SRO.ui = SRO.ui || {};
   function K() { return ui.plannerKit; }
   const h = function () { return ui.h.apply(null, arguments); };
+  // Plan status in the same plain word as Outputs / History: a plan another approval replaced reads
+  // 'Replaced' (the data field stays plan.superseded, and the badge class is-superseded).
+  function statusOf(plan) {
+    const s = K().planStatus(plan);
+    return s && s.key === 'superseded' ? Object.assign({}, s, { label: 'Replaced' }) : s;
+  }
 
   const RUN_PHASES = ['preparing', 'estimating', 'running'];
   const PERIOD_KEYS = { Day: 'day', Dusk: 'dusk', Night: 'night', Dawn: 'dawn' };
@@ -584,7 +590,7 @@
             : 'Load or submit requests first (Queue), then press Plan now.')));
         return;
       }
-      const stt = k.planStatus(plan);
+      const stt = statusOf(plan);
       const win = k.planWindow(plan);
       const title = h('div.pp-title-row',
         h('h2.h2.pp-name', { title: plan.name, 'data-testid': 'plan-name' }, plan.name || plan.id),
@@ -624,7 +630,7 @@
           'data-testid': 'plan-picker',
           onChange: function (e) { K().showPlan(e.target.value); }
         }, list.map(function (p) {
-          const s2 = k.planStatus(p);
+          const s2 = statusOf(p);
           return h('option', { value: p.id, selected: p === plan }, p.name + ' (' + k.methodLabel(p.method) + ', ' + s2.label.toLowerCase() + ')');
         }));
         sel.value = plan.id;
@@ -683,7 +689,7 @@
       const approve = h('button.btn.btn-primary.pp-approve', {
         type: 'button', 'data-testid': 'approve', disabled: !!(plan.approved || plan.superseded),
         onClick: function () { self.approve(plan); }
-      }, ui.icon('check'), plan.approved ? 'Approved' : plan.superseded ? 'Superseded' : 'Approve plan');
+      }, ui.icon('check'), plan.approved ? 'Approved' : plan.superseded ? 'Replaced' : 'Approve plan');
       const snap = h('button.btn.btn-secondary', { type: 'button', 'data-testid': 'snapshot', onClick: function () { self.snapshot(plan); } }, ui.icon('download'), 'Save snapshot');
       const cmp = prev ? h('button.btn.btn-secondary', {
         type: 'button', 'aria-pressed': String(self.showDiff || !!plan.parentPlanId), 'data-testid': 'compare-previous', disabled: !!plan.parentPlanId,

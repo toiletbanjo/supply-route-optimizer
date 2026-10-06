@@ -829,7 +829,9 @@ async function runFlow(browser, fileUrl, vp) {
   check(bar2 > bar1, 'progress bar advanced', [bar1, bar2]);
   nums.truckMoves = { atHub: tp0 && [+tp0.lat.toFixed(5), +tp0.lon.toFixed(5)], leg1: tp1 && [+tp1.lat.toFixed(5), +tp1.lon.toFixed(5)], leg2: tp2 && [+tp2.lat.toFixed(5), +tp2.lon.toFixed(5)] };
   await shots(page, tag, '15-mine-en-route', { before: async () => { await page.locator(c1).scrollIntoViewIfNeeded(); } });
-  // contingency re-plan: R1's ETA moves 25 min later -> "Updated"
+  // contingency re-plan: R1's ETA moves 25 min later -> "Updated" with what changed, until seen
+  // (keep the note up for the screenshots; the moment on screen that counts as seen is checked below)
+  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 1e9; });
   const etaNew = await page.evaluate(({ p, r1 }) => {
     const q = JSON.parse(JSON.stringify(p));
     q.id = 'P-TEST2'; q.parentPlanId = 'P-TEST1'; q.name = 'Test re-plan'; q.createdAt = window.SRO.app.store.getState().clock.simMin;
@@ -847,9 +849,27 @@ async function runFlow(browser, fileUrl, vp) {
   check(await visible(page, c1 + ' .psg-updated'), 'card: "Updated" badge');
   const etaTxt = await page.evaluate((v) => window.SRO.core.format.time24(v), etaNew);
   check((await text(page, c1 + ' .psg-eta-time')) === etaTxt, 'card shows the new ETA ' + etaTxt);
+  const chg = await text(page, c1 + ' .psg-change-note');
+  check(chg.startsWith('Updated:') && chg.includes('ETA now ' + etaTxt) && !chg.includes('Pickup moved'), 'card says what changed: "Updated: ETA now ' + etaTxt + '."', chg);
+  check(R && R.updatedChange && R.updatedChange.kind === 'eta' && R.updatedChange.etaChanged === true && R.updatedChange.planId === 'P-TEST2', 'store: the change (eta, from P-TEST2) is on the request', R && R.updatedChange);
   check(await count(page, c1 + ' .psg-map-track.leaflet-container') === 1, 'map still shown after the re-plan');
   await shots(page, tag, '16-mine-updated', { before: async () => { await page.locator(c1).scrollIntoViewIfNeeded(); } });
   await shots(page, tag, '17-mine-delayed', { themes: ['dark'], before: async () => { await page.locator(c4).scrollIntoViewIfNeeded(); } });
+  check((await reqById(page, r1)).updated === true, '"Updated" stays while it has not been on screen for the moment that counts as seen');
+  // seen: the note on screen for a moment (here 1.5 s) -> request/seen. Leave the tab and come back
+  // (a hidden tab does not count), bring the note into view, and wait.
+  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 1500; });
+  await showTab(page, act, 'request');
+  await showTab(page, act, 'myrequests');
+  await page.locator(c1 + ' .psg-change-note').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(300);
+  check((await reqById(page, r1)).updated === true, 'not cleared before the moment has passed');
+  const seenOk = await page.waitForFunction((id) => !window.SRO.app.store.getState().requests.find((r) => r.id === id).updated, r1, { timeout: 8000 }).then(() => true, () => false);
+  await settle(page);
+  check(seenOk && !(await visible(page, c1 + ' .psg-updated')) && !(await visible(page, c1 + ' .psg-change-note')), 'after a moment on screen request/seen clears "Updated" and the note', seenOk);
+  R = await reqById(page, r1);
+  check(R && !('updatedChange' in R) && R.eta === etaNew, 'seen: the change note is cleared, the new ETA stays', R && [R.eta, R.updatedChange]);
+  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 4000; });
   // delivered
   await tick(etaNew + 1);
   R = await reqById(page, r1);
@@ -927,6 +947,10 @@ async function editAndSplitCases(browser, fileUrl) {
   const vp = { width: 390, height: 844, touch: true };
   const { context, page, errors, blocked } = await openApp(browser, fileUrl, vp);
   const act = actor(page, vp);
+  // one warm-up reload: Chromium can drop localStorage writes made in a new context's first document
+  // on its first reload (see planner-scenario.spec.mjs); the reload check below must not hit that
+  await page.reload();
+  await waitApp(page);
   await quickProfile(page);
   await settle(page);
   await act.tap(V('request') + ' .psg-tile[data-class="III"]');
@@ -986,6 +1010,18 @@ async function editAndSplitCases(browser, fileUrl) {
   await act.tap(V('request') + ' .psg-submit');
   R = await reqById(page, rid);
   check(R && R.deadline === 960 && R.lines[0].onHand === 1800, 'stored deadline matches the preview (1600)', R && [R.deadline, R.lines[0].onHand]);
+  check(R && R.reportedAt === 420, 'the new on-hand count is the report time (reportedAt 0700)', R && R.reportedAt);
+  // later, an NLT-only edit: the run-out still counts from the 0700 report (request.reportedAt), not
+  // from when the request was first sent (0600) or from now
+  await page.evaluate(() => window.SRO.app.store.dispatch({ type: 'clock/tick', simMin: 450 }));
+  await settle(page);
+  await act.tap(V('myrequests') + ' .psg-req[data-id="' + rid + '"] .psg-edit');
+  const prev3 = await text(page, V('request') + ' .psg-immediate');
+  check(prev3.includes('(1600)'), 'edit preview after a re-report: run-out still 1600 (reported at 0700)', prev3);
+  await act.tap(V('request') + ' .psg-nlt-chips .chip[data-nlt="1440"]');
+  await act.tap(V('request') + ' .psg-submit');
+  R = await reqById(page, rid);
+  check(R && R.nlt === 1440 && R.deadline === 960 && R.reportedAt === 420, 'NLT-only edit after a re-report: deadline stays 1600, reportedAt stays 0700', R && [R.nlt, R.deadline, R.reportedAt]);
 
   // split: 60 cases of MREs, 20 on Alpha-2, 20 on Bravo-2, 20 carried to the next window
   const split = await page.evaluate(() => {
@@ -1027,6 +1063,89 @@ async function editAndSplitCases(browser, fileUrl) {
   check((await text(page, cs + ' .psg-truck-chip')).startsWith('Alpha-2') && (await text(page, cs + ' .psg-eta-time')) === split.etaA, 'tracking follows the first truck (Alpha-2, ETA ' + split.etaA + ')');
   await page.locator(cs).scrollIntoViewIfNeeded();
   await shots(page, '390x844', '18-mine-split', { themes: ['dark', 'night'] });
+
+  // a re-plan that moves only the second stop of the split (Bravo-2 to another drop point, 15 min
+  // later): the platoon is "Updated" and the card says which delivery changed
+  await page.evaluate(() => { window.SRO.ui.psg.myRequestsView.seenDwellMs = 1e9; });
+  const moved = await page.evaluate((id) => {
+    const SRO = window.SRO, S = SRO.app.store, st = S.getState(), G = SRO.core.geo;
+    const p = JSON.parse(JSON.stringify(st.plans.find((x) => x.id === 'P-SPLIT')));
+    const used = p.routes.map((rt) => rt.stops[0].gridId);
+    const gc = SRO.data.grid.filter((g) => g.rallyCandidate && !used.includes(g.id)).map((g) => ({ g, d: G.haversineMi(st.profile, g) })).sort((a, b) => a.d - b.d)[0].g;
+    Object.assign(p, { id: 'P-SPLIT-R', parentPlanId: 'P-SPLIT', name: 'Split re-plan', createdAt: 425, approved: false, approvedAt: null, superseded: false });
+    const s0 = p.routes[1].stops[0];
+    Object.assign(s0, { nodeKey: 'rally:' + gc.id, gridId: gc.id, lat: gc.lat, lon: gc.lon, label: gc.name, arrive: 625, depart: 640 });
+    const br = p.byRequest[id];
+    br.stops[1] = Object.assign({}, br.stops[1], { gridId: gc.id, lat: gc.lat, lon: gc.lon, label: gc.name, eta: 625 });
+    const a = S.dispatch({ type: 'plan/store', plan: p, now: 425 });
+    const b = S.dispatch({ type: 'plan/approve', planId: 'P-SPLIT-R', now: 425 });
+    return { ok: a.ok && b.ok, err: a.error || b.error, c: SRO.ui.psg.placeName(gc), eta: SRO.core.format.time24(625) };
+  }, split.id);
+  check(moved.ok, 're-plan of the split stored and approved', moved.err);
+  await settle(page);
+  R = await reqById(page, split.id);
+  const uc = R && R.updatedChange;
+  check(R && R.updated === true && uc && uc.kind === 'moved' && !uc.pickupMoved && !uc.etaChanged && uc.others.length === 1 && uc.others[0].truckId === 'Bravo-2',
+    'second stop of the split moved: request updated (first pickup and ETA unchanged)', uc);
+  const splitNote = await text(page, cs + ' .psg-change-note');
+  check(splitNote.includes('Second delivery (Bravo-2) now at ') && splitNote.includes(moved.c) && splitNote.includes(', ETA ' + moved.eta + '.') && !splitNote.includes('Pickup moved'),
+    'card: "Updated: Second delivery (Bravo-2) now at ' + moved.c + ', ETA ' + moved.eta + '."', splitNote);
+  check(await visible(page, cs + ' .psg-updated'), 'split card: "Updated" badge');
+  check((await text(page, cs + ' .psg-also')).includes(moved.c), '"Also coming" shows the new drop point', await text(page, cs + ' .psg-also'));
+  await page.locator(cs + ' .psg-change-note').scrollIntoViewIfNeeded();
+  await shots(page, '390x844', '18b-mine-split-updated', { themes: ['dark'] });
+  // a tap on the card counts as seen; a reload right after the tap keeps it (the save is debounced
+  // and flushed on pagehide)
+  await act.tap(cs + ' .psg-change-note');
+  const pendingSave = await page.evaluate(() => window.SRO.app.store.hasPendingSave());
+  R = await reqById(page, split.id);
+  check(R && R.updated === false && !(await visible(page, cs + ' .psg-updated')) && !(await visible(page, cs + ' .psg-change-note')), 'tap on the card: request/seen clears "Updated"', R && R.updated);
+  await page.reload();
+  await waitApp(page);
+  R = await reqById(page, split.id);
+  check(pendingSave === true, 'the save after the tap was still pending (debounced) when the page reloaded', pendingSave);
+  check(R && R.updated === false && R.seenAt !== undefined, 'reload right after the tap: the seen request stays seen', R && [R.updated, R.seenAt]);
+  // and a reload right after a submit keeps the new request
+  const before = (await S(page)).requests.length;
+  const nRes = await page.evaluate(() => {
+    const S = window.SRO.app.store, p = S.getState().profile;
+    return S.dispatch({ type: 'request/submit', request: { unitName: p.unitName, designator: p.designator, lat: p.lat, lon: p.lon, gridId: p.gridId, mobility: 'mounted',
+      lines: [{ classId: 'I', itemId: 'water-bottled', option: '0.5L', qty: 5, unit: 'case', onHand: null }], urgencyRequested: 'Routine', nlt: 1080 } });
+  });
+  await page.reload();
+  await waitApp(page);
+  const afterReload = await S(page);
+  check(nRes.ok && afterReload.requests.length === before + 1 && afterReload.requests.some((r) => r.id === nRes.id), 'reload right after a submit keeps the request', [before, afterReload.requests.length]);
+  await page.evaluate((id) => window.SRO.app.store.dispatch({ type: 'request/cancel', id }), nRes.id);
+  await showTab(page, act, 'myrequests');
+
+  // the remainder planned in a later window: that plan covers only the 20 left, brings 10 and carries
+  // 10 on. "N more next window" is the plan's deferredQty, not the line total minus what this plan brings
+  const rem = await page.evaluate((id) => {
+    const SRO = window.SRO, S = SRO.app.store, st = S.getState(), G = SRO.core.geo;
+    const p = st.profile;
+    const g = SRO.data.grid.filter((x) => x.rallyCandidate).map((x) => ({ x, d: G.haversineMi(p, x) })).sort((a, b) => a.d - b.d)[0].x;
+    const t = st.scenario.fleet.find((x) => x.id === 'Alpha-2');
+    const hub = st.scenario.hubs.find((x) => x.id === t.hubId);
+    const rt = { truckId: t.id, type: t.type, color: t.color, freq: t.freq, depart: 740, returnAt: 860,
+      stops: [{ seq: 1, nodeKey: 'rally:' + g.id, kind: 'rally', gridId: g.id, lat: g.lat, lon: g.lon, label: g.name, arrive: 800, depart: 815,
+        deliveries: [{ requestId: id, lineIdx: 0, qty: 10, unit: 'case', classId: 'I' }], pickups: [{ requestId: id, platoonMiles: 2 }] }],
+      legs: [{ depart: 740, arrive: 800, path: G.encodePolyline([[hub.lat, hub.lon], [g.lat, g.lon]]) }, { depart: 815, arrive: 860, path: G.encodePolyline([[g.lat, g.lon], [hub.lat, hub.lon]]) }] };
+    const stop = { truckId: t.id, stopSeq: 1, nodeKind: 'rally', gridId: g.id, lat: g.lat, lon: g.lon, label: g.name, eta: 800, done: false, stopsBefore: 0 };
+    const plan = { id: 'P-REM', windowId: 'W-D1-1200', name: 'Remainder', createdAt: 425, routes: [rt],
+      deferred: [{ requestId: id, lineIdx: 0, qty: 10, unit: 'case', group: 'cargo', reason: 'capacity', detail: 'trucks-full', note: '' }],
+      byRequest: { [id]: Object.assign({}, stop, { qtyByLine: { 0: 10 }, deferredQty: { 0: 10 }, stops: [stop] }) } };
+    const a = S.dispatch({ type: 'plan/store', plan, now: 425 });
+    const b = S.dispatch({ type: 'plan/approve', planId: 'P-REM', now: 425 });
+    return { ok: a.ok && b.ok, err: a.error || b.error, eta: SRO.core.format.time24(800) };
+  }, split.id);
+  check(rem.ok, 'remainder plan for the next window stored and approved', rem.err);
+  await settle(page);
+  R = await reqById(page, split.id);
+  check(R && R.status === 'partial' && R.updated === false, 'remainder plan: still partial, not "Updated" (a first plan for that window)', R && [R.status, R.updated]);
+  const part2 = await text(page, cs + ' .psg-partial');
+  check(part2.includes('10 of the remaining 20 cases MREs, Mixed menus') && part2.includes('ETA ' + rem.eta) && part2.includes('10 cases more next window') && !part2.includes('50'),
+    'partial line from deferredQty: "10 of the remaining 20 cases ...; 10 cases more next window" (not 50 more)', part2);
   // My requests left at its top (the tall split card first); a new request goes below the fold, and
   // "View my requests" must open on it rather than where the tab was left
   await page.evaluate(() => { document.querySelector('#psg-root .psg-body').scrollTop = 0; });

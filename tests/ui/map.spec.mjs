@@ -15,6 +15,12 @@
 //     machine (no watchdog fallback on re-enable, one-tap retry), drawing-session robustness, rapid theme
 //     switching, shell theme following, 320x568 and 2560x1440 layouts, blocked storage, reload, reduced
 //     motion, long names, truck-label contrast, compact-map framing above the attribution
+//   - integration checks (integrationChecks): destroy() at any moment (same task, microtask, mid zoom /
+//     pan / fly, inside the map's own events) without errors and no-op calls after it; a map created at
+//     zero size keeps the view its caller set; legs given as encoded polylines (plan.routes) draw and
+//     animate exactly as coords; overlapping routes drawn side by side and each visible (screenshot
+//     pixels) at island and city zoom, after animated zooms and pans; highlighted route on top; chevrons;
+//     a click on one of two adjacent lines picks that line's truck
 // Screenshots go to /tmp/claude-0/ui-shots/map/ at 320x568, 390x844, 1440x900 and 2560x1440.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -559,6 +565,420 @@ async function reviewChecks(browser, base, allBags) {
   }
 }
 
+// ---- integration checks: map lifecycle races, caller-set views on a hidden map, legs given as encoded
+// polylines (plan.routes), overlapping routes in lanes ------------------------------------------------
+const INTEG_HELPERS = String.raw`
+  // vertices of an SVG path as client-px polylines (one per M)
+  window.__pathPts = (el) => {
+    const d = el.getAttribute('d') || '', ctm = el.getScreenCTM(), svg = el.ownerSVGElement, out = [];
+    const re = /([ML])\s*(-?[\d.]+)[ ,]\s*(-?[\d.]+)/g;
+    let m, cur = null;
+    while ((m = re.exec(d))) {
+      const p = svg.createSVGPoint(); p.x = +m[2]; p.y = +m[3];
+      const q = p.matrixTransform(ctm);
+      if (m[1] === 'M' || !cur) { cur = []; out.push(cur); }
+      cur.push({ x: q.x, y: q.y });
+    }
+    return out;
+  };
+  // nearest point on polylines to p: { d, x, y }
+  window.__nearest = (p, lines) => {
+    let best = { d: Infinity, x: NaN, y: NaN };
+    lines.forEach((ln) => {
+      for (let i = 1; i < ln.length; i++) {
+        const a = ln[i - 1], b = ln[i], dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+        let t = l2 ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const x = a.x + t * dx, y = a.y + t * dy, d = Math.hypot(x - p.x, y - p.y);
+        if (d < best.d) best = { d, x, y };
+      }
+    });
+    return best;
+  };
+  // drawn route lines of one color (client px)
+  window.__drawn = (color) => Array.from(document.querySelectorAll('#map .sro-pane-routes path.sro-route'))
+    .filter((e) => (e.getAttribute('stroke') || '').toLowerCase() === color.toLowerCase()).flatMap(__pathPts);
+  // the road geometry of a route (its legs' points, coords or encoded path) in client px
+  window.__raw = (r) => {
+    const m = H.map.leaflet, mr = document.getElementById('map').getBoundingClientRect();
+    return (r.legs || [r]).map((l) => SRO.ui.map.legCoords(l)).filter(Boolean)
+      .map((cs) => cs.map((c) => { const p = m.latLngToContainerPoint(c); return { x: mr.left + p.x, y: mr.top + p.y }; }));
+  };
+  // points every 5 px along each route's road where another route's road runs within 2 px for 10 px
+  // either side (shared road, not a crossing, not the ends of the shared stretch), away from controls and
+  // the map edge: where routes overlap. others = the routes sharing it.
+  window.__overlaps = (routes) => {
+    const mr = document.getElementById('map').getBoundingClientRect();
+    const raw = routes.map(__raw);
+    const avoid = Array.from(document.querySelectorAll('#map .sro-stop, #map .leaflet-control, #map .sro-note, #map .sro-basemap'))
+      .map((e) => e.getBoundingClientRect()).filter((b) => b.width && b.height);
+    const ok = (p) => p.x > mr.left + 18 && p.x < mr.right - 18 && p.y > mr.top + 18 && p.y < mr.bottom - 18 &&
+      !avoid.some((b) => p.x > b.left - 16 && p.x < b.right + 16 && p.y > b.top - 16 && p.y < b.bottom + 16);
+    return routes.map((r, i) => {
+      const pts = [];
+      raw[i].forEach((ln) => {
+        const samples = [];
+        let next = 0, acc = 0;
+        for (let k = 1; k < ln.length; k++) {
+          const a = ln[k - 1], b = ln[k], len = Math.hypot(b.x - a.x, b.y - a.y);
+          for (; next <= acc + len; next += 5) {
+            const t = len ? (next - acc) / len : 0, p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+            samples.push(ok(p) ? { x: p.x, y: p.y, near: routes.map((o, j) => j).filter((j) => j !== i && __nearest(p, raw[j]).d < 2) } : null);
+          }
+          acc += len;
+        }
+        for (let k = 2; k < samples.length - 2; k++) {
+          const w = samples.slice(k - 2, k + 3);
+          if (w.some((q) => !q)) continue;
+          const others = samples[k].near.filter((j) => w.every((q) => q.near.indexOf(j) >= 0));
+          if (others.length) pts.push({ x: samples[k].x, y: samples[k].y, others });
+        }
+      });
+      return pts;
+    });
+  };
+  // decodes a PNG (base64) to ImageData
+  window.__png = async (b64) => {
+    const blob = await (await fetch('data:image/png;base64,' + b64)).blob();
+    const bm = await createImageBitmap(blob), c = new OffscreenCanvas(bm.width, bm.height), g = c.getContext('2d');
+    g.drawImage(bm, 0, 0);
+    return g.getImageData(0, 0, bm.width, bm.height);
+  };
+  // share of points p with a pixel of the route's colour (as drawn: 0.95 over the casing) within r px
+  window.__seen = (img, pts, hex, r) => {
+    const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)), k = [10, 15, 19];
+    const want = c.map((v, i) => v * 0.95 + k[i] * 0.05);
+    let hit = 0;
+    pts.forEach((p) => {
+      let found = false;
+      for (let y = Math.round(p.y) - r; y <= Math.round(p.y) + r && !found; y++) {
+        for (let x = Math.round(p.x) - r; x <= Math.round(p.x) + r && !found; x++) {
+          if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
+          const o = (y * img.width + x) * 4, d = img.data;
+          if (Math.hypot(d[o] - want[0], d[o + 1] - want[1], d[o + 2] - want[2]) < 40) found = true;
+        }
+      }
+      if (found) hit++;
+    });
+    return pts.length ? hit / pts.length : 0;
+  };
+`;
+
+async function integrationChecks(browser, base, allBags) {
+  // I1. lifecycle: destroy() at any time (same task, microtask, frame, mid-animation, inside the map's
+  // own events) leaves no error behind, and every call after it is a no-op ---------------------------
+  {
+    const { ctx, page, bag } = await openPage(browser, base + '?theme=dark', { viewport: { width: 1000, height: 700 } });
+    allBags.push(['integration-lifecycle', bag]);
+    const race = await page.evaluate(async () => {
+      const errors = [];
+      const onErr = (e) => errors.push(String(e.message || e.reason || e));
+      window.addEventListener('error', onErr); window.addEventListener('unhandledrejection', onErr);
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
+      const B = [[24.9, 121.1], [25.1, 121.6]];
+      const scen = {
+        'setView then destroy, same task': async (m) => { m.setView([24.5, 121], 10, { animate: false }); m.destroy(); },
+        'leaflet setView then destroy, same task': async (m) => { m.leaflet.setView([24.5, 121], 10, { animate: false }); m.destroy(); },
+        'fitTo then destroy in a microtask': async (m) => { m.fitTo(B); await Promise.resolve(); m.destroy(); },
+        'routes + setView then destroy': async (m) => { m.setRoutes(H.routes); m.leaflet.setView([24.5, 121], 11, { animate: false }); m.destroy(); },
+        'animated zoom, destroy same task': async (m) => { m.setRoutes(H.routes); m.leaflet.zoomIn(); m.destroy(); },
+        'animated zoom, destroy next frame': async (m) => { m.leaflet.zoomIn(); await frame(); m.destroy(); },
+        'animated zoom, destroy at 60 ms': async (m) => { m.setRoutes(H.routes); m.leaflet.zoomIn(); await sleep(60); m.destroy(); },
+        'animated fitTo, destroy at 30 ms': async (m) => { m.fitTo(B, { animate: true }); await sleep(30); m.destroy(); },
+        'animated pan, destroy at 50 ms': async (m) => { m.leaflet.panBy([200, 100]); await sleep(50); m.destroy(); },
+        'flyTo, destroy at 100 ms': async (m) => { m.leaflet.flyTo([24.5, 121.2], 11, { duration: 0.5 }); await sleep(100); m.destroy(); },
+        'theme + tiles + fitTaiwan, destroy same task': async (m) => { m.fitTaiwan(); m.setTheme('night'); m.setTilesEnabled(true); m.destroy(); },
+        'create then destroy': async (m) => { m.destroy(); },
+        'destroy inside moveend': async (m) => { m.setRoutes(H.routes); m.leaflet.once('moveend', () => m.destroy()); m.leaflet.setView([24.5, 121], 10, { animate: false }); },
+        'destroy inside zoomend (animated)': async (m) => { m.setRoutes(H.routes); m.leaflet.once('zoomend', () => m.destroy()); m.leaflet.zoomIn(); await sleep(400); },
+        'destroy inside zoomstart': async (m) => { m.setRoutes(H.routes); m.leaflet.once('zoomstart', () => m.destroy()); m.leaflet.zoomIn(); await sleep(400); },
+        'destroy inside move (pan animation)': async (m) => { m.setRoutes(H.routes); m.leaflet.once('move', () => m.destroy()); m.leaflet.panBy([300, 0]); await sleep(400); },
+        'destroy inside click:route': async (m) => {
+          m.setRoutes(H.routes); m.on('click:route', () => m.destroy());
+          const hit = m.el.querySelector('path.sro-route-hit'), b = hit.getBoundingClientRect();
+          hit.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: b.left + b.width / 2, clientY: b.top + b.height / 2 }));
+        },
+        'destroy inside a tiles event': async (m) => { m.on('tiles', () => m.destroy()); m.setTilesEnabled(false); },
+        'destroy while hidden, then shown': async (m, div) => { div.style.display = 'none'; await frame(); m.destroy(); div.style.display = 'block'; },
+        'destroy while drawing a zone': async (m) => { m.enableZoneDrawing({ kind: 'closed' }); m.destroy(); }
+      };
+      const res = {};
+      for (const k of Object.keys(scen)) {
+        const div = document.createElement('div');
+        div.style.cssText = 'position:absolute;left:10px;top:10px;width:480px;height:320px';
+        document.body.appendChild(div);
+        let m = null, threw = null;
+        try { m = SRO.ui.map.create(div, { theme: 'dark' }); await scen[k](m, div); } catch (e) { threw = e.message; }
+        await sleep(20);
+        res[k] = { destroyed: !!(m && m.isDestroyed()), left: div.querySelectorAll('*').length, threw };
+        div.remove();
+      }
+      await sleep(1000);          // pending frames, the 250 ms zoom-end timer, fly frames
+      // every call after destroy is a no-op
+      const div = document.createElement('div');
+      div.style.cssText = 'position:absolute;left:10px;top:10px;width:480px;height:320px';
+      document.body.appendChild(div);
+      const m = SRO.ui.map.create(div, { theme: 'dark' });
+      m.destroy();
+      let after = 'ok';
+      try {
+        m.destroy();
+        m.setRoutes(H.routes); m.setTrucks(H.trucksAt(470)); m.setZones(H.zones); m.setHubs(H.hubs); m.setRally(H.rally); m.setPlatoons(H.platoons);
+        m.setView([24, 121], 9); m.fitTo([[24, 121], [25, 122]]); m.fitTaiwan(); m.setTheme('night'); m.setRoadsVisible(false);
+        m.setTilesEnabled(true); m.invalidateSize();
+        const off = m.on('click:route', () => {}); off();
+        const s = m.enableZoneDrawing({ kind: 'closed' }); s.cancel();
+        if (typeof off !== 'function' || !s || m.isDrawing()) after = 'bad return values';
+      } catch (e) { after = 'threw ' + e.message; }
+      await sleep(300);
+      const left = div.querySelectorAll('*').length;
+      div.remove();
+      window.removeEventListener('error', onErr); window.removeEventListener('unhandledrejection', onErr);
+      return { res, errors, after, left };
+    });
+    const bad = Object.entries(race.res).filter(([, v]) => !v.destroyed || v.left || v.threw);
+    check('destroy() at any time: same task, microtask, next frame, mid zoom/pan/fly, inside map events, hidden', bad.length === 0 && race.errors.length === 0, { scenarios: Object.keys(race.res).length, bad, errors: race.errors.slice(0, 5) });
+    check('calls after destroy() are no-ops (no throw, no DOM, no drawing session)', race.after === 'ok' && race.left === 0, { after: race.after, left: race.left });
+
+    // I2. a map created at zero size keeps the view its caller set; with no caller view it fits Taiwan
+    const views = await page.evaluate(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const TPE = [[24.98, 121.42], [25.12, 121.62]];
+      const cases = {
+        'fitTo while hidden': (m) => m.fitTo(TPE),
+        'setView while hidden': (m) => m.setView([22.62, 120.30], 12),
+        'leaflet setView while hidden': (m) => m.leaflet.setView([23.97, 121.60], 11),
+        'fitTo right after show (same task)': (m, div) => { div.style.display = 'block'; m.fitTo(TPE); },
+        'fitTaiwan while hidden': (m) => m.fitTaiwan(),
+        'no caller view': () => {},
+        'fitTo on a visible map': (m, div) => { div.style.display = 'block'; m.fitTo(TPE); }
+      };
+      const out = {};
+      for (const k of Object.keys(cases)) {
+        const div = document.createElement('div');
+        div.style.cssText = 'display:none;position:absolute;left:0;top:0;width:420px;height:360px';
+        document.body.appendChild(div);
+        const visibleFirst = k === 'fitTo on a visible map';
+        if (visibleFirst) div.style.display = 'block';
+        const m = SRO.ui.map.create(div, { theme: 'dark' });
+        cases[k](m, div);
+        div.style.display = 'block';
+        await sleep(350);
+        const lm = m.leaflet, b = lm.getBounds(), c = lm.getCenter(), sz = lm.getSize();
+        out[k] = { z: lm.getZoom(), c: [+c.lat.toFixed(3), +c.lng.toFixed(3)], size: [sz.x, sz.y],
+          tpe: b.contains(TPE), taiwan: b.contains([25.04, 121.52]) && b.contains([22.0, 120.74]) };
+        m.destroy(); div.remove();
+      }
+      return out;
+    });
+    const near = (c, t) => Math.abs(c[0] - t[0]) < 0.02 && Math.abs(c[1] - t[1]) < 0.02;
+    check('hidden map: fitTo before it is shown is kept (no Taiwan fit over it)', views['fitTo while hidden'].tpe && !views['fitTo while hidden'].taiwan && views['fitTo while hidden'].z >= 9, views['fitTo while hidden']);
+    check('hidden map: setView before it is shown is kept', near(views['setView while hidden'].c, [22.62, 120.30]) && views['setView while hidden'].z === 12, views['setView while hidden']);
+    check('hidden map: Leaflet setView before it is shown is kept', near(views['leaflet setView while hidden'].c, [23.97, 121.60]) && views['leaflet setView while hidden'].z === 11, views['leaflet setView while hidden']);
+    check('hidden map: fitTo in the same task as show is kept', views['fitTo right after show (same task)'].tpe && !views['fitTo right after show (same task)'].taiwan, views['fitTo right after show (same task)']);
+    check('hidden map: fitTaiwan / no caller view -> Taiwan once shown', views['fitTaiwan while hidden'].taiwan && views['no caller view'].taiwan && views['no caller view'].size[0] === 420, { fitTaiwan: views['fitTaiwan while hidden'], none: views['no caller view'] });
+    check('visible map: fitTo right after create is kept', views['fitTo on a visible map'].tpe && !views['fitTo on a visible map'].taiwan, views['fitTo on a visible map']);
+    await ctx.close();
+  }
+
+  // I2b. legs given as encoded polylines (plan.routes: leg.path, precision 5) draw and animate exactly as
+  // the same legs given as coords --------------------------------------------------------------------
+  {
+    const { ctx, page, bag } = await openPage(browser, base + '?theme=dark', { viewport: { width: 1200, height: 800 } });
+    allBags.push(['integration-paths', bag]);
+    const enc = await page.evaluate(() => {
+      const geo = SRO.core.geo, MAP = SRO.ui.map;
+      const encR = H.routes.map((r) => Object.assign({}, r, { legs: r.legs.map((l) => ({ path: geo.encodePolyline(l.coords, 5), source: l.source, approximate: l.approximate, depart: l.depart, arrive: l.arrive })) }));
+      const decR = encR.map((r) => Object.assign({}, r, { legs: r.legs.map((l) => Object.assign({}, l, { path: undefined, coords: geo.decodePolyline(l.path, 5) })) }));
+      const ds = () => Array.from(document.querySelectorAll('#map .sro-pane-routes path')).map((e) => e.getAttribute('class') + '|' + e.getAttribute('stroke') + '|' + e.getAttribute('d'));
+      H.map.setRoutes(decR, { highlightTruckId: 'Alpha-1' }); const dCoords = ds();
+      H.map.setRoutes(encR, { highlightTruckId: 'Alpha-1' }); const dPath = ds();
+      const lines = Array.from(document.querySelectorAll('#map .sro-pane-routes path.sro-route')).length;
+      // truck positions over the whole day
+      let posSame = 0, posN = 0, moving = 0;
+      encR.forEach((r, i) => {
+        for (let t = r.depart - 10; t <= r.returnAt + 10; t += (r.returnAt - r.depart) / 40) {
+          const a = MAP.truckPosition(r, t), b = MAP.truckPosition(decR[i], t);
+          posN++;
+          if (a.lat === b.lat && a.lon === b.lon && a.status === b.status && a.legIndex === b.legIndex && a.heading === b.heading) posSame++;
+          if (a.status === 'en-route') moving++;
+        }
+      });
+      // the decode cache: one decode per string
+      const s = encR[0].legs[0].path, n0 = MAP.pathCacheSize();
+      const same = MAP.decodePath(s) === MAP.decodePath(s) && MAP.pathCacheSize() === n0;
+      const legSame = MAP.legCoords(encR[0].legs[0]) === MAP.decodePath(s);
+      const junk = [MAP.decodePath(''), MAP.decodePath(null), MAP.decodePath(42)].every((x) => x === null);
+      // whole-route path only (no legs), and mixed legs (coords + path)
+      const whole = { truckId: 'W-1', color: '#C9359A', path: geo.encodePolyline([].concat.apply([], H.routes[0].legs.map((l) => l.coords)), 5), depart: H.routes[0].depart, returnAt: H.routes[0].returnAt };
+      const mixed = Object.assign({}, H.routes[1], { truckId: 'M-1', color: '#B0765E', legs: [H.routes[1].legs[0]].concat(encR[1].legs.slice(1)) });
+      H.map.setRoutes([whole, mixed], {});
+      const wLines = Array.from(document.querySelectorAll('#map .sro-pane-routes path.sro-route')).filter((e) => e.getAttribute('stroke').toLowerCase() === '#c9359a' && (e.getAttribute('d') || '').length > 20).length;
+      const mLines = Array.from(document.querySelectorAll('#map .sro-pane-routes path.sro-route')).filter((e) => e.getAttribute('stroke').toLowerCase() === '#b0765e' && (e.getAttribute('d') || '').length > 20).length;
+      const mid = MAP.truckPosition(whole, (whole.depart + whole.returnAt) / 2), wc = MAP.decodePath(whole.path);
+      const onPath = wc.some((c, k) => {
+        if (!k) return false;
+        const a = wc[k - 1], dx = c[1] - a[1], dy = c[0] - a[0], l2 = dx * dx + dy * dy;
+        const t = l2 ? Math.max(0, Math.min(1, ((mid.lon - a[1]) * dx + (mid.lat - a[0]) * dy) / l2)) : 0;
+        return Math.hypot(a[1] + t * dx - mid.lon, a[0] + t * dy - mid.lat) < 1e-6;
+      });
+      H.map.setRoutes(H.routes, {});
+      return { same: dCoords.length > 0 && dCoords.join('\n') === dPath.join('\n'), n: dCoords.length, lines, posSame, posN, moving, cacheOk: same && legSame, junk, wLines, mLines, mixedLegs: mixed.legs.length, mid: mid.status, onPath };
+    });
+    check('setRoutes: legs as encoded path strings draw exactly as the same legs as coords', enc.same && enc.lines >= 4, { paths: enc.n, lines: enc.lines });
+    check('truckPosition: encoded path legs give the same position, heading and status as coords', enc.posSame === enc.posN && enc.moving > 10, { same: enc.posSame, of: enc.posN, enRoute: enc.moving });
+    check('decoded paths cached by string (no re-decode), bad input -> null', enc.cacheOk && enc.junk, enc);
+    check('route with only a whole-route path, and mixed coords/path legs, are drawn and animated', enc.wLines === 1 && enc.mLines === enc.mixedLegs && enc.mid === 'en-route' && enc.onPath, enc);
+    await ctx.close();
+  }
+
+  // I3. overlapping routes (three trucks out of FOB Granite on the same roads, one from Jade): every
+  // truck's line is visible where roads are shared, at island and at city zoom, after pans and animated
+  // zooms; the highlighted route draws on top; a click on a line picks that line's truck --------------
+  {
+    const { ctx, page, bag } = await openPage(browser, base + '?theme=dark', { viewport: { width: 1440, height: 900 } });
+    allBags.push(['integration-overlap', bag]);
+    await page.waitForFunction(() => H.map.status().tiles === 'off', null, { timeout: 12000 });
+    await page.evaluate(INTEG_HELPERS);
+    await page.evaluate(() => {
+      const grid = SRO.data.grid, byId = (id) => grid.find((g) => g.id === id), roads = SRO.core.roads, geo = SRO.core.geo;
+      const colors = SRO.data.scenario.truckColors.map((c) => c.hex);
+      function timed(truckId, color, hubId, stopIds, enc) {
+        const pts = [byId(hubId)].concat(stopIds.map(byId)).concat([byId(hubId)]), legs = [];
+        let t = 400;
+        for (let i = 1; i < pts.length; i++) {
+          const p = roads.path(pts[i - 1], pts[i], []), d = Math.max(1, Math.round(p.minutes * 1.5));
+          legs.push(enc ? { path: geo.encodePolyline(p.coords, 5), source: p.source, depart: t, arrive: t + d } : { coords: p.coords, source: p.source, depart: t, arrive: t + d });
+          t += d + 15;
+        }
+        // no stop markers: at island zoom they would cover most of the shared roads
+        return { truckId, color, legs, depart: 400, returnAt: t };
+      }
+      window.OV = [
+        timed('Alpha-1', colors[0], 'G-GRANITE', ['G-TAOYUAN', 'G-ZHUBEI']),
+        timed('Alpha-2', colors[1], 'G-GRANITE', ['G-TAOYUAN'], true),
+        timed('Alpha-3', colors[3], 'G-GRANITE', ['G-ZHUBEI', 'G-TAICHUNG']),
+        timed('Bravo-1', colors[2], 'G-JADE', ['G-TAICHUNG', 'G-PULI'], true)
+      ];
+      H.map.setPlatoons([]); H.map.setRally([]); H.map.setTrucks([]); H.map.setZones([]); H.map.setHubs([]);
+      H.map.setRoutes(OV, {});
+    });
+    // lanes at the view: routes drawn apart where their roads overlap, the first route on its road
+    const lanes = () => page.evaluate(() => {
+      const ov = __overlaps(OV), drawn = OV.map((r) => __drawn(r.color));
+      let pairs = 0, apart = 0, close = 0, n = 0, firstOff = 0;
+      ov.forEach((pts, i) => pts.forEach((p) => {
+        n++;
+        const qi = __nearest(p, drawn[i]);
+        if (qi.d <= 4 * (OV.length - 1) + 2.5) close++;
+        if (i === 0) firstOff = Math.max(firstOff, qi.d);
+        p.others.forEach((j) => { if (j < i) return; const qj = __nearest(p, drawn[j]); pairs++; if (Math.hypot(qi.x - qj.x, qi.y - qj.y) >= 3) apart++; });
+      }));
+      return { z: H.map.leaflet.getZoom(), points: ov.map((p) => p.length), n, close, pairs, apart, firstOff: +firstOff.toFixed(2) };
+    });
+    // each route's colour visible near its overlap points (screenshot pixels)
+    const seen = async (label) => {
+      await page.waitForTimeout(150);
+      const b64 = (await page.screenshot({ path: path.join(OUT, 'overlap-' + label + '.png') })).toString('base64');
+      return page.evaluate(async (b64) => {
+        const img = await __png(b64), ov = __overlaps(OV);
+        return OV.map((r, i) => ({ id: r.truckId, points: ov[i].length, seen: +__seen(img, ov[i], r.color, 4 * (OV.length - 1) + 2).toFixed(2) }));
+      }, b64);
+    };
+    const views = [
+      ['island', () => H.map.fitTaiwan({ animate: false }), 0.7],
+      ['city', () => H.map.setView([24.955, 121.345], 12, { animate: false }), 0.85]
+    ];
+    // (apart: the nearest drawn points of two routes at a shared point; at island zoom a few fall where
+    // other legs of the same trucks knot around the hub, hence the lower share there)
+    for (const [label, fn, share] of views) {
+      await page.evaluate(fn);
+      await page.waitForTimeout(100);
+      const ln = await lanes();
+      check('overlapping routes (' + label + ' zoom): drawn apart where roads are shared, first route on its road', ln.n >= 12 && ln.pairs >= 8 && ln.apart >= ln.pairs * share && ln.close >= ln.n * 0.9 && ln.firstOff <= 2.5, ln);
+      const sv = await seen(label);
+      check('overlapping routes (' + label + ' zoom): every truck colour visible where roads are shared', sv.filter((s) => s.points >= 3).length >= 3 && sv.every((s) => s.points < 3 || s.seen >= 0.8), sv);
+    }
+    // animated zoom (control button) and a long pan: lanes recomputed for the new view
+    await page.click('.leaflet-control-zoom-in');
+    await page.waitForTimeout(500);
+    const lz = await lanes();
+    await page.evaluate(() => H.map.leaflet.panBy([-500, 300], { animate: false }));
+    await page.waitForTimeout(100);
+    const lp = await lanes();
+    check('lanes recomputed after an animated zoom and after a pan', lz.z === 13 && lz.n >= 12 && lz.apart >= lz.pairs * 0.85 && lz.close >= lz.n * 0.9 && lz.firstOff <= 2.5 &&
+      lp.n >= 6 && lp.apart >= lp.pairs * 0.85 && lp.close >= lp.n * 0.9 && lp.firstOff <= 2.5, { zoom: lz, pan: lp });
+    // chevrons: on every route in view, above every line of their tier
+    await page.evaluate(() => H.map.setView([24.955, 121.345], 12, { animate: false }));
+    const chev = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('#map .sro-pane-routes path'));
+      const idx = (cls) => all.map((e, i) => (e.classList.contains(cls) ? i : -1)).filter((i) => i >= 0);
+      const arrows = idx('sro-route-arrows'), lines = idx('sro-route');
+      const mr = document.getElementById('map').getBoundingClientRect();
+      const inView = (p) => p.x >= mr.left && p.x <= mr.right && p.y >= mr.top && p.y <= mr.bottom;
+      // per route (arrows are in route order with no highlight): drawn length in view and chevrons in view
+      return OV.map((r, i) => {
+        let len = 0;
+        __drawn(r.color).forEach((ln) => { for (let k = 1; k < ln.length; k++) if (inView(ln[k - 1]) && inView(ln[k])) len += Math.hypot(ln[k].x - ln[k - 1].x, ln[k].y - ln[k - 1].y); });
+        const el = all[arrows[i]], tips = el ? __pathPts(el).filter((c) => c.length === 3 && inView(c[1])).length : 0;
+        return { id: r.truckId, len: Math.round(len), chevrons: tips, above: !!el && arrows[i] > Math.max.apply(null, lines) };
+      });
+    });
+    check('direction chevrons along every route in view (about one per 90 px), drawn above the lines', chev.filter((c) => c.len > 400).length >= 3 && chev.every((c) => c.above && (c.len < 400 || c.chevrons >= c.len / 90 * 0.6)), chev);
+    // highlight: casing, line and chevrons of the highlighted truck on top; lanes keep the given order
+    const hi = await page.evaluate(() => {
+      const before = OV.slice(1).map((r) => __drawn(r.color).map((ln) => ln.map((p) => Math.round(p.x) + ',' + Math.round(p.y)).join(' ')).join('|'));
+      H.map.setRoutes(OV, { highlightTruckId: 'Alpha-1' });
+      const after = OV.slice(1).map((r) => __drawn(r.color).map((ln) => ln.map((p) => Math.round(p.x) + ',' + Math.round(p.y)).join(' ')).join('|'));
+      const all = Array.from(document.querySelectorAll('#map .sro-pane-routes path'));
+      const pos = (pred) => all.map((e, i) => (pred(e) ? i : -1)).filter((i) => i >= 0);
+      const hiColor = OV[0].color.toLowerCase();
+      const hiLine = pos((e) => e.classList.contains('sro-route') && e.getAttribute('stroke').toLowerCase() === hiColor);
+      const otherLines = pos((e) => e.classList.contains('sro-route') && e.getAttribute('stroke').toLowerCase() !== hiColor);
+      const casings = pos((e) => e.classList.contains('sro-route-casing')), arrows = pos((e) => e.classList.contains('sro-route-arrows'));
+      const w = (i) => +all[i].getAttribute('stroke-width');
+      const hiCasing = casings.filter((i) => w(i) === 9), hiArrows = arrows.filter((i) => w(i) === 2.2);
+      const hits = pos((e) => e.classList.contains('sro-route-hit'));
+      return {
+        lineTop: hiLine.length > 0 && Math.min.apply(null, hiLine) > Math.max.apply(null, otherLines),
+        casingTop: hiCasing.length === 1 && hiCasing[0] === Math.max.apply(null, casings) && hiCasing[0] > Math.max.apply(null, otherLines),
+        arrowsTop: hiArrows.length === 1 && hiArrows[0] === Math.max.apply(null, arrows),
+        hitsLast: Math.min.apply(null, hits) > Math.max.apply(null, all.map((e, i) => (e.classList.contains('sro-route-hit') ? -1 : i))),
+        lanesKept: before.join('#') === after.join('#')
+      };
+    });
+    const hiSeen = await seen('city-highlight');
+    check('highlighted route on top (casing, line, chevrons), lanes unchanged by the highlight', hi.lineTop && hi.casingTop && hi.arrowsTop && hi.hitsLast && hi.lanesKept && hiSeen[0].seen >= 0.9, { hi, seen: hiSeen[0] });
+    // real clicks on two lines side by side pick the truck of the line clicked
+    await page.evaluate(() => { H.map.setRoutes(OV, {}); window.__clicks = []; H.map.on('click:route', (e) => __clicks.push(e.truckId)); });
+    const targets = await page.evaluate(() => {
+      const ov = __overlaps(OV), drawn = OV.map((r) => __drawn(r.color)), out = [], used = [];
+      const free = (q) => !document.elementsFromPoint(q.x, q.y).some((e) => e.closest('.sro-stop, .leaflet-control, .leaflet-marker-icon'));
+      ov.forEach((pts, i) => pts.forEach((p) => {
+        if (used.length >= 3 || used.some((u) => Math.hypot(u.x - p.x, u.y - p.y) < 150)) return;
+        for (const j of p.others) {
+          const qi = __nearest(p, drawn[i]), qj = __nearest(p, drawn[j]);
+          if (Math.hypot(qi.x - qj.x, qi.y - qj.y) < 3.5 || !free(qi) || !free(qj)) continue;
+          out.push({ id: OV[i].truckId, x: qi.x, y: qi.y }, { id: OV[j].truckId, x: qj.x, y: qj.y });
+          used.push(p);
+          return;
+        }
+      }));
+      return out;
+    });
+    const picked = [];
+    for (const t of targets) {
+      await page.evaluate(() => { __clicks.length = 0; });
+      await page.mouse.click(t.x, t.y);
+      await page.waitForTimeout(320);
+      picked.push({ want: t.id, got: await page.evaluate(() => __clicks.slice()) });
+    }
+    check('click on one of two lines side by side picks that line\'s truck', picked.length >= 4 && picked.every((p) => p.got.length === 1 && p.got[0] === p.want), picked);
+    await ctx.close();
+  }
+}
+
 async function main() {
   const harness = buildHarness();
   const base = pathToFileURL(harness).href;
@@ -868,6 +1288,9 @@ async function main() {
 
     // 5. review: harder checks (real hit testing, tile state, edge sizes, themes, storage, long names) ---
     await reviewChecks(browser, base, allBags);
+
+    // 6. integration: lifecycle races, caller views on hidden maps, encoded leg paths, overlapping routes
+    await integrationChecks(browser, base, allBags);
   } finally {
     await browser.close();
   }

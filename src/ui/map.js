@@ -5,17 +5,25 @@
 //   m.setHubs(hubs)                           2525 supply installation symbols
 //   m.setRally(points, { walkRingMi })        [{ id|gridId, lat, lon, label, used, pinned, banned, walkRingMi }]
 //   m.setPlatoons(requests, { selectedId })   2525 platoon symbols on urgency rings
-//   m.setRoutes(routes, { highlightTruckId }) [{ truckId, color, legs: [{ coords, source, approximate }] | coords,
-//                                               stops: [{ lat, lon, seq, label }] }]
+//   m.setRoutes(routes, { highlightTruckId }) [{ truckId, color, label?, summary?,
+//                                               legs: [{ coords: [[lat, lon]...] | path: 'encoded polyline', source, approximate }]
+//                                               | coords | path, stops: [{ lat, lon, seq, label }] }]
+//                                             plan.routes can be passed as they are (leg.path, precision 5, is decoded
+//                                             and cached). Routes sharing a road are drawn side by side in lanes.
 //   m.setTrucks([{ id, color, lat, lon, heading, label, type }])   updated in place (animation)
-//   m.fitTaiwan(), m.fitTo(bounds | [[lat, lon], ...] | [{ lat, lon }, ...])
+//   m.fitTaiwan(), m.fitTo(bounds | [[lat, lon], ...] | [{ lat, lon }, ...]), m.setView([lat, lon], zoom)
+//                                             a map made with no size (hidden tab) fits Taiwan once it has one, unless
+//                                             the caller set a view; a view set while it has no size is applied again then
 //   m.on('click:zone' | 'click:route' | 'click:platoon' | 'click:hub' | 'click:rally' | 'click:truck' | 'click:map' | 'tiles', fn) -> off()
 //   m.enableZoneDrawing({ kind: 'closed' | 'risk', rating, onDone({ kind, rating, lat, lon, radiusMi }), onCancel }) -> { cancel }
 //   m.setTheme('dark' | 'light' | 'night') (also follows html[data-theme] unless opts.followDocumentTheme === false),
 //   m.setRoadsVisible(bool), m.setTilesEnabled(bool)
-//   m.status() -> { tiles: 'loading' | 'on' | 'off', reason, roads: bool }, m.invalidateSize(), m.destroy(), m.leaflet
+//   m.status() -> { tiles: 'loading' | 'on' | 'off', reason, roads: bool }, m.invalidateSize(), m.leaflet
+//   m.destroy()   safe at any time (same task as create, during a zoom animation); later calls are no-ops
 //
 //   SRO.ui.map.truckPosition(route, simMin) -> { lat, lon, heading, legIndex, status: 'at-hub' | 'en-route' | 'at-stop' | 'returned' }
+//     (legs with coords or an encoded leg.path, as in a stored plan)
+//   SRO.ui.map.legCoords(leg) -> [[lat, lon]...] | null   SRO.ui.map.decodePath(encoded) (cached)
 //
 // Base map: OpenStreetMap tiles when they load (needs the app served over http(s)); always underneath,
 // the Natural Earth coastline on a sea-colored background; the road graph (SRO.core.roads) drawn as thin
@@ -45,6 +53,7 @@
   MAP.MAX_ZONE_MI = 60;
   MAP.DISMOUNTED_RING_MI = 5;
   MAP.DRAWBAR_NARROW_PX = 560;
+  MAP.ROUTE_LANE_PX = 4;           // gap between routes that share a road (screen px)
 
   // Vector colors per theme (CSS handles controls, tiles and symbols).
   MAP.THEMES = {
@@ -71,10 +80,38 @@
     }
   };
 
+  // ---- leg paths -------------------------------------------------------------------------------
+  // Plans store each leg's road path as an encoded polyline (leg.path, precision 5, DESIGN.md 8b);
+  // views may also pass decoded coordinates (leg.coords). Decoded strings are cached (the clock asks
+  // for truck positions on every tick), oldest first out. Callers must not modify the arrays returned.
+  MAP.PATH_PRECISION = 5;
+  MAP.PATH_CACHE_MAX = 600;
+  const pathCache = new Map();
+  MAP.decodePath = function (str) {
+    if (typeof str !== 'string' || !str) return null;
+    let c = pathCache.get(str);
+    if (c) return c;
+    try { c = SRO.core.geo.decodePolyline(str, MAP.PATH_PRECISION); } catch (e) { c = null; }
+    if (!c || !c.length) return null;
+    if (pathCache.size >= MAP.PATH_CACHE_MAX) pathCache.delete(pathCache.keys().next().value);
+    pathCache.set(str, c);
+    return c;
+  };
+  MAP.pathCacheSize = function () { return pathCache.size; };
+  // [[lat, lon], ...] of a leg (or route): coords array, else path (encoded string or array), else null
+  function pathOf(x) {
+    if (!x) return null;
+    if (Array.isArray(x.coords) && x.coords.length) return x.coords;
+    if (typeof x.path === 'string') return MAP.decodePath(x.path);
+    if (Array.isArray(x.path) && x.path.length) return x.path;
+    return null;
+  }
+  MAP.legCoords = pathOf;
+
   // ---- truck position along a timed route (pure, used for the demo clock) -----------------------
   function legCoords(leg) {
     if (!leg) return null;
-    const c = leg.coords || leg.path;
+    const c = pathOf(leg);
     if (c && c.length) return c;
     if (leg.from && leg.to) return [[leg.from.lat, leg.from.lon], [leg.to.lat, leg.to.lon]];
     return null;
@@ -101,8 +138,9 @@
     const G = SRO.core.geo;
     if (typeof simMin !== 'number' || !isFinite(simMin)) return null;   // e.g. clock not set yet: no position, not 'returned'
     let legs = ((route && route.legs) || []).filter(function (l) { return isFinite(l.depart) && isFinite(l.arrive) && legCoords(l); });
-    if (!legs.length && route && route.coords && route.coords.length && isFinite(route.depart)) {
-      legs = [{ coords: route.coords, depart: route.depart, arrive: isFinite(route.returnAt) ? route.returnAt : route.depart }];
+    const whole = !legs.length && route ? pathOf(route) : null;
+    if (whole && whole.length && isFinite(route.depart)) {
+      legs = [{ coords: whole, depart: route.depart, arrive: isFinite(route.returnAt) ? route.returnAt : route.depart }];
     }
     if (!legs.length) return null;
     const first = legCoords(legs[0]), lastLeg = legs[legs.length - 1], lastC = legCoords(lastLeg);
@@ -209,6 +247,30 @@
   }
   function finitePt(p) { return p && isFinite(p[0]) && isFinite(p[1]); }
 
+  // Leaflet 1.9.4 canvas renderer, made safe to remove at any time. Canvas._redraw run synchronously
+  // (_updatePaths after a view reset, e.g. setView / fitBounds without animation) forgets the frame an
+  // earlier _requestRedraw scheduled without cancelling it, so _destroyContainer cannot cancel it either;
+  // when the map was removed before that frame, it ran with no 2D context and threw "Cannot read
+  // properties of undefined (reading 'save')". This class cancels the outstanding frame on every redraw,
+  // ignores a redraw or draw with no context, and forgets the cancelled frame on removal (so a renderer
+  // added again can redraw).
+  let SafeCanvas = null;
+  function safeCanvas(L, o) {
+    if (!SafeCanvas) {
+      const base = L.Canvas.prototype;
+      SafeCanvas = L.Canvas.extend({
+        _redraw: function () {
+          if (this._redrawRequest) { L.Util.cancelAnimFrame(this._redrawRequest); this._redrawRequest = null; }
+          if (!this._ctx || !this._map) { this._redrawBounds = null; return; }
+          base._redraw.call(this);
+        },
+        _draw: function () { if (this._ctx) base._draw.call(this); },
+        _destroyContainer: function () { base._destroyContainer.call(this); this._redrawRequest = null; this._redrawBounds = null; }
+      });
+    }
+    return new SafeCanvas(o);
+  }
+
   // =============================================================================================
   MAP.create = function (el, options) {
     const L = root.L;
@@ -226,12 +288,49 @@
     el.classList.toggle('sro-compact', !!opts.compact);
     el.setAttribute('data-sro-theme', theme);
 
+    let destroyed = false;         // every deferred callback (tiles, probe, observers, frames) checks this
     const map = L.map(el, {
       zoomControl: false, attributionControl: false, minZoom: 6, maxZoom: 18,
       maxBounds: MAP.MAX_BOUNDS, maxBoundsViscosity: 0.8, zoomSnap: 0.25, zoomDelta: 1,
       wheelPxPerZoomLevel: 90, worldCopyJump: false, tapTolerance: 12
     });
-    map.fitBounds(MAP.TAIWAN_BOUNDS, { padding: [8, 8], animate: false });
+
+    // ---- view bookkeeping --------------------------------------------------------------------------
+    // The component fits Taiwan the first time the element has a size (a map made inside a hidden tab
+    // has none), unless the caller set a view first (fitTo, fitTaiwan, setView, or leaflet.setView /
+    // fitBounds / flyTo). A view set while the element has no size is meaningless (Leaflet fits a 0 x 0
+    // box), so the last such call is applied again as soon as the element has a size.
+    let internalView = 0;          // > 0 while the component itself moves the view
+    let callerView = false;        // the caller has set a view
+    let pendingView = null;        // { fn } the caller's last view change while the element had no size
+    function hasSize() { return el.clientWidth > 0 && el.clientHeight > 0; }
+    function internally(fn) { internalView++; try { return fn(); } finally { internalView--; } }
+    // Leaflet caches the container size until invalidateSize(); a fit computed with a stale 0 x 0 size
+    // lands at maximum zoom
+    function freshSize() { const s = map.getSize(); if (hasSize() && (s.x !== el.clientWidth || s.y !== el.clientHeight)) map.invalidateSize({ pan: false }); }
+    // fn runs the view change; replay (optional) re-runs it once the element has a size
+    function callerSetsView(fn, replay) {
+      if (internalView) return fn();
+      callerView = true;
+      pendingView = hasSize() ? null : { fn: replay || fn };
+      freshSize();
+      return internally(fn);
+    }
+    ['setView', 'fitBounds', 'flyTo', 'flyToBounds'].forEach(function (k) {
+      const orig = map[k];
+      map[k] = function () {
+        const args = arguments, self = this;
+        if (internalView || destroyed) return orig.apply(self, args);
+        return callerSetsView(function () { return orig.apply(self, args); }, function () {
+          // replayed without animation: the element just got its size
+          const a = Array.prototype.slice.call(args);
+          const oi = k === 'setView' || k === 'flyTo' ? 2 : 1;
+          a[oi] = Object.assign({}, a[oi] && typeof a[oi] === 'object' ? a[oi] : {}, { animate: false });
+          return orig.apply(self, a);
+        });
+      };
+    });
+    internally(function () { map.fitBounds(MAP.TAIWAN_BOUNDS, { padding: [8, 8], animate: false }); });
 
     // panes (z-index): coast 150 < tiles 200 < roads 250 < zones 380 < walk 390 < routes 410 <
     // labels 590 < rally 605 < hubs 610 < platoons 620 < trucks 640 < draw 650
@@ -281,7 +380,7 @@
     }
     function coastStyle() { const t = pal(); return { color: t.coast, weight: 1.2, fillColor: t.land, fillOpacity: 1, opacity: 1 }; }
 
-    const roadRenderer = L.canvas({ pane: 'sro-roads', padding: 0.4 });
+    const roadRenderer = safeCanvas(L, { pane: 'sro-roads', padding: 0.4 });
     let roadLayer = null;
     function buildRoads() {
       if (roadLayer) { map.removeLayer(roadLayer); roadLayer = null; }
@@ -304,11 +403,14 @@
     function tilesLayer() {
       if (!tiles.layer) {
         tiles.layer = L.tileLayer(MAP.OSM_URL, { maxZoom: 19, attribution: MAP.OSM_ATTRIBUTION, className: 'sro-tiles', keepBuffer: 2 });
+        // a removed tile layer still reports tiles that finish loading (or fail) later
         tiles.layer.on('tileload', function () {
+          if (destroyed) return;
           tiles.loads++;
           if (tiles.state === 'loading') { tiles.state = 'on'; tiles.reason = null; clearTimeout(tiles.timer); syncBase(); emit('tiles', status()); }
         });
         tiles.layer.on('tileerror', function () {
+          if (destroyed) return;
           tiles.errors++;
           if (tiles.state === 'loading' && tiles.errors >= MAP.TILE_ERROR_LIMIT && tiles.loads === 0) fallback('errors');
         });
@@ -316,13 +418,14 @@
       return tiles.layer;
     }
     function startTiles() {
+      if (destroyed) return;
       if (!tiles.wanted) { tiles.state = 'off'; tiles.reason = 'disabled'; syncBase(); return; }
       if (root.navigator && root.navigator.onLine === false) { fallback('offline'); return; }
       tiles.state = 'loading'; tiles.reason = null; tiles.loads = 0; tiles.errors = 0;
       const layer = tilesLayer();
       if (!map.hasLayer(layer)) map.addLayer(layer);
       clearTimeout(tiles.timer);
-      tiles.timer = setTimeout(function () { if (tiles.state === 'loading' && tiles.loads === 0) fallback('timeout'); }, MAP.TILE_TIMEOUT_MS);
+      tiles.timer = setTimeout(function () { if (!destroyed && tiles.state === 'loading' && tiles.loads === 0) fallback('timeout'); }, MAP.TILE_TIMEOUT_MS);
       probe();
       syncBase();
     }
@@ -334,11 +437,12 @@
       const url = L.Util.template(MAP.OSM_URL, { z: z, x: p.x, y: p.y });
       try {
         root.fetch(url, { mode: 'cors', credentials: 'omit', cache: 'default' }).then(function (r) {
-          if (seq === tiles.probeSeq && !r.ok && tiles.state !== 'off') fallback('blocked');
+          if (!destroyed && seq === tiles.probeSeq && !r.ok && tiles.state !== 'off') fallback('blocked');
         }).catch(function () { /* unreadable (CORS) or network: inconclusive, tile events decide */ });
       } catch (e) { /* inconclusive */ }
     }
     function fallback(reason) {
+      if (destroyed) return;
       clearTimeout(tiles.timer);
       tiles.probeSeq++;
       if (tiles.layer && map.hasLayer(tiles.layer)) map.removeLayer(tiles.layer);
@@ -346,9 +450,9 @@
       syncBase();
       emit('tiles', status());
     }
-    function onOffline() { if (tiles.wanted && tiles.state !== 'off') fallback('offline'); }
+    function onOffline() { if (!destroyed && tiles.wanted && tiles.state !== 'off') fallback('offline'); }
     function onOnline() {
-      if (!tiles.wanted || tiles.state !== 'off') return;
+      if (destroyed || !tiles.wanted || tiles.state !== 'off') return;
       startTiles();
       if (tiles.layer) tiles.layer.redraw();
     }
@@ -402,6 +506,7 @@
       return '<b>Offline map.</b> <span class="sro-note-long">Street tiles unavailable here; showing coastline and main roads.</span>' + short;
     }
     function syncBase() {
+      if (destroyed) return;
       const show = roadsVisible();
       if (show && !roadLayer) buildRoads();
       if (roadLayer) {
@@ -562,18 +667,267 @@
     }
 
     // routes
-    const routeLayers = [];     // { route, parts: [[latlng...]], arrows: L.Polyline, color, dim }
+    // Trucks from one hub share roads, and at island zoom roads a few hundred metres apart (the two
+    // carriageways of a motorway) draw on top of each other. So that every truck's route stays visible,
+    // routes are laid out in screen space for the current view, again after every zoom or pan: where a
+    // route passes within a few pixels of routes given before it, it moves to lane k (k = how many of
+    // those are there), k x MAP.ROUTE_LANE_PX to the right of its direction of travel. Lane 0 is the road
+    // itself: a route alone stays on its road, and a truck's outbound and return legs never land on another
+    // truck's line. Lanes are worked out within half a screen around the view (further out a route stays on
+    // its road until the view moves there). Drawing order: every casing, every line, every chevron row,
+    // with the highlighted route's three on top; the invisible wide hit lines go last, and a click or
+    // hover goes to the route whose drawn line is nearest the pointer.
+    const routeLayers = [];     // { route, parts, isHi, dim, color, bit, thin, thinZ, drawn: [{ px, ll, raw, sig }], zoom, shared, casing, lines, arrows, hit }
+    const LANE_CELL = 3, LANE_STEP = 2, LANE_MIN_RUN = 14, LANE_MAX_ROUTES = 30;
+    let laid = null;            // { z, box } of the last layout: a pan that stays inside box needs none
+    let laneGrid = null;        // Int32Array raster, reused: bit r set where route r passes
+    // [[lat, lon], ...] numbers: the array itself (keeps the decoded-path cache useful), else a clean copy
+    function cleanCoords(src) {
+      if (!src || src.length < 2) return null;
+      let ok = true;
+      for (let i = 0; i < src.length && ok; i++) {
+        const c = src[i];
+        ok = Array.isArray(c) && typeof c[0] === 'number' && typeof c[1] === 'number' && isFinite(c[0]) && isFinite(c[1]);
+      }
+      const out = ok ? src : src.map(toLatLng).filter(finitePt);
+      return out.length >= 2 ? out : null;
+    }
     function routeParts(r) {
       const parts = [];
       if (r.legs && r.legs.length) {
         r.legs.forEach(function (l) {
-          const c = (l.coords || l.path || []).map(toLatLng).filter(finitePt);
-          if (c.length >= 2) parts.push({ coords: c, approx: l.approximate || l.source === 'straight' || l.offRoad === true && l.source !== 'osm-roads' });
+          const c = cleanCoords(pathOf(l));
+          if (c) parts.push({ coords: c, approx: !!(l.approximate || l.source === 'straight' || l.offRoad === true && l.source !== 'osm-roads') });
         });
-      } else if (r.coords && r.coords.length >= 2) {
-        parts.push({ coords: r.coords.map(toLatLng).filter(finitePt), approx: r.approximate || r.source === 'straight' });
+      } else {
+        const c = cleanCoords(pathOf(r));
+        if (c) parts.push({ coords: c, approx: !!(r.approximate || r.source === 'straight') });
       }
       return parts;
+    }
+    // per coords array, kept while the array lives: its L.LatLngs and zoom-0 pixels (Web Mercator: zoom z =
+    // zoom 0 x 2^z), so a zoom or pan does not convert or project the original points again
+    const baseCache = new WeakMap();
+    function baseOf(coords) {
+      let b = baseCache.get(coords);
+      if (b) return b;
+      const px = new Float64Array(coords.length * 2), ll = new Array(coords.length);
+      for (let i = 0; i < coords.length; i++) {
+        ll[i] = L.latLng(coords[i][0], coords[i][1]);
+        const p = map.project(ll[i], 0);
+        px[2 * i] = p.x; px[2 * i + 1] = p.y;
+      }
+      b = { px: px, ll: ll };
+      baseCache.set(coords, b);
+      return b;
+    }
+    // the part at zoom z with points closer than 1 px to the last one kept dropped (the end point stays
+    // exact; what Leaflet's own simplification would draw anyway): pixels px[i] and their LatLngs ll[i]
+    function thinPart(coords, z) {
+      const base = baseOf(coords), b = base.px, n = coords.length, s = Math.pow(2, z);
+      const px = [{ x: b[0] * s, y: b[1] * s }], idx = [0];
+      let qx = px[0].x, qy = px[0].y;
+      for (let i = 1; i < n; i++) {
+        const x = b[2 * i] * s, y = b[2 * i + 1] * s;
+        if (Math.abs(x - qx) + Math.abs(y - qy) >= 1) { px.push({ x: x, y: y }); idx.push(i); qx = x; qy = y; }
+        else if (i === n - 1) {
+          if (px.length > 1) { px[px.length - 1] = { x: x, y: y }; idx[idx.length - 1] = i; } else { px.push({ x: x, y: y }); idx.push(i); }
+        }
+      }
+      const ll = idx.length === n ? base.ll : idx.map(function (k) { return base.ll[k]; });
+      return { px: px, ll: ll };
+    }
+    // the line moved o px to the right of its direction (screen y points down), mitred joins (at most 2x)
+    function offsetPx(px, o) {
+      const n = px.length;
+      if (n < 2) return px.slice();
+      const nx = new Array(n - 1), ny = new Array(n - 1);
+      for (let i = 0; i < n - 1; i++) {
+        const dx = px[i + 1].x - px[i].x, dy = px[i + 1].y - px[i].y, len = Math.sqrt(dx * dx + dy * dy) || 1;
+        nx[i] = -dy / len; ny[i] = dx / len;
+      }
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) {
+        let ax, ay, k = 1;
+        if (i === 0) { ax = nx[0]; ay = ny[0]; } else if (i === n - 1) { ax = nx[n - 2]; ay = ny[n - 2]; } else {
+          const bx = nx[i - 1] + nx[i], by = ny[i - 1] + ny[i], bl = Math.sqrt(bx * bx + by * by);
+          if (bl < 1e-6) { ax = nx[i]; ay = ny[i]; } else { ax = bx / bl; ay = by / bl; k = 1 / Math.max(0.5, ax * nx[i] + ay * ny[i]); }
+        }
+        out[i] = { x: px[i].x + ax * o * k, y: px[i].y + ay * o * k };
+      }
+      return out;
+    }
+    function pxLen(a, b) { const dx = b.x - a.x, dy = b.y - a.y; return Math.sqrt(dx * dx + dy * dy); }
+    // the part of segment a-b inside box as [t0, t1] (Liang-Barsky), null when it misses
+    function clipSeg(a, b, box) {
+      const dx = b.x - a.x, dy = b.y - a.y;
+      let t0 = 0, t1 = 1;
+      const p = [-dx, dx, -dy, dy], q = [a.x - box.min.x, box.max.x - a.x, a.y - box.min.y, box.max.y - a.y];
+      for (let i = 0; i < 4; i++) {
+        if (p[i] === 0) { if (q[i] < 0) return null; continue; }
+        const r = q[i] / p[i];
+        if (p[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; } else { if (r < t0) return null; if (r < t1) t1 = r; }
+      }
+      return [t0, t1];
+    }
+    function popcount(m) { let c = 0; while (m) { m &= m - 1; c++; } return c; }
+    // runs of one lane shorter than LANE_MIN_RUN px (a road crossing, a brief split) take their neighbours' lane
+    function smoothLanes(tp, lanes) {
+      const runs = [];
+      for (let i = 0; i < lanes.length;) {
+        let j = i, len = 0;
+        while (j < lanes.length && lanes[j] === lanes[i]) { len += pxLen(tp[j], tp[j + 1]); j++; }
+        runs.push({ a: i, b: j, lane: lanes[i], len: len });
+        i = j;
+      }
+      if (runs.length < 2) return;
+      runs.forEach(function (r, k) {
+        if (r.len >= LANE_MIN_RUN) return;
+        r.lane = Math.max(k > 0 ? runs[k - 1].lane : -1, k < runs.length - 1 ? runs[k + 1].lane : -1);
+        for (let i = r.a; i < r.b; i++) lanes[i] = r.lane;
+      });
+    }
+    // the drawn line: runs in lane 0 keep their points, other runs are offset in pixels and unprojected;
+    // where the lane changes the line steps across
+    function drawRuns(t, lanes, z) {
+      const px = [], ll = [];
+      for (let i = 0; i < lanes.length;) {
+        let j = i;
+        while (j < lanes.length && lanes[j] === lanes[i]) j++;
+        const run = t.px.slice(i, j + 1);
+        if (!lanes[i]) {
+          for (let k = 0; k < run.length; k++) { px.push(run[k]); ll.push(t.ll[i + k]); }
+        } else {
+          const q = offsetPx(run, lanes[i] * MAP.ROUTE_LANE_PX);
+          for (let k = 0; k < q.length; k++) { px.push(q[k]); ll.push(map.unproject(q[k], z)); }
+        }
+        i = j;
+      }
+      return { px: px, ll: ll };
+    }
+    // screen layout of every route for the current view: where a segment within one half screen of the view
+    // passes within a few px of earlier routes it moves to lane k (k = how many of them)
+    function layoutRoutes() {
+      const z = map.getZoom(), size = map.getSize(), pb = map.getPixelBounds();
+      const mx = Math.ceil(size.x / 2), my = Math.ceil(size.y / 2);
+      const box = { min: { x: pb.min.x - mx, y: pb.min.y - my }, max: { x: pb.max.x + mx, y: pb.max.y + my } };
+      const C = LANE_CELL, cx0 = Math.floor(box.min.x / C) - 2, cy0 = Math.floor(box.min.y / C) - 2;
+      const W = Math.floor(box.max.x / C) + 3 - cx0, H = Math.floor(box.max.y / C) + 3 - cy0, need = W * H;
+      if (!laneGrid || laneGrid.length < need) laneGrid = new Int32Array(need); else laneGrid.fill(0, 0, need);
+      const grid = laneGrid;
+      // calls fn(cell index) for each cell the in-box part of a-b passes (consecutive repeats once)
+      function cellsOn(a, b, fn) {
+        const t = clipSeg(a, b, box);
+        if (!t) return;
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.sqrt(dx * dx + dy * dy) * (t[1] - t[0]);
+        const n = Math.max(1, Math.ceil(len / LANE_STEP));
+        let last = -1;
+        for (let s = 0; s <= n; s++) {
+          const f = t[0] + (t[1] - t[0]) * s / n;
+          const k = (Math.floor((a.y + dy * f) / C) - cy0) * W + Math.floor((a.x + dx * f) / C) - cx0;
+          if (k !== last) { last = k; fn(k); }
+        }
+      }
+      routeLayers.forEach(function (rl, r) {
+        rl.bit = r < LANE_MAX_ROUTES ? (1 << r) : 0;
+        if (rl.thinZ !== z) { rl.thin = rl.parts.map(function (p) { return thinPart(p.coords, z); }); rl.thinZ = z; }
+        const bit = rl.bit;
+        if (!bit) return;
+        rl.thin.forEach(function (t) {
+          const tp = t.px;
+          for (let i = 1; i < tp.length; i++) cellsOn(tp[i - 1], tp[i], function (k) { grid[k] |= bit; });
+        });
+      });
+      routeLayers.forEach(function (rl) {
+        const bit = rl.bit, lower = bit ? bit - 1 : 0, prev = rl.drawn || [];
+        let m = 0;
+        rl.shared = false;
+        rl.drawn = rl.thin.map(function (t, pi) {
+          const tp = t.px, lanes = new Array(Math.max(0, tp.length - 1)).fill(0);
+          let any = false;
+          if (bit) {
+            for (let i = 1; i < tp.length; i++) {
+              let lane = 0;
+              cellsOn(tp[i - 1], tp[i], function (k) {
+                m = grid[k - W - 1] | grid[k - W] | grid[k - W + 1] | grid[k - 1] | grid[k] | grid[k + 1] | grid[k + W - 1] | grid[k + W] | grid[k + W + 1];
+                if (m & ~bit) rl.shared = true;
+                const l = popcount(m & lower);
+                if (l > lane) lane = l;
+              });
+              lanes[i - 1] = lane;
+              if (lane) any = true;
+            }
+          }
+          if (any) { smoothLanes(tp, lanes); any = lanes.some(function (l) { return l > 0; }); }
+          if (!any) return { px: tp, ll: t.ll, raw: true, sig: z + ':' };
+          let sig = z + ':';
+          for (let i = 0; i < lanes.length; i++) if (lanes[i] && lanes[i] !== lanes[i - 1]) sig += i + '=' + lanes[i] + ',';
+          else if (!lanes[i] && lanes[i - 1]) sig += i + ',';
+          const old = prev[pi];
+          if (old && old.sig === sig) return old;
+          const d = drawRuns(t, lanes, z);
+          return { px: d.px, ll: d.ll, raw: false, sig: sig };
+        });
+        rl.zoom = z;
+      });
+      laid = { z: z, box: box };
+    }
+    function drawnLatLngs(rl) { return rl.drawn.map(function (d) { return d.ll; }); }
+    // the invisible hit line (ROUTE_HIT_PX wide) needs no 1 px detail: the drawn points thinned to 4 px
+    function hitLatLngs(rl) {
+      return rl.drawn.map(function (d) {
+        const px = d.px, out = [d.ll[0]];
+        let q = px[0];
+        for (let i = 1; i < px.length; i++) {
+          if (i === px.length - 1 || Math.abs(px[i].x - q.x) + Math.abs(px[i].y - q.y) >= 4) { out.push(d.ll[i]); q = px[i]; }
+        }
+        return out;
+      });
+    }
+    // new points for a polyline. quiet: on 'zoomend', ahead of the routes renderer (its listener was added
+    // after this map's own), which projects every path for the new zoom next; the 'moveend' that follows
+    // clips and draws them. So a zoom projects each route once, not twice.
+    function setLine(layer, ll, quiet) {
+      if (quiet && typeof layer._setLatLngs === 'function') layer._setLatLngs(ll); else layer.setLatLngs(ll);
+    }
+    // push a new layout into the route's polylines: only the parts whose drawn points changed
+    function applyLayout(rl, before, quiet) {
+      let any = false;
+      rl.lines.forEach(function (ln, i) {
+        const d = rl.drawn[i];
+        if (before[i] && before[i].ll === d.ll) return;
+        setLine(ln, d.ll, quiet);
+        any = true;
+      });
+      if (!any) return;
+      setLine(rl.casing, drawnLatLngs(rl), quiet);
+      setLine(rl.hit, hitLatLngs(rl), quiet);
+    }
+    function routeTip(r) { return '<b>' + esc(r.label || r.truckId) + '</b>' + (r.summary ? '<br>' + esc(r.summary) : ''); }
+    function segDist(p, a, b) {
+      const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+      let t = l2 ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const ex = a.x + t * dx - p.x, ey = a.y + t * dy - p.y;
+      return Math.sqrt(ex * ex + ey * ey);
+    }
+    const ROUTE_HIT_PX = 18;
+    // the route whose drawn line is nearest a layer point (null when none is within the hit width)
+    function nearestRoute(layerPoint) {
+      const z = map.getZoom(), p = layerPoint.add(map.getPixelOrigin());
+      let best = null, bestD = ROUTE_HIT_PX / 2 + 2;
+      routeLayers.forEach(function (rl) {
+        if (rl.zoom !== z) return;
+        rl.drawn.forEach(function (d) {
+          for (let i = 1; i < d.px.length; i++) {
+            const a = d.px[i - 1], b = d.px[i];
+            if (p.x < Math.min(a.x, b.x) - bestD || p.x > Math.max(a.x, b.x) + bestD || p.y < Math.min(a.y, b.y) - bestD || p.y > Math.max(a.y, b.y) + bestD) continue;
+            const dd = segDist(p, a, b);
+            if (dd < bestD) { bestD = dd; best = rl; }
+          }
+        });
+      });
+      return best;
     }
     function setRoutes(routes, ropts) {
       data.routes = (routes || []).slice();
@@ -583,70 +937,109 @@
       routeLayers.length = 0;
       const t = pal();
       const hi = data.routeOpts.highlightTruckId;
-      const ordered = data.routes.slice().sort(function (a, b) { return (a.truckId === hi) - (b.truckId === hi); });
-      ordered.forEach(function (r) {
+      data.routes.forEach(function (r) {
+        if (!r) return;
         const parts = routeParts(r);
         if (!parts.length) return;
-        const color = r.color || '#2F6FE0';
-        const isHi = hi && r.truckId === hi;
-        const dim = hi && !isHi;
-        const w = isHi ? 6 : 4;
-        const op = dim ? t.dim : t.routeOpacity;
-        const all = parts.map(function (p) { return p.coords; });
-        const g = L.featureGroup();
-        L.polyline(all, { pane: 'sro-routes', color: t.casing, weight: w + 3, opacity: dim ? t.dim * 0.8 : 0.9, interactive: false, lineCap: 'round', lineJoin: 'round' }).addTo(g);
-        parts.forEach(function (p) {
-          L.polyline(p.coords, {
-            pane: 'sro-routes', color: color, weight: w, opacity: op, interactive: false, lineCap: p.approx ? 'butt' : 'round', lineJoin: 'round',
-            dashArray: p.approx ? '8 7' : null, className: 'sro-route' + (p.approx ? ' sro-route-approx' : '')
-          }).addTo(g);
+        const isHi = !!(hi && r.truckId === hi);
+        routeLayers.push({ route: r, parts: parts, isHi: isHi, dim: !!(hi && !isHi), color: r.color || '#2F6FE0' });
+      });
+      layoutRoutes();         // lanes follow the order given, not the highlight
+      const rest = routeLayers.filter(function (rl) { return !rl.isHi; }), top = routeLayers.filter(function (rl) { return rl.isHi; });
+      function casing(rl) {
+        rl.casing = L.polyline(drawnLatLngs(rl), {
+          pane: 'sro-routes', color: t.casing, weight: (rl.isHi ? 6 : 4) + 3, opacity: rl.dim ? t.dim * 0.8 : 0.9, interactive: false,
+          lineCap: 'round', lineJoin: 'round', className: 'sro-route-casing'
+        }).addTo(groups.routes);
+      }
+      function lines(rl) {
+        rl.lines = rl.parts.map(function (p, i) {
+          return L.polyline(rl.drawn[i].ll, {
+            pane: 'sro-routes', color: rl.color, weight: rl.isHi ? 6 : 4, opacity: rl.dim ? t.dim : t.routeOpacity, interactive: false,
+            lineCap: p.approx ? 'butt' : 'round', lineJoin: 'round', dashArray: p.approx ? '8 7' : null,
+            className: 'sro-route' + (p.approx ? ' sro-route-approx' : '')
+          }).addTo(groups.routes);
         });
-        const arrows = L.polyline([], { pane: 'sro-routes', color: t.arrow, weight: isHi ? 2.2 : 1.8, opacity: dim ? t.dim : 0.95, interactive: false, lineCap: 'round', lineJoin: 'round' }).addTo(g);
-        const hit = L.polyline(all, { pane: 'sro-routes', color: '#000', weight: 18, opacity: 0, interactive: true, bubblingMouseEvents: false, className: 'sro-route-hit' }).addTo(g);
-        hit.on('click', function (e) { if (!drawing) emit('click:route', { truckId: r.truckId, route: r, lat: e.latlng.lat, lon: e.latlng.lng }); });
-        if (r.truckId) tip(hit, '<b>' + esc(r.label || r.truckId) + '</b>' + (r.summary ? '<br>' + esc(r.summary) : ''), { sticky: true, direction: 'top' });
-        g.addTo(groups.routes);
-        routeLayers.push({ route: r, parts: all, arrows: arrows });
+      }
+      function arrows(rl) {
+        rl.arrows = L.polyline([], {
+          pane: 'sro-routes', color: t.arrow, weight: rl.isHi ? 2.2 : 1.8, opacity: rl.dim ? t.dim : 0.95, interactive: false,
+          lineCap: 'round', lineJoin: 'round', className: 'sro-route-arrows'
+        }).addTo(groups.routes);
+      }
+      [rest, top].forEach(function (list) { list.forEach(casing); list.forEach(lines); list.forEach(arrows); });
+      rest.concat(top).forEach(function (rl) {
+        const r = rl.route;
+        const hit = rl.hit = L.polyline(hitLatLngs(rl), { pane: 'sro-routes', color: '#000', weight: ROUTE_HIT_PX, opacity: 0, interactive: true, bubblingMouseEvents: false, className: 'sro-route-hit' }).addTo(groups.routes);
+        hit.on('click', function (e) {
+          if (drawing) return;
+          const b = nearestRoute(e.layerPoint) || rl;
+          emit('click:route', { truckId: b.route.truckId, route: b.route, lat: e.latlng.lat, lon: e.latlng.lng });
+        });
+        if (r.truckId) {
+          tip(hit, routeTip(r), { sticky: true, direction: 'top' });
+          let shown = rl;
+          hit.on('mousemove', function (e) {
+            const b = nearestRoute(e.layerPoint) || rl;
+            if (b !== shown && b.route.truckId) { shown = b; hit.setTooltipContent(routeTip(b.route)); }
+          });
+        }
         (r.stops || []).forEach(function (s, i) {
           const p = toLatLng(s);
           if (!finitePt(p)) return;
           const n = s.seq !== undefined ? s.seq : i + 1;
           L.marker(p, {
-            pane: 'sro-stops', interactive: false, keyboard: false, zIndexOffset: isHi ? 1000 : 0,
-            icon: L.divIcon({ className: 'sro-stop-icon', html: '<div class="sro-stop' + (dim ? ' sro-stop-dim' : '') + '" style="--sro-stop:' + color + '">' + esc(n) + '</div>', iconSize: [20, 20], iconAnchor: [10, 10] })
+            pane: 'sro-stops', interactive: false, keyboard: false, zIndexOffset: rl.isHi ? 1000 : 0,
+            icon: L.divIcon({ className: 'sro-stop-icon', html: '<div class="sro-stop' + (rl.dim ? ' sro-stop-dim' : '') + '" style="--sro-stop:' + rl.color + '">' + esc(n) + '</div>', iconSize: [20, 20], iconAnchor: [10, 10] })
           }).addTo(groups.stops);
         });
       });
       drawArrows();
     }
+    // after every zoom ('zoomend', quiet) and after a pan that leaves the laid-out area ('moveend'):
+    // lanes are screen pixels
+    function relayoutRoutes(quiet) {
+      if (destroyed || !routeLayers.length) return;
+      const pb = map.getPixelBounds();
+      if (laid && laid.z === map.getZoom() && pb.min.x >= laid.box.min.x && pb.min.y >= laid.box.min.y &&
+          pb.max.x <= laid.box.max.x && pb.max.y <= laid.box.max.y) return;
+      const before = routeLayers.map(function (rl) { return rl.drawn || []; });
+      layoutRoutes();
+      routeLayers.forEach(function (rl, i) { applyLayout(rl, before[i], quiet); });
+      drawArrows(quiet);
+    }
 
-    // direction chevrons every ~90 px along each route, recomputed on zoom
-    const ARROW_GAP = 90, ARROW_LEN = 5, ARROW_HALF = 3.6;
-    function drawArrows() {
-      const z = map.getZoom();
-      routeLayers.forEach(function (rl) {
+    // direction chevrons every ~90 px along each drawn line (smaller where routes run side by side), only
+    // within the laid-out area: a pan beyond it lays out again
+    const ARROW_GAP = 90, ARROW_LEN = 5, ARROW_HALF = 3.6, ARROW_LEN_SHARED = 4.2, ARROW_HALF_SHARED = 2.8;
+    function drawArrows(quiet) {
+      const box = laid && laid.box;
+      routeLayers.forEach(function (rl, idx) {
+        const small = rl.shared && !rl.isHi;
+        const len = small ? ARROW_LEN_SHARED : ARROW_LEN, half = small ? ARROW_HALF_SHARED : ARROW_HALF, z = rl.zoom;
         const chevrons = [];
-        rl.parts.forEach(function (coords) {
-          const px = coords.map(function (c) { return map.project(c, z); });
-          let next = ARROW_GAP * 0.6, acc = 0;
+        rl.drawn.forEach(function (d) {
+          const px = d.px;
+          // staggered so chevrons on lines side by side do not line up
+          let next = ARROW_GAP * 0.6 + (rl.shared ? (idx % 4) * 22 : 0), acc = 0;
           for (let i = 1; i < px.length; i++) {
             const a = px[i - 1], b = px[i];
             const dx = b.x - a.x, dy = b.y - a.y, seg = Math.sqrt(dx * dx + dy * dy);
             if (!seg) continue;
             const ux = dx / seg, uy = dy / seg;
             while (acc + seg >= next) {
-              const d = next - acc;
-              const tipP = L.point(a.x + ux * d, a.y + uy * d);
-              const back = L.point(tipP.x - ux * ARROW_LEN, tipP.y - uy * ARROW_LEN);
-              const w1 = L.point(back.x - uy * ARROW_HALF, back.y + ux * ARROW_HALF);
-              const w2 = L.point(back.x + uy * ARROW_HALF, back.y - ux * ARROW_HALF);
-              chevrons.push([map.unproject(w1, z), map.unproject(tipP, z), map.unproject(w2, z)]);
+              const dd = next - acc;
               next += ARROW_GAP;
+              const tx = a.x + ux * dd, ty = a.y + uy * dd;
+              if (box && (tx < box.min.x || tx > box.max.x || ty < box.min.y || ty > box.max.y)) continue;
+              const bx = tx - ux * len, by = ty - uy * len;
+              chevrons.push([map.unproject(L.point(bx - uy * half, by + ux * half), z), map.unproject(L.point(tx, ty), z),
+                map.unproject(L.point(bx + uy * half, by - ux * half), z)]);
             }
             acc += seg;
           }
         });
-        rl.arrows.setLatLngs(chevrons);
+        setLine(rl.arrows, chevrons, quiet);
       });
     }
     function resize() {
@@ -656,7 +1049,8 @@
         setHubs(data.hubs); setRally(data.rally, data.rallyOpts); setPlatoons(data.platoons, data.platoonOpts); setTrucks(data.trucks);
       }
     }
-    map.on('zoomend', function () { drawArrows(); zoneLabels(); resize(); });
+    map.on('zoomend', function () { relayoutRoutes(true); zoneLabels(); resize(); });
+    map.on('moveend', function () { relayoutRoutes(false); });
     map.on('resize', resize);
 
     // trucks (updated in place so the demo clock can animate them)
@@ -698,16 +1092,23 @@
     }
 
     // ---- view ----------------------------------------------------------------------------------------
-    function fitTaiwan(o) { map.fitBounds(MAP.TAIWAN_BOUNDS, Object.assign({ padding: [8, 8] }, o || {})); }
-    function fitTo(b, o) {
-      let bounds = null;
-      if (b && typeof b.isValid === 'function') bounds = b;
-      else if (Array.isArray(b) && b.length) {
-        const pts = b.map(toLatLng).filter(finitePt);
-        if (pts.length === 1) { map.setView(pts[0], Math.max(map.getZoom(), 11)); return; }
-        if (pts.length) bounds = L.latLngBounds(pts);
-      }
-      if (!bounds || !bounds.isValid()) return;
+    function fitTaiwanNow(o) { map.fitBounds(MAP.TAIWAN_BOUNDS, Object.assign({ padding: [8, 8] }, o || {})); }
+    function noAnim(o) { return Object.assign({}, o || {}, { animate: false }); }
+    function fitTaiwan(o) {
+      callerSetsView(function () { fitTaiwanNow(o); }, function () { fitTaiwanNow(noAnim(o)); });
+    }
+    // b: L.LatLngBounds | [[lat, lon], ...] | [{ lat, lon }, ...]
+    function fitTarget(b) {
+      if (b && typeof b.isValid === 'function') return b.isValid() ? { bounds: b } : null;
+      if (!Array.isArray(b) || !b.length) return null;
+      const pts = b.map(toLatLng).filter(finitePt);
+      if (pts.length === 1) return { point: pts[0] };
+      if (!pts.length) return null;
+      const bounds = L.latLngBounds(pts);
+      return bounds.isValid() ? { bounds: bounds } : null;
+    }
+    function fitToNow(target, o) {
+      if (target.point) { map.setView(target.point, Math.max(map.getZoom(), 11), o && o.animate === false ? { animate: false } : undefined); return; }
       const fo = Object.assign({ maxZoom: 13 }, o || {});
       const pad = fo.padding || [28, 28];
       delete fo.padding;
@@ -716,7 +1117,18 @@
       const attrH = attrEl ? attrEl.offsetHeight : 0;
       fo.paddingTopLeft = fo.paddingTopLeft || pad;
       fo.paddingBottomRight = fo.paddingBottomRight || [pad[0], pad[1] + attrH];
-      map.fitBounds(bounds, fo);
+      map.fitBounds(target.bounds, fo);
+    }
+    function fitTo(b, o) {
+      const target = fitTarget(b);
+      if (!target) return;
+      callerSetsView(function () { fitToNow(target, o); }, function () { fitToNow(target, noAnim(o)); });
+    }
+    function setView(center, zoom, o) {
+      const c = toLatLng(center);
+      if (!finitePt(c)) return;
+      const z = function () { return isFinite(zoom) ? +zoom : map.getZoom(); };
+      callerSetsView(function () { map.setView(c, z(), o); }, function () { map.setView(c, z(), noAnim(o)); });
     }
 
     map.on('click', function (e) {
@@ -872,17 +1284,26 @@
       setTrucks(data.trucks);
     }
 
-    let fittedVisible = map.getSize().x > 0 && map.getSize().y > 0, raf = 0, ro = null;
+    // Size changes (a hidden tab shown, a panel resized): one invalidateSize per frame. The first time
+    // the element has a size the component fits Taiwan, unless the caller set a view; a view the caller
+    // set while the element had no size is applied again now.
+    let fittedVisible = hasSize(), raf = 0, ro = null;
+    const frame = root.requestAnimationFrame ? function (f) { return root.requestAnimationFrame(f); } : function (f) { return setTimeout(f, 16); };
+    const cancelFrame = root.cancelAnimationFrame ? function (id) { root.cancelAnimationFrame(id); } : clearTimeout;
+    function sized() {
+      raf = 0;
+      if (destroyed) return;
+      internally(function () {
+        map.invalidateSize({ pan: false });
+        if (!hasSize()) return;
+        if (pendingView) { const v = pendingView; pendingView = null; fittedVisible = true; v.fn(); }
+        else if (!fittedVisible) { fittedVisible = true; if (!callerView) fitTaiwanNow({ animate: false }); }
+      });
+    }
     if (typeof root.ResizeObserver === 'function') {
       ro = new root.ResizeObserver(function () {
-        if (raf) return;
-        raf = (root.requestAnimationFrame || setTimeout)(function () {
-          raf = 0;
-          if (destroyed) return;
-          map.invalidateSize({ pan: false });
-          const sz = map.getSize();
-          if (!fittedVisible && sz.x > 0 && sz.y > 0) { fittedVisible = true; fitTaiwan({ animate: false }); }
-        });
+        if (raf || destroyed) return;
+        raf = frame(sized);
       });
       ro.observe(el);
     }
@@ -898,37 +1319,55 @@
       themeObs.observe(doc.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     }
 
-    let destroyed = false;
+    // After destroy() every call is a no-op (a view may still hold the handle for a frame).
+    function live(fn, dead) {
+      return function () { return destroyed ? (typeof dead === 'function' ? dead() : dead) : fn.apply(null, arguments); };
+    }
+    const noop = function () {};
+    const deadSession = function () { return { cancel: noop, stage: function () { return 'done'; }, radius: function () { return 0; } }; };
     const api = {
       leaflet: map,
       el: el,
-      setZones: setZones, setHubs: setHubs, setRally: setRally, setPlatoons: setPlatoons, setRoutes: setRoutes, setTrucks: setTrucks,
-      fitTaiwan: fitTaiwan, fitTo: fitTo, on: on, off: off,
-      enableZoneDrawing: enableZoneDrawing,
+      setZones: live(setZones), setHubs: live(setHubs), setRally: live(setRally), setPlatoons: live(setPlatoons),
+      setRoutes: live(setRoutes), setTrucks: live(setTrucks),
+      fitTaiwan: live(fitTaiwan), fitTo: live(fitTo), setView: live(setView),
+      on: live(on, function () { return noop; }), off: off,
+      enableZoneDrawing: live(enableZoneDrawing, deadSession),
       isDrawing: function () { return !!drawing; },
-      setTheme: setTheme,
+      isDestroyed: function () { return destroyed; },
+      setTheme: live(setTheme),
       getTheme: function () { return theme; },
-      setRoadsVisible: function (v) { roadsPref = !!v; syncBase(); },
-      setTilesEnabled: function (v) {
+      setRoadsVisible: live(function (v) { roadsPref = !!v; syncBase(); }),
+      setTilesEnabled: live(function (v) {
         tiles.wanted = !!v;
         // already loading or on: restarting would reset the load counter and let the 8 s watchdog
         // drop working tiles (no new tile loads arrive while the view is unchanged)
         if (tiles.wanted) { if (tiles.state === 'off') startTiles(); }
         else { clearTimeout(tiles.timer); tiles.probeSeq++; if (tiles.layer && map.hasLayer(tiles.layer)) map.removeLayer(tiles.layer); tiles.state = 'off'; tiles.reason = 'user'; syncBase(); emit('tiles', status()); }
-      },
+      }),
       status: status,
-      invalidateSize: function () { map.invalidateSize(); },
+      invalidateSize: live(function () { map.invalidateSize(); }),
+      // Safe at any time, including in the same task as create() and during a zoom or pan animation.
       destroy: function () {
         if (destroyed) return;
         destroyed = true;
         if (drawing) drawing.cancel();
         if (ro) ro.disconnect();
+        if (raf) { cancelFrame(raf); raf = 0; }
         if (themeObs) themeObs.disconnect();
         clearTimeout(tiles.timer);
+        tiles.probeSeq++;
+        pendingView = null;
         root.removeEventListener && root.removeEventListener('offline', onOffline);
         root.removeEventListener && root.removeEventListener('online', onOnline);
         Object.keys(handlers).forEach(function (k) { handlers[k].length = 0; });
-        map.remove();
+        map.remove();                  // stops pan / fly animations; road renderer: SafeCanvas (no frame left behind)
+        // An animated zoom leaves its first frame and a 250 ms end timer behind (Leaflet 1.9.4); with the
+        // panes gone the timer threw "reading '_leaflet_pos'". The timer only acts while this flag is set,
+        // and with every map listener dropped the frame's events reach nothing.
+        map._animatingZoom = false;
+        map.off();
+        if (tiles.layer) tiles.layer.off();
         if (defs.parentNode) defs.parentNode.removeChild(defs);
         el.classList.remove('sro-map', 'sro-compact');
         el.removeAttribute('data-sro-theme');

@@ -198,10 +198,18 @@
     return canonicalWindows(fillDefaults(s || {}, skeleton()));
   };
 
-  // Loaded/imported state -> complete state: fill missing keys, canonical window ids, never
-  // resume a running clock.
+  // Older saves: a request without reportedAt reported its on hand when it was made.
+  function migrateRequests(s) {
+    if (!Array.isArray(s.requests)) return s;
+    const old = function (r) { return isObj(r) && !isNum(r.reportedAt) && isNum(r.createdAt); };
+    if (!s.requests.some(old)) return s;
+    return Object.assign({}, s, { requests: s.requests.map(function (r) { return old(r) ? Object.assign({}, r, { reportedAt: r.createdAt }) : r; }) });
+  }
+
+  // Loaded/imported state -> complete state: fill missing keys, canonical window ids, request
+  // report times, never resume a running clock.
   function hydrate(loaded, defaults) {
-    const s = canonicalWindows(fillDefaults(loaded, defaults || store.defaultState()));
+    const s = migrateRequests(canonicalWindows(fillDefaults(loaded, defaults || store.defaultState())));
     s.version = store.VERSION;
     s.clock = Object.assign({}, s.clock, { running: false });
     return s;
@@ -229,11 +237,13 @@
       hoursLeftComputed: null, hoursLeftReported: null,
       nlt: null, deadline: null,
       remarks: ''
-    }, clone(without(r0, ['id', 'status', 'createdAt', 'windowId', 'locks', 'updated'])));
+    }, clone(without(r0, ['id', 'status', 'createdAt', 'reportedAt', 'windowId', 'locks', 'updated', 'updatedChange'])));
     r.id = id;
     r.source = r0.source || source;
     r.status = 'submitted';
     r.createdAt = createdAt;
+    // when the lines / on hand / hours left were reported (escalation counts the run-out from here)
+    r.reportedAt = isNum(num(r0.reportedAt)) ? Math.floor(num(r0.reportedAt)) : createdAt;
     // The window that is open when the request enters the queue (the one whose plan will pick it
     // up). Sample requests carry back-dated createdAt stamps (up to 3 h before loading); using
     // createdAt here put the demo's 19 samples in the previous, already-closed window while the
@@ -243,7 +253,7 @@
     r.updated = false;
     // Escalation (urgency.js): when the caller did not already decide the urgency, apply the
     // spec rule here so an Urgent request with < 24 h of supply always becomes Immediate.
-    if (!r.urgency) escalateInto(r, r, createdAt, settings);
+    if (!r.urgency) escalateInto(r, r, r.reportedAt, settings);
     if (!r.urgency) r.urgency = r.urgencyRequested || 'Routine';
     if (r.deadline === null || r.deadline === undefined) r.deadline = r.nlt;
     if (!r.gridId && isFinite(num(r.lat)) && isFinite(num(r.lon)) && SRO.core.geo && Array.isArray(SRO.data && SRO.data.grid)) {
@@ -252,6 +262,16 @@
     }
     return r;
   }
+
+  // What a request reports (lines with on hand; hours left), for telling a new report from the same
+  // one sent again (same fields as the form's reportKey in psg/request.js).
+  function reportKey(lines) {
+    return JSON.stringify((Array.isArray(lines) ? lines : []).map(function (l) {
+      l = l || {};
+      return [l.classId, l.itemId, l.option === undefined ? null : l.option, num(l.qty), l.unit, isNum(num(l.onHand)) ? num(l.onHand) : null];
+    }));
+  }
+  function hoursKey(h) { return isNum(num(h)) ? num(h) : null; }
 
   // Sets urgency / deadline / hours from SRO.core.urgency.escalate(src, atMin) on `dst` (when the
   // module is loaded). The deadline is only set when dst has none. Returns true when applied.
@@ -289,6 +309,237 @@
     });
     ((plan && plan.deferred) || []).forEach(function (d) { get(d.requestId).deferred = true; });
     return info;
+  }
+
+  // ---- what a re-plan changed for each request ('updated', spec-answers Contingency) -----------------
+  // A stop's ETA has to move by more than this many minutes to count as a change.
+  store.ETA_TOLERANCE_MIN = 1;
+
+  // Per-request index of a plan in the plan.byRequest shape the engine's planChanges reads:
+  // { [requestId]: { truckId, nodeKey, gridId, label, nodeKind, eta, status, deferredQty, stops: [...] } }.
+  // Engine plans carry byRequest with every stop of a split delivery (done ones too); plans without it
+  // (hand-made, or entries with no stops list) are read from route stops and plan.deferred.
+  function stopNodeKey(st) {
+    return st.nodeKey || ((st.kind || st.nodeKind || 'rally') + ':' + (st.gridId || (st.lat + ',' + st.lon)));
+  }
+  function requestIndex(plan) {
+    const routeStops = {}, deferred = {};
+    ((plan && plan.routes) || []).forEach(function (rt) {
+      (rt.stops || []).forEach(function (st) {
+        const seen = {};
+        (st.deliveries || []).forEach(function (d) {
+          if (!d || !d.requestId || seen[d.requestId]) return;
+          seen[d.requestId] = true;
+          (routeStops[d.requestId] = routeStops[d.requestId] || []).push({
+            truckId: rt.truckId, stopSeq: st.seq, nodeKind: st.kind || null, nodeKey: stopNodeKey(st), gridId: st.gridId || null,
+            lat: st.lat, lon: st.lon, label: st.label || '', eta: isNum(st.arrive) ? st.arrive : null, done: !!st.done
+          });
+        });
+      });
+    });
+    ((plan && plan.deferred) || []).forEach(function (d) {
+      if (!d || !d.requestId) return;
+      const q = deferred[d.requestId] || (deferred[d.requestId] = {});
+      q[d.lineIdx] = (q[d.lineIdx] || 0) + (num(d.qty) || 0);
+    });
+    const br = (plan && isObj(plan.byRequest)) ? plan.byRequest : {};
+    const ids = Object.keys(br).concat(Object.keys(routeStops), Object.keys(deferred));
+    const out = {};
+    ids.forEach(function (rid) {
+      if (out[rid]) return;
+      const b = isObj(br[rid]) ? br[rid] : null;
+      const stops = (b && Array.isArray(b.stops) && b.stops.length
+        ? b.stops.map(function (s) { return Object.assign({}, s, { nodeKey: stopNodeKey(s), eta: isNum(s.eta) ? s.eta : null, done: !!s.done }); })
+        : (routeStops[rid] || []).slice());
+      stops.sort(function (x, y) { return (x.done - y.done) || ((isNum(x.eta) ? x.eta : Infinity) - (isNum(y.eta) ? y.eta : Infinity)); });
+      const defQty = b && isObj(b.deferredQty) ? b.deferredQty : (deferred[rid] || {});
+      const hasDef = Object.keys(defQty).some(function (k) { return num(defQty[k]) > 1e-9; });
+      const p = stops.find(function (s) { return !s.done; }) || stops[0] || null;
+      out[rid] = {
+        requestId: rid, truckId: p ? p.truckId : null, nodeKey: p ? p.nodeKey : null, gridId: p ? p.gridId : null, label: p ? p.label : null,
+        nodeKind: p ? p.nodeKind : null, eta: p ? p.eta : null,
+        status: !stops.length ? 'deferred' : hasDef ? 'partial' : 'planned',
+        deferredQty: defQty, stops: stops
+      };
+    });
+    return out;
+  }
+
+  // Same rules as SRO.core.engine.planChanges (used when the engine is not loaded, e.g. store-only use).
+  function indexChanges(a, b) {
+    const sig = function (e, withEta) {
+      return (e.stops || []).map(function (s) { return s.truckId + '@' + s.nodeKey + (withEta ? '@' + Math.round(isNum(s.eta) ? s.eta : -1) : ''); }).sort().join('|');
+    };
+    const out = [];
+    Object.keys(a).concat(Object.keys(b).filter(function (k) { return !a[k]; })).forEach(function (rid) {
+      const x = a[rid], y = b[rid];
+      let kind = null;
+      if (x && !y) kind = 'dropped';
+      else if (!x && y) kind = 'added';
+      else if (x.status !== y.status && (y.status === 'deferred' || x.status === 'deferred')) kind = y.status === 'deferred' ? 'delayed' : 'restored';
+      else if (sig(x, false) !== sig(y, false)) kind = 'moved';
+      else if (sig(x, true) !== sig(y, true)) kind = 'eta';
+      else if (x.status !== y.status) kind = y.status === 'partial' ? 'delayed' : 'restored';
+      if (kind) out.push({ requestId: rid, kind: kind });
+    });
+    return out;
+  }
+
+  // The same stop in two plans: same truck and point, ETA within the tolerance.
+  function sameStop(p, s) {
+    return p.truckId === s.truckId && p.nodeKey === s.nodeKey &&
+      (isNum(p.eta) && isNum(s.eta) ? Math.abs(p.eta - s.eta) <= store.ETA_TOLERANCE_MIN : p.eta === s.eta);
+  }
+  // Stops of `bs` that have no counterpart in `as`.
+  function unmatchedStops(as, bs) {
+    const pool = as.slice();
+    return bs.filter(function (s) {
+      const i = pool.findIndex(function (p) { return sameStop(p, s); });
+      if (i < 0) return true;
+      pool.splice(i, 1);
+      return false;
+    });
+  }
+  // More (or less) of a request carried to the next window with the same stops.
+  function deferShift(x, y) {
+    const keys = Object.keys(x.deferredQty || {}).concat(Object.keys(y.deferredQty || {}));
+    let more = false, less = false;
+    keys.forEach(function (k) {
+      const p = num(x.deferredQty[k]) || 0, q = num(y.deferredQty[k]) || 0;
+      if (q > p + 1e-6) more = true; else if (q < p - 1e-6) less = true;
+    });
+    return more ? 'delayed' : less ? 'restored' : null;
+  }
+  function pickupOf(s) { return s ? { truckId: s.truckId, gridId: s.gridId, label: s.label, nodeKind: s.nodeKind, eta: s.eta } : null; }
+  // What changed for one request, for the platoon sergeant's card ('Pickup moved to X', 'ETA now 1430').
+  // Times stay numbers; format.js formats them in the view.
+  function describeChange(kind, x, y) {
+    // stops already done in the new plan were done in the old one too: compare what is still to come
+    const done = y.stops.filter(function (s) { return s.done; });
+    const before = x.stops.filter(function (s) {
+      const i = done.findIndex(function (d) { return d.truckId === s.truckId && d.nodeKey === s.nodeKey; });
+      if (i < 0) return true;
+      done.splice(i, 1);
+      return false;
+    });
+    const after = y.stops.filter(function (s) { return !s.done; });
+    // pair each stop still to come with an unchanged stop of the old plan; what is left over on either
+    // side is what changed
+    const pool = before.slice();
+    const same = after.map(function (s) {
+      const i = pool.findIndex(function (p) { return sameStop(p, s); });
+      return i < 0 ? null : pool.splice(i, 1)[0];
+    });
+    const b0 = after[0] || null;
+    // The first stop is compared with itself when it did not change, else with the old stop it most
+    // likely replaces (same truck, else same point, else the first changed one). By position, a fuel
+    // and a cargo truck arriving together read 'Truck now Alpha-2' when Alpha-2 was already coming and
+    // only the other truck's stop moved.
+    const a0 = !b0 ? null : same[0] || pool.find(function (p) { return p.truckId === b0.truckId; }) ||
+      pool.find(function (p) { return p.nodeKey === b0.nodeKey; }) || pool[0] || null;
+    const prev = a0 || before[0] || null;
+    // stops that changed or are new, by their place in the new plan (a new first stop next to old ones
+    // that did not change is listed here too; with no old stops the card says 'Pickup at ...')
+    const others = after.map(function (s, k) {
+      return same[k] || (k === 0 && (a0 || !before.length)) ? null : Object.assign(pickupOf(s), { order: k + 1 });
+    }).filter(Boolean);
+    const fewer = after.length ? Math.max(0, before.length - after.length) : 0;
+    const shift = deferShift(x, y);
+    return {
+      kind: kind, status: y.status,
+      truckId: b0 ? b0.truckId : null, gridId: b0 ? b0.gridId : null, label: b0 ? b0.label : null, nodeKind: b0 ? b0.nodeKind : null,
+      eta: b0 ? b0.eta : null, prevEta: prev ? prev.eta : null, prevLabel: prev ? prev.label : null, prevGridId: prev ? prev.gridId : null,
+      pickupMoved: !!(a0 && b0 && a0.nodeKey !== b0.nodeKey),
+      etaChanged: !!(a0 && b0 && isNum(a0.eta) && isNum(b0.eta) && Math.abs(b0.eta - a0.eta) > store.ETA_TOLERANCE_MIN),
+      truckChanged: !!(a0 && b0 && a0.truckId !== b0.truckId),
+      others: others, fewerStops: others.length ? 0 : fewer,
+      // more of it carried to the next window / brought back into this one (also when stops moved)
+      deferredMore: kind === 'delayed' || shift === 'delayed', deferredLess: kind === 'restored' || (kind !== 'delayed' && shift === 'restored')
+    };
+  }
+  // requestId -> change, for the requests whose delivery `plan` changes against `prev`: a moved stop, a
+  // retimed stop (more than ETA_TOLERANCE_MIN), a new deferral or a restored delivery, on any stop of a
+  // split delivery. The engine's change list (plan.changes, made against its parent, or
+  // SRO.core.engine.planChanges) decides which requests changed; first plans (no prev) change nothing.
+  function requestChanges(prev, plan) {
+    const out = {};
+    if (!prev || !plan) return out;
+    const A = requestIndex(prev), B = requestIndex(plan);
+    let list = null;
+    if (Array.isArray(plan.changes) && plan.parentPlanId && plan.parentPlanId === prev.id) list = plan.changes;
+    if (!list) {
+      const E = SRO.core.engine;
+      try { if (E && typeof E.planChanges === 'function') list = E.planChanges({ byRequest: A }, { byRequest: B }); } catch (e) { list = null; }
+    }
+    if (!Array.isArray(list)) list = indexChanges(A, B);
+    list.forEach(function (c) {
+      const x = c && A[c.requestId], y = c && B[c.requestId];
+      if (!x || !y || out[c.requestId]) return;                       // 'added' / 'dropped': nothing to compare
+      if (['moved', 'eta', 'delayed', 'restored'].indexOf(c.kind) < 0) return;
+      // ETA-only differences within the tolerance (the engine rounds to the minute) are not a change
+      if (c.kind === 'eta' && !unmatchedStops(x.stops, y.stops).length) return;
+      out[c.requestId] = describeChange(c.kind, x, y);
+    });
+    Object.keys(B).forEach(function (rid) {
+      if (out[rid] || !A[rid]) return;
+      const k = deferShift(A[rid], B[rid]);
+      if (k) out[rid] = describeChange(k, A[rid], B[rid]);
+    });
+    return out;
+  }
+  store.requestChanges = requestChanges;
+
+  // ---- plan storage limit ------------------------------------------------------------------------------
+  // Plans are ~55 KB each. plan/store keeps every approved (or once approved) plan, plans that snapshots,
+  // windows or requests point at, the plans of the current window (clock), the plan just stored and
+  // the KEEP_DRAFTS most recent other drafts; older drafts are dropped.
+  store.KEEP_DRAFTS = 10;
+  function prunePlans(s, storedId) {
+    const plans = s.plans || [];
+    const curWin = windowOf(isNum(s.clock && s.clock.simMin) ? s.clock.simMin : 0).id;
+    const keep = {};
+    keep[storedId] = true;
+    plans.forEach(function (p) {
+      if (p.approved || p.superseded || isNum(p.approvedAt)) keep[p.id] = true;
+      if (p.windowId === curWin) keep[p.id] = true;
+    });
+    (s.snapshots || []).forEach(function (x) { if (x && x.planId) keep[x.planId] = true; });
+    (s.windows || []).forEach(function (w) { if (w && w.approvedPlanId) keep[w.approvedPlanId] = true; });
+    (s.requests || []).forEach(function (r) { if (r && r.planId) keep[r.planId] = true; });
+    const others = plans.map(function (p, i) { return { p: p, i: i }; }).filter(function (x) { return !keep[x.p.id]; });
+    if (others.length <= store.KEEP_DRAFTS) return { state: s, dropped: [] };
+    others.sort(function (a, b) { return (num(b.p.createdAt) || 0) - (num(a.p.createdAt) || 0) || b.i - a.i; });
+    others.slice(0, store.KEEP_DRAFTS).forEach(function (x) { keep[x.p.id] = true; });
+    // a kept plan's parent and the plans it was built on stay with it (before / after views)
+    plans.forEach(function (p) {
+      if (!keep[p.id]) return;
+      if (p.parentPlanId) keep[p.parentPlanId] = true;
+      (Array.isArray(p.builtOn) ? p.builtOn : []).forEach(function (id) { keep[id] = true; });
+    });
+    const dropped = plans.filter(function (p) { return !keep[p.id]; }).map(function (p) { return p.id; });
+    if (!dropped.length) return { state: s, dropped: [] };
+    const gone = {};
+    dropped.forEach(function (id) { gone[id] = true; });
+    const left = plans.filter(function (p) { return !gone[p.id]; });
+    const windows = (s.windows || []).map(function (w) {
+      if (!w || !(w.planIds || []).some(function (id) { return gone[id]; })) return w;
+      const planIds = w.planIds.filter(function (id) { return !gone[id]; });
+      return Object.assign({}, w, { planIds: planIds, status: !planIds.length && w.status === 'planned' ? 'open' : w.status });
+    });
+    // a request that only a dropped draft delivered is back to waiting for a plan
+    let reqs = s.requests;
+    if ((s.requests || []).some(function (r) { return r.status === 'planned'; })) {
+      const inDraft = {};
+      left.forEach(function (p) {
+        if (p.approved || p.superseded) return;
+        const info = planRequestInfo(p);
+        Object.keys(info).forEach(function (id) { if (info[id].delivered) inDraft[id] = true; });
+      });
+      if (s.requests.some(function (r) { return r.status === 'planned' && !inDraft[r.id]; })) {
+        reqs = s.requests.map(function (r) { return r.status === 'planned' && !inDraft[r.id] ? Object.assign({}, r, { status: 'submitted' }) : r; });
+      }
+    }
+    return { state: Object.assign({}, s, { plans: left, windows: windows, requests: reqs }), dropped: dropped };
   }
 
   function hasPending(state) {
@@ -460,14 +711,18 @@
     if (EDITABLE.indexOf(r.status) < 0) return fail(s, 'Request ' + id + ' is ' + r.status + ' and can no longer be changed.');
     let ch = arg(a, ['changes', 'patch']);
     if (!isObj(ch)) ch = without(objArg(a, 'request') || {}, ['id', 'requestId', 'now']);
-    ch = clone(without(ch, ['id', 'status', 'createdAt', 'windowId', 'source', 'updated']));
+    ch = clone(without(ch, ['id', 'status', 'createdAt', 'reportedAt', 'windowId', 'source', 'updated', 'updatedChange']));
     const n = Object.assign({}, r, ch);
     const tierChanged = 'urgencyRequested' in ch && ch.urgencyRequested !== r.urgencyRequested;
     const urgencyInputs = tierChanged || ['nlt', 'lines', 'hoursLeftReported'].some(function (k) { return k in ch; });
-    // Re-run escalation when its inputs change (on hand re-reported now if lines / hours changed,
-    // otherwise as of the original report), unless the caller set urgency or deadline itself.
-    const reportAt = ('lines' in ch || 'hoursLeftReported' in ch) ? nowOf(s, a) : r.createdAt;
-    if (!(urgencyInputs && !('urgency' in ch) && !('deadline' in ch) && escalateInto(n, n, reportAt, s.scenario && s.scenario.settings, true))) {
+    // New lines / on hand / hours left are a new report, made now; anything else (an NLT-only edit,
+    // or the same lines sent again) keeps the time of the last report, so an Immediate run-out
+    // deadline does not move. Escalation re-runs as of that report when its inputs change, unless
+    // the caller set urgency or deadline itself.
+    const reported = ('lines' in ch && reportKey(ch.lines) !== reportKey(r.lines)) ||
+      ('hoursLeftReported' in ch && hoursKey(ch.hoursLeftReported) !== hoursKey(r.hoursLeftReported));
+    n.reportedAt = reported ? nowOf(s, a) : (isNum(r.reportedAt) ? r.reportedAt : r.createdAt);
+    if (!(urgencyInputs && !('urgency' in ch) && !('deadline' in ch) && escalateInto(n, n, n.reportedAt, s.scenario && s.scenario.settings, true))) {
       if ('nlt' in ch && !('deadline' in ch)) {
         n.deadline = (r.deadline === r.nlt || !isNum(r.deadline)) ? n.nlt : Math.min(n.nlt, r.deadline);
       }
@@ -480,6 +735,19 @@
     if (r.status === 'planned') n.status = 'submitted';      // the draft plan no longer matches
     n.editedAt = nowOf(s, a);
     return ok(Object.assign({}, s, { requests: mapById(s.requests, id, function () { return n; }) }), { id: id });
+  };
+
+  // { id } the platoon sergeant has seen what a re-plan changed (the card was on screen for a moment,
+  // or tapped): clears 'updated' and the change note.
+  H['request/seen'] = function (s, a) {
+    const id = arg(a, ['id', 'requestId']);
+    const r = s.requests.find(function (x) { return x.id === id; });
+    if (!r) return fail(s, 'Request ' + id + ' was not found.');
+    if (!r.updated && !r.updatedChange) return ok(s, { id: id, unchanged: true });
+    const now = nowOf(s, a);
+    return ok(Object.assign({}, s, { requests: mapById(s.requests, id, function (x) {
+      return without(Object.assign({}, x, { updated: false, seenAt: now }), ['updatedChange']);
+    }) }), { id: id });
   };
 
   H['request/cancel'] = function (s, a) {
@@ -570,7 +838,8 @@
     });
     if (changed) ns.requests = reqs;
     ns = assignIn(ns, ['ui'], { planRequested: false, planRequestReason: null, lastPlanId: p.id });
-    return ok(ns, { id: p.id });
+    const pr = prunePlans(ns, p.id);
+    return ok(pr.state, { id: p.id, droppedPlanIds: pr.dropped });
   };
 
   // { planId } approves a plan: it becomes the window's movement schedule, supersedes the
@@ -602,7 +871,8 @@
       return p;
     });
     const info = planRequestInfo(plan);
-    const prevInfo = prev ? planRequestInfo(prev) : null;
+    // what this plan changes against the one it replaces: those platoon sergeants see 'Updated'
+    const changes = requestChanges(prev, plan);
     const requests = s.requests.map(function (r) {
       const x = info[r.id];
       if (r.status === 'cancelled' || r.status === 'delivered') return r;
@@ -615,10 +885,12 @@
       if (x && x.delivered) {
         n.eta = isNum(x.firstArrive) ? x.firstArrive : null;
         n.planId = id;
-        const px = prevInfo && prevInfo[r.id];
-        if (px && px.delivered && (px.firstArrive !== x.firstArrive || px.gridIds.slice().sort().join() !== x.gridIds.slice().sort().join())) n.updated = true;
       }
-      if (st === r.status && n.eta === r.eta && n.updated === r.updated && n.planId === r.planId) return r;
+      if (changes[r.id]) {
+        n.updated = true;
+        n.updatedChange = Object.assign({ planId: id, at: now }, changes[r.id]);
+      }
+      if (st === r.status && n.eta === r.eta && n.updated === r.updated && n.planId === r.planId && n.updatedChange === r.updatedChange) return r;
       return n;
     });
     const used = {};
@@ -677,15 +949,40 @@
     if (!fleet) return fail(s, 'Truck ' + id + ' was not found.');
     return ok(setIn(s, ['scenario', 'fleet'], fleet), { id: id });
   };
+  // { truckId } puts a truck that is out back in service. It only clears 'out': a truck still on an
+  // approved trip goes back to en route until that trip's return (never available "now" in the
+  // middle of a route); a truck with no trip running is available from now. An en-route truck stays
+  // en route until its return, and a truck still returning keeps its return time; an idle truck at
+  // its hub is available from now.
   H['truck/markAvailable'] = function (s, a) {
     const id = arg(a, ['truckId', 'id']);
+    const t = s.scenario.fleet.find(function (x) { return x.id === id; });
+    if (!t) return fail(s, 'Truck ' + id + ' was not found.');
     const now = nowOf(s, a);
-    const fleet = mapById(s.scenario.fleet, id, function (t) {
-      return without(Object.assign({}, t, { status: 'available', availableAt: now }), ['outUntil', 'outReason']);
-    });
-    if (!fleet) return fail(s, 'Truck ' + id + ' was not found.');
-    return ok(setIn(s, ['scenario', 'fleet'], fleet), { id: id });
+    let n;
+    if (t.status === 'out') {
+      const back = tripReturn(s, id, now);
+      n = without(Object.assign({}, t, back !== null ? { status: 'en_route', availableAt: back } : { status: 'available', availableAt: now }), ['outUntil', 'outReason']);
+    } else if (t.status === 'en_route' || (isNum(t.availableAt) && t.availableAt > now)) {
+      return ok(s, { id: id, unchanged: true, status: t.status });
+    } else {
+      n = Object.assign({}, t, { status: 'available', availableAt: now });
+    }
+    return ok(setIn(s, ['scenario', 'fleet'], mapById(s.scenario.fleet, id, function () { return n; })), { id: id, status: n.status });
   };
+  // Return time of the truck's trip on a live approved plan that is still under way at `now`
+  // (null when none: no trip, the trip is over, or a re-plan took the truck off its route).
+  function tripReturn(s, truckId, now) {
+    let back = null;
+    (s.plans || []).forEach(function (p) {
+      if (!p || !p.approved || p.superseded || p.cancelled) return;
+      (p.routes || []).forEach(function (rt) {
+        if (rt.truckId !== truckId || rt.out || rt.cutOff || !(rt.stops || []).length || !isNum(rt.returnAt) || rt.returnAt <= now) return;
+        if (back === null || rt.returnAt > back) back = rt.returnAt;
+      });
+    });
+    return back;
+  }
 
   H['zone/add'] = function (s, a) {
     const z0 = objArg(a, 'zone');
@@ -920,27 +1217,54 @@
   };
 
   // ---- store ------------------------------------------------------------------------------------
-  // createStore({ adapter, initialState, saveThrottleMs, now })
+  // createStore({ adapter, initialState, saveThrottleMs, saveDebounceMs, saveMaxWaitMs, now, setTimer, clearTimer })
   //   adapter: persistence adapter; omitted -> LocalStorageAdapter(); null -> no persistence.
   //   initialState: used when the adapter has nothing saved (default store.defaultState()).
   //   Ticks that only move the clock are saved at most every saveThrottleMs (default 2000) of
-  //   wall time; every other change is saved at once. now() is the wall clock for that throttle.
+  //   wall time. Every other change is saved saveDebounceMs after the last of a burst of actions
+  //   (but at least every saveMaxWaitMs while actions keep coming), so rapid actions do not
+  //   serialize the whole state (plans are ~55 KB each) every time. The default debounce is
+  //   SAVE_DEBOUNCE_MS in a page and 0 (save at once) without a document (Node, workers).
+  //   flush() writes anything pending at once; boot.js calls it on pagehide and when the page is
+  //   hidden, so a reload right after an action keeps it.
+  //   now() is the wall clock; setTimer / clearTimer default to setTimeout / clearTimeout.
+  store.SAVE_DEBOUNCE_MS = 300;
+  store.SAVE_MAX_WAIT_MS = 2000;
   store.createStore = function (opts) {
     const o = opts || {};
     const adapter = o.adapter === undefined ? store.LocalStorageAdapter() : o.adapter;
     const throttle = isNum(o.saveThrottleMs) ? o.saveThrottleMs : 2000;
     const wall = o.now || function () { return Date.now(); };
+    const setTimer = o.setTimer || function (fn, ms) { return root.setTimeout(fn, ms); };
+    const clearTimer = o.clearTimer || function (h) { root.clearTimeout(h); };
+    const canTime = !!(o.setTimer || typeof root.setTimeout === 'function');
+    const debounce = !canTime ? 0 : isNum(o.saveDebounceMs) ? Math.max(0, o.saveDebounceMs) : (root.document ? store.SAVE_DEBOUNCE_MS : 0);
+    const maxWait = isNum(o.saveMaxWaitMs) ? Math.max(debounce, o.saveMaxWaitMs) : Math.max(debounce, store.SAVE_MAX_WAIT_MS);
     const defaults = o.initialState ? hydrate(clone(o.initialState), store.defaultState()) : store.defaultState();
     let loaded = null;
     if (adapter) { try { loaded = adapter.load(); } catch (e) { loaded = null; } }
     let state = loaded ? hydrate(loaded, defaults) : defaults;
     const listeners = [];
-    let lastSave = -Infinity, dirty = false;
+    let lastSave = -Infinity, dirty = false, timer = null, pendingSince = null;
 
+    function cancelTimer() {
+      if (timer !== null) { try { clearTimer(timer); } catch (e) { /* ignore */ } }
+      timer = null;
+    }
     function persist() {
+      cancelTimer();
+      pendingSince = null;
       if (!adapter) return;
       try { adapter.save(state); } catch (e) { /* adapter already falls back to memory */ }
       lastSave = wall(); dirty = false;
+    }
+    function schedule() {
+      dirty = true;
+      const t = wall();
+      if (pendingSince === null) pendingSince = t;
+      const wait = Math.max(0, Math.min(debounce, pendingSince + maxWait - t));
+      cancelTimer();
+      timer = setTimer(function () { timer = null; persist(); }, wait);
     }
 
     function dispatch(action) {
@@ -948,10 +1272,11 @@
       let out;
       try { out = store.reduce(state, action); } catch (e) { out = fail(state, 'Internal error: ' + e.message); }
       state = out.state;
-      if (state !== prev) {
+      if (state !== prev && adapter) {
         const clockOnly = action && action.type === 'clock/tick' && state.requests === prev.requests &&
           state.scenario === prev.scenario && state.ui === prev.ui;
-        if (clockOnly) { dirty = true; if (wall() - lastSave >= throttle) persist(); }
+        if (clockOnly) { dirty = true; if (timer === null && wall() - lastSave >= throttle) persist(); }
+        else if (debounce > 0) schedule();
         else persist();
       }
       listeners.slice().forEach(function (fn) {
@@ -967,7 +1292,8 @@
         listeners.push(fn);
         return function () { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); };
       },
-      flush: function () { if (dirty) persist(); },
+      flush: function () { if (dirty || timer !== null) persist(); },
+      hasPendingSave: function () { return dirty || timer !== null; },
       exportJson: function () { return (adapter && adapter.exportJson ? adapter.exportJson : store.exportJson)(state); },
       importJson: function (text) { return dispatch({ type: 'data/import', json: text }); },
       adapter: adapter

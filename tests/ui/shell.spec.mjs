@@ -580,19 +580,34 @@ async function runViewport(browser, fileUrl, vp) {
     const badge = [...document.querySelectorAll('#planner-root [data-tab="zztest"] .tab-badge')].some((b) => !b.hidden && b.textContent === '3');
     ui.showView('psg');
     await raf();
+    const prevTab = window.SRO.app.store.getState().ui.psgTab;
+    // registering adds the tab (it does not take the selection); showView('psg/<tab>') switches to it
     ui.registerView('psg/zzreq', { label: 'Spec PSG', mount(el) { el.append(ui.h('p#zz-psg', 'PSG spec view')); }, update() {} });
     await raf();
+    const tabBtn = () => document.querySelector('#psg-root .tabbar-item[data-tab="zzreq"]');
+    const listed = ui.psgTabs.list().some((t) => t.name === 'zzreq' && t.registered);
+    const btnAdded = !!tabBtn();
+    const kept = window.SRO.app.store.getState().ui.psgTab === prevTab;
+    const switched = ui.showView('psg/zzreq');
+    await raf();
     const psgShown = !!document.getElementById('zz-psg') && document.getElementById('zz-psg').getClientRects().length > 0;
+    const selected = !!tabBtn() && tabBtn().getAttribute('aria-selected') === 'true';
+    const st = window.SRO.app.store.getState().ui;
+    const role = st.role, psgTab = st.psgTab;
     ui.plannerTabs.remove('zztest');
     ui.psgTabs.remove('zzreq');
+    ui.showView('psg/' + prevTab);
     await raf();
-    return { log, shownAfter, badge, psgShown, role: window.SRO.app.store.getState().ui.role };
+    const btnGone = !tabBtn();
+    return { log, shownAfter, badge, listed, btnAdded, kept, switched, psgShown, selected, role, psgTab, btnGone, prevTab };
   });
   check(reg.shownAfter && reg.log[0] && reg.log[0].startsWith('mount:planner:right'), 'plannerTabs.add + showView mounts the tab lazily (' + reg.log.join(' ') + ')');
   check(reg.log.some((x) => x.startsWith('update:true:')), 'update(state, ctx) runs with ctx.changed and ctx.layout');
   check(reg.log.includes('hide'), 'onHide runs when the view is hidden');
   check(reg.badge, 'tab badge rendered');
-  check(reg.psgShown && reg.role === 'psg', 'registerView("psg/<tab>") shows a PSG view');
+  check(reg.listed && reg.btnAdded && reg.kept, 'registerView("psg/<tab>") adds a PSG tab without taking the selection (' + JSON.stringify({ listed: reg.listed, btnAdded: reg.btnAdded, kept: reg.kept, prevTab: reg.prevTab }) + ')');
+  check(reg.switched === true && reg.psgShown && reg.selected && reg.role === 'psg' && reg.psgTab === 'zzreq', 'showView("psg/<tab>") shows the registered PSG view and selects its tab (' + JSON.stringify({ switched: reg.switched, shown: reg.psgShown, selected: reg.selected, role: reg.role, tab: reg.psgTab }) + ')');
+  check(reg.btnGone, 'psgTabs.remove drops the tab from the bar');
 
   // ---- checks done once ----------------------------------------------------------------------------
   if (wide) {
@@ -614,33 +629,48 @@ async function runViewport(browser, fileUrl, vp) {
     });
     check(pr.app === 'none' && pr.print === 'block', 'print media shows only #print-root (' + JSON.stringify(pr) + ')');
     await page.emulateMedia({ media: 'screen' });
-    // build.py packaging: highs.js + gzip/base64 wasm start in a Blob worker and solve a tiny LP
+    // build.py packaging: highs.js + the gzip/base64 wasm + worker-src start in a Blob worker the way the
+    // app does it (worker-main.js header): init -> ready (HiGHS self-test), then a MIP solve of a small
+    // test instance through the protocol, checked against the page's own evaluator
     const hi = await page.evaluate(() => new Promise((resolve) => {
-      const js = document.getElementById('highs-js');
-      const gz = document.getElementById('highs-wasm-gz');
-      const ws = document.getElementById('worker-src');
+      const $ = (id) => document.getElementById(id);
+      const js = $('highs-js'), gz = $('highs-wasm-gz'), ws = $('worker-src'), S = window.SRO.solver, U = window.SRO.util;
       if (!js || !gz || !ws) { resolve({ error: 'missing payload' }); return; }
-      const main = function () {
-        self.onmessage = async function (e) {
-          try {
-            const bin = atob(e.data.trim());
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            const wasm = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
-            const highs = await Module({ instantiateWasm(imports, receive) { WebAssembly.instantiate(wasm, imports).then((r) => receive(r.instance)); return {}; } });
-            const r = highs.solve('Maximize\n obj: x + 2 y\nSubject To\n c1: x + y <= 4\nBounds\n 0 <= x <= 3\n 0 <= y <= 3\nGeneral\n x y\nEnd');
-            postMessage({ status: r.Status, obj: r.ObjectiveValue, sro: typeof self.SRO === 'object' });
-          } catch (err) { postMessage({ error: String(err && err.message || err) }); }
-        };
+      if (!S || typeof S.makeTestInstance !== 'function' || typeof S.evaluate !== 'function' || !U || !U.jsonReplacer) { resolve({ error: 'page solver helpers missing' }); return; }
+      const src = js.textContent + '\n;\n' + ws.textContent;
+      const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      const inst = S.makeTestInstance(2, { nJobs: 4, nVehicles: 2, nRally: 2, noSplit: true, flatPeriods: true });
+      const out = { msgs: [] };
+      let timer = null;
+      const finish = (x) => { clearTimeout(timer); w.terminate(); resolve(Object.assign(out, x || {})); };
+      timer = setTimeout(() => finish({ error: 'timeout' }), 60000);
+      w.onerror = (e) => finish({ error: 'worker error: ' + (e.message || e) });
+      w.onmessage = (e) => {
+        const m = e.data || {};
+        if (m.type !== 'progress') out.msgs.push(m.type + (m.id != null ? ':' + m.id : ''));
+        if (m.type === 'ready') {
+          const methods = m.methods || [];
+          out.ready = { highs: m.highs, error: m.error || null, selfTest: m.selfTest ? m.selfTest.objective : null,
+            mip: methods.some((x) => x.key === 'mip' && x.available), methods: methods.filter((x) => x.available).map((x) => x.key) };
+          if (m.highs !== true) { finish({ error: 'HiGHS did not load: ' + m.error }); return; }
+          w.postMessage({ type: 'solve', id: 'spec-mip', instance: JSON.stringify(inst, U.jsonReplacer), method: 'mip', params: { timeLimitSec: 10 }, settings: {} });
+        } else if (m.type === 'error') {
+          finish({ error: (m.code || 'error') + ': ' + m.message });
+        } else if (m.type === 'done' && m.id === 'spec-mip') {
+          const r = m.result || {};
+          let pageTotal = null;
+          try { pageTotal = S.evaluate(inst, r.solution).total; } catch (err) { pageTotal = 'evaluate threw: ' + err.message; }
+          out.solve = { method: r.method, feasible: r.feasible, total: r.total, pageTotal, status: r.extra && r.extra.status, gap: r.extra && r.extra.mipGap };
+          finish();
+        }
       };
-      const code = js.textContent + '\n;' + ws.textContent + '\n;(' + main.toString() + ')();';
-      const w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
-      const timer = setTimeout(() => { w.terminate(); resolve({ error: 'timeout' }); }, 20000);
-      w.onmessage = (e) => { clearTimeout(timer); w.terminate(); resolve(e.data); };
-      w.onerror = (e) => { clearTimeout(timer); w.terminate(); resolve({ error: 'worker error: ' + (e.message || e) }); };
-      w.postMessage(gz.textContent);
+      w.postMessage({ type: 'init', wasmGzB64: gz.textContent });
     }));
-    check(!hi.error && hi.status === 'Optimal' && Math.abs(hi.obj - 7) < 1e-6 && hi.sro, 'inlined HiGHS + worker-src run in a Blob worker from file:// (' + JSON.stringify(hi) + ')');
+    const hs = hi.solve || {};
+    check(!hi.error && hi.ready && hi.ready.highs === true && hi.ready.selfTest === 5 && hi.ready.mip,
+      'inlined HiGHS + worker-src start in a Blob worker from file:// (init -> ready, self-test 5, Exact available) (' + JSON.stringify(hi.error ? hi : hi.ready) + ')');
+    check(!hi.error && hs.method === 'mip' && hs.feasible === true && typeof hs.total === 'number' && Math.abs(hs.total - hs.pageTotal) < 1e-6 && typeof hs.status === 'string' && typeof hs.gap === 'number',
+      'Blob worker solves a test instance with MIP through the protocol; total matches the page evaluator (' + JSON.stringify(hi.error ? hi : hs) + ')');
   }
 
   // ---- component gallery + color checks (phone and wide) ----------------------------------------------
@@ -872,14 +902,21 @@ async function edgeCases(browser, fileUrl) {
       window.SRO.app.store.dispatch({ type: 'clock/speed', speed: 1 });
       await raf();
       const q = !!document.getElementById('zz-q') && document.getElementById('zz-q').getClientRects().length > 0;
-      ['outputs', 'scenario', 'queue'].forEach((x) => ui.plannerTabs.remove(x));
+      const removed = ['outputs', 'scenario', 'queue'];
+      removed.forEach((x) => ui.plannerTabs.remove(x));
       await raf();
-      return { err, q, n, placeholders: document.querySelectorAll('#planner-root .pl-view .placeholder').length };
+      // expected: one placeholder per default tab with no registered view (the three just removed, plus
+      // any default whose module is not in this build); none for tabs with a view
+      const unregistered = ui.plannerTabs.list().filter((t) => !t.registered).map((t) => t.name);
+      const each = removed.filter((x) => !!document.querySelector('#planner-root .pl-view[data-tab="' + x + '"] .placeholder'));
+      const onRegistered = ui.plannerTabs.list().filter((t) => t.registered && document.querySelector('#planner-root .pl-view[data-tab="' + t.name + '"] .placeholder')).map((t) => t.name);
+      return { err, q, n, placeholders: document.querySelectorAll('#planner-root .pl-view .placeholder').length, unregistered, each, onRegistered };
     });
     check(fv.err, 'a view whose mount throws shows an error notice in its panel');
     check(fv.q, 'other views still mount next to a failing one');
     check(fv.n >= 2, 'a view whose update throws keeps getting updates (' + fv.n + ')');
-    check(fv.placeholders === 5, 'removing default tabs brings their placeholders back (' + fv.placeholders + ')');
+    check(fv.each.length === 3 && ['outputs', 'scenario', 'queue'].every((x) => fv.unregistered.includes(x)) && fv.placeholders === fv.unregistered.length && fv.onRegistered.length === 0,
+      'removing default tabs brings their placeholders back (' + JSON.stringify({ placeholders: fv.placeholders, unregistered: fv.unregistered, removedWithPlaceholder: fv.each, placeholderOnRegistered: fv.onRegistered }) + ')');
 
     // resize across 1100px: hidden views get onHide, ctx.layout follows
     await page.evaluate(() => {

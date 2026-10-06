@@ -5,7 +5,11 @@
 // yours", a live line ("Alpha-2: 2 stops before yours. ETA 2000") and a compact map with the truck
 // moving along its real road route on the demo clock, the pickup point, the platoon and its line to
 // the pickup. Delayed: "Not in this window - next plan at HHMM" with the reason in plain words.
-// "Updated" when a re-plan changed the ETA or pickup. Empty state points to New request.
+// "Updated" with what changed ("Pickup moved to X. ETA now 1430.", from request.updatedChange) when an
+// approved re-plan moved or retimed any of its stops, carried more of it to the next window or brought
+// it back; it stays until seen: the note on screen for seenDwellMs (4 s) or a tap on the card
+// dispatches request/seen. Partial: "40 of 60 ... ; 20 more next window" from byRequest qtyByLine /
+// deferredQty. Empty state points to New request.
 //
 // Plan data: plan.byRequest[requestId] = { truckId, stopSeq, nodeKind, gridId, lat, lon, label, eta,
 // qtyByLine, deferredQty, stopsBefore } (DESIGN.md 8b; an array of these is accepted for split
@@ -218,18 +222,80 @@
     }).filter(Boolean).join(', ');
   }
 
-  function partialText(r, e, info, now) {
-    const q = e && e.qtyByLine;
-    const parts = [], rest = [];
-    (r.lines || []).forEach(function (l, i) {
-      const got = q ? q[i] : undefined;
-      if (!isNum(got) || got >= l.qty - 1e-9) return;
-      parts.push(F().number(got) + ' of ' + psg.lineQty(l.qty, l.unit) + ' ' + psg.lineTitle(l));
-      rest.push(psg.lineQty(l.qty - got, l.unit) + ' more');
-    });
-    if (parts.length) return parts.join('; ') + ' at ' + pickupName(e) + ', ETA ' + psg.time(e.eta, now) + '; ' + rest.join(', ') + ' next window.';
-    return 'Part of this request comes in this window (ETA ' + psg.time(e && e.eta, now) + '); the rest is carried to the next window.';
+  // Per line: what this plan brings (byRequest qtyByLine) and what it carries to the next window
+  // (byRequest deferredQty). Without byRequest both come from the plan's route deliveries and
+  // plan.deferred. The remainder is never line qty minus qtyByLine: a plan in a later window covers
+  // only what an earlier window left, so the line total would overstate what is still to come.
+  function perLine(obj) {
+    const out = {};
+    if (obj && typeof obj === 'object') Object.keys(obj).forEach(function (k) { const v = Number(obj[k]); if (isFinite(v)) out[k] = v; });
+    return out;
   }
+  function lineAmounts(r, e, info) {
+    let got = e && e.qtyByLine && typeof e.qtyByLine === 'object' ? perLine(e.qtyByLine) : null;
+    let def = e && e.deferredQty && typeof e.deferredQty === 'object' ? perLine(e.deferredQty) : null;
+    if (!got) {
+      got = {};
+      (((info && info.plan) || {}).routes || []).forEach(function (rt) {
+        (rt.stops || []).forEach(function (s) {
+          (s.deliveries || []).forEach(function (d) { if (d.requestId === r.id && isNum(d.qty)) got[d.lineIdx] = (got[d.lineIdx] || 0) + d.qty; });
+        });
+      });
+    }
+    if (!def) {
+      def = {};
+      ((info && info.deferred) || []).forEach(function (d) { if (isNum(d.qty)) def[d.lineIdx] = (def[d.lineIdx] || 0) + d.qty; });
+    }
+    return { got: got, def: def };
+  }
+  function partialText(r, e, info, now) {
+    const q = lineAmounts(r, e, info);
+    const parts = [], rest = [];
+    const round = function (v) { return Math.round(v * 10) / 10; };
+    (r.lines || []).forEach(function (l, i) {
+      const def = q.def[i] || 0, got = q.got[i] || 0;
+      if (!(def > 1e-9)) return;
+      if (got > 1e-9) {
+        // what this plan covers for the line; less than the line when an earlier window brought some
+        const covered = round(got + def);
+        parts.push(F().number(round(got)) + ' of ' + (covered < l.qty - 1e-9 ? 'the remaining ' : '') + psg.lineQty(covered, l.unit) + ' ' + psg.lineTitle(l));
+        rest.push(psg.lineQty(round(def), l.unit) + ' more');
+      } else {
+        rest.push(psg.lineQty(round(def), l.unit) + ' ' + psg.lineTitle(l));
+      }
+    });
+    const eta = psg.time(e && e.eta, now);
+    if (parts.length) return parts.join('; ') + ' at ' + pickupName(e) + ', ETA ' + eta + '; ' + rest.join(', ') + ' next window.';
+    if (rest.length) return 'Part of this request comes in this window (ETA ' + eta + '); ' + rest.join(', ') + ' next window.';
+    return 'Part of this request comes in this window (ETA ' + eta + '); the rest is carried to the next window.';
+  }
+
+  // What a re-plan changed, in the platoon sergeant's words, from request.updatedChange (store.js
+  // plan/approve): 'Pickup moved to Drop point B · Zhongli. ETA now 1430.'
+  const ORDINAL = ['', 'First', 'Second', 'Third', 'Fourth', 'Fifth'];
+  function changeText(r, now) {
+    const c = r.updatedChange;
+    if (!c) return 'The plan changed: new ETA or pickup point. Check the details above.';
+    const bits = [];
+    const where = function (x) { return x.nodeKind === 'direct' ? 'direct to your location' : 'at ' + pickupName(x); };
+    const more = c.deferredMore || (c.deferredMore === undefined && c.kind === 'delayed');
+    const less = c.deferredLess || (c.deferredLess === undefined && c.kind === 'restored');
+    if (more) bits.push(r.status === 'delayed' || c.status === 'deferred' ? 'Moved to the next window' : 'More of it now comes next window');
+    else if (less) bits.push(c.status === 'partial' ? 'More of it now comes in this window' : 'Back in this window');
+    if (less && !c.pickupMoved && !c.etaChanged && isNum(c.eta) && !isNum(c.prevEta)) {
+      bits.push('Pickup ' + where(c) + ', ETA ' + psg.time(c.eta, now));
+    }
+    if (c.pickupMoved) bits.push(c.nodeKind === 'direct' ? 'Now delivered direct to your location' : 'Pickup moved to ' + pickupName(c));
+    if (c.etaChanged) bits.push('ETA now ' + psg.time(c.eta, now));
+    if (c.truckChanged) bits.push('Truck now ' + c.truckId);
+    (c.others || []).forEach(function (o) {
+      bits.push((ORDINAL[o.order] || 'Another') + ' delivery (' + o.truckId + ') now ' + where(o) + ', ETA ' + psg.time(o.eta, now));
+    });
+    if (c.fewerStops > 0) bits.push('Now in fewer deliveries');
+    if (!bits.length) bits.push('The plan changed. Check the details above');
+    return bits.join('. ') + '.';
+  }
+  psg.changeText = changeText;
 
   // ==== view ==========================================================================================
   const view = {
@@ -254,10 +320,18 @@
       el.append(this.head, this.list);
       const self = this;
       this.offTheme = ui.on ? ui.on('theme', function () { self.recolor(); }) : null;
+      this.seenTimers = {};
+      // 'Updated' notes on screen for a moment count as seen (hidden tabs and roles are not on screen)
+      this.seenIo = typeof IntersectionObserver === 'function' ? new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) { self.seenVisible(en.target.getAttribute('data-seen-id'), en.isIntersecting && en.intersectionRatio >= 0.5); });
+      }, { threshold: [0, 0.5, 1] }) : null;
     },
     unmount: function () {
       const self = this;
       Object.keys(this.cards || {}).forEach(function (id) { self.dropMap(self.cards[id]); });
+      Object.keys(this.seenTimers || {}).forEach(function (id) { clearTimeout(self.seenTimers[id]); });
+      this.seenTimers = {};
+      if (this.seenIo) this.seenIo.disconnect();
       this.cards = {};
       if (this.offTheme) this.offTheme();
       if (this.offScroll) this.offScroll();
@@ -325,7 +399,7 @@
     card: function (r, state) {
       const info = TRACKED.indexOf(r.status) >= 0 || r.status === 'delayed' || r.status === 'delivered' ? planInfo(state, r) : { plan: null, entries: [], deferred: [] };
       const e = info.entries[0] || null;
-      const sig = JSON.stringify([r.status, r.urgency, r.updated, r.lines, r.nlt, r.deadline, r.eta, r.directOnly, r.desiredPickup, r.remarks, r.cancelledAt, r.deliveredAt,
+      const sig = JSON.stringify([r.status, r.urgency, r.updated, r.updatedChange || null, r.lines, r.nlt, r.deadline, r.eta, r.directOnly, r.desiredPickup, r.remarks, r.cancelledAt, r.deliveredAt,
         info.plan && info.plan.id, info.entries.map(function (x) { return [x.truckId, x.stopIdx, x.eta, x.gridId, x.label, x.nodeKind]; }),
         info.deferred.map(function (d) { return [d.reason, d.detail]; }), state.profile && state.profile.unitName]);
       let c = this.cards[r.id];
@@ -334,8 +408,46 @@
       if (c && c.mapKey !== mapKey) this.dropMap(c);
       c = Object.assign(c || {}, { id: r.id, sig: sig, mapKey: mapKey, info: info, entry: e });
       this.cards[r.id] = c;
+      this.unwatchSeen(c);
       c.el = this.renderCard(r, state, c);
+      this.watchSeen(c, r);
       return c.el;
+    },
+
+    // ---- 'Updated' until seen: the note on screen for seenDwellMs, or a tap on the card -> request/seen
+    seenDwellMs: 4000,
+    watchSeen: function (c, r) {
+      if (!r.updated || r.status === 'cancelled') return;
+      const target = c.el.querySelector('.psg-change-note') || c.el.querySelector('.psg-updated');
+      if (!target) return;
+      target.setAttribute('data-seen-id', r.id);
+      c.seenTarget = target;
+      if (this.seenIo) this.seenIo.observe(target);
+    },
+    unwatchSeen: function (c) {
+      if (c.seenTarget && this.seenIo) this.seenIo.unobserve(c.seenTarget);
+      c.seenTarget = null;
+      if (this.seenTimers[c.id]) { clearTimeout(this.seenTimers[c.id]); delete this.seenTimers[c.id]; }
+    },
+    seenVisible: function (id, on) {
+      const self = this;
+      if (!id) return;
+      if (!on) { if (this.seenTimers[id]) { clearTimeout(this.seenTimers[id]); delete this.seenTimers[id]; } return; }
+      if (this.seenTimers[id]) return;
+      const wait = function () {
+        self.seenTimers[id] = setTimeout(function () {
+          delete self.seenTimers[id];
+          // a page in a background browser tab is not being read: wait until it is shown again
+          if (document.visibilityState === 'hidden') { wait(); return; }
+          self.markSeen(id);
+        }, self.seenDwellMs);
+      };
+      wait();
+    },
+    markSeen: function (id) {
+      if (!this.ctx) return;
+      const r = (this.ctx.getState().requests || []).find(function (x) { return x.id === id; });
+      if (r && (r.updated || r.updatedChange)) this.ctx.dispatch({ type: 'request/seen', id: id });
     },
 
     renderCard: function (r, state, c) {
@@ -346,6 +458,7 @@
       const editable = psg.EDITABLE.indexOf(r.status) >= 0;
       const card = h('article.card.psg-req' + (r.updated && r.status !== 'cancelled' ? '.is-updated' : '') + (r.status === 'cancelled' ? '.is-cancelled' : ''),
         { 'data-id': r.id, 'data-status': r.status, 'data-urgency': urg, 'aria-label': 'Request ' + r.id });
+      if (r.updated && r.status !== 'cancelled') card.addEventListener('click', function () { self.markSeen(r.id); });
       // head
       card.appendChild(h('header.psg-req-head',
         h('div.psg-req-badges',
@@ -363,6 +476,10 @@
       const body = h('div.psg-req-body');
       card.appendChild(body);
       c.live = null;
+      // what a re-plan changed, first thing in the card, until the platoon sergeant has seen it
+      const updNote = r.updated && r.status !== 'cancelled' && r.status !== 'delivered'
+        ? h('div.notice.notice-warn.psg-change-note', { role: 'status' }, icon('refresh'), h('div', h('strong', 'Updated: '), h('span.psg-updated-text', changeText(r, now))))
+        : null;
       if (r.status === 'submitted') {
         c.nextEl = h('strong.num', F().time24(psg.nextPlanAt(now)));
         body.appendChild(h('div.notice.notice-info.psg-status-note', icon('clock'), h('div', 'Waiting for the next plan at ', c.nextEl, '. ',
@@ -385,9 +502,7 @@
         else body.appendChild(h('div.notice.notice-info', icon('info'), h('div', 'Approved. Pickup details will show here shortly.')));
         if (r.status === 'partial' && e) body.insertBefore(h('div.notice.notice-warn.psg-partial', icon('alert'), h('div', partialText(r, e, info, now))), body.firstChild);
       }
-      if (r.updated && r.status !== 'cancelled' && r.status !== 'delivered') {
-        body.appendChild(h('div.field-warn.psg-updated-note', icon('refresh'), h('span', 'The plan changed: new ETA or pickup point. Check the details above.')));
-      }
+      if (updNote) body.insertBefore(updNote, body.firstChild);
       if (r.remarks) card.appendChild(h('div.small.muted.psg-req-remarks', 'Remarks: ' + r.remarks));
       // actions
       if (editable) {

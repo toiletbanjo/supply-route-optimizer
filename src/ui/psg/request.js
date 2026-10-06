@@ -93,10 +93,11 @@
     return req;
   }
 
-  // Editing: on hand (and the run-out answer) count from when they were reported. While the edit
-  // leaves them as they were, the request keeps its original report time, so changing only the NLT
-  // of an IMMEDIATE request does not push its run-out deadline later. The store does the same when
-  // request/edit leaves out lines and hoursLeftReported (see send()).
+  // Editing: on hand (and the run-out answer) count from when they were reported (request.reportedAt,
+  // set by the store on submit and on every edit that changes them). While the edit leaves them as
+  // they were, the request keeps that report time, so changing only the NLT of an IMMEDIATE request
+  // does not push its run-out deadline later. The store does the same (send() also leaves unchanged
+  // lines and hoursLeftReported out of request/edit).
   function reportKey(lines, hours) {
     return JSON.stringify([(lines || []).map(function (l) { return [l.classId, l.itemId, l.option, l.qty, l.unit, isNum(l.onHand) ? l.onHand : null]; }), isNum(hours) ? hours : null]);
   }
@@ -1006,7 +1007,7 @@
       d.hoursReported = isNum(r.hoursLeftReported) ? r.hoursLeftReported : null;
       d.remarks = r.remarks || '';
       d.adding = false;
-      d.orig = { key: reportKey(r.lines, r.hoursLeftReported), at: r.createdAt };
+      d.orig = { key: reportKey(r.lines, r.hoursLeftReported), at: isNum(r.reportedAt) ? r.reportedAt : r.createdAt };
       draft = d;
       if (view.ctx && (view.mode === 'form' || view.mode === 'done')) view.build(view.ctx.getState());
       ui.psgTabs.show('request');
