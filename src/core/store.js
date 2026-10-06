@@ -845,6 +845,11 @@
   // { planId } approves a plan: it becomes the window's movement schedule, supersedes the
   // window's (or its parent's) earlier approved plan (not one listed in plan.builtOn, see below),
   // sets request statuses and sends trucks out.
+  // true when two id lists (missing = empty) hold the same ids
+  function sameIds(a, b) {
+    a = Array.isArray(a) ? a.slice().sort() : []; b = Array.isArray(b) ? b.slice().sort() : [];
+    return a.length === b.length && a.every(function (x, i) { return x === b[i]; });
+  }
   H['plan/approve'] = function (s, a) {
     const id = arg(a, ['planId', 'id']);
     const plan = s.plans.find(function (p) { return p.id === id; });
@@ -852,14 +857,15 @@
     if (plan.approved) return ok(s, { id: id });
     // A plan that breaks a planning rule (plan.stats.violations > 0, e.g. more rally points than the
     // limit) is refused while a draft for the same window and parent meets every rule; the result
-    // names those drafts (code 'infeasible-plan', alternativeIds). With no such draft it is approved,
+    // names those drafts (code 'infeasible-plan', alternativeIds). A draft only counts when it was built
+  // on the same approved plans (plan.builtOn): an older draft would miss newer requests and undo them. With no such draft it is approved,
     // and the result carries a warning the UI shows.
     const nViol = plan.stats && isNum(plan.stats.violations) ? plan.stats.violations : 0;
     let violationWarning = null;
     if (nViol > 0) {
       const alts = s.plans.filter(function (p) {
         return p.id !== id && !p.approved && !p.superseded && p.windowId === plan.windowId && (p.parentPlanId || null) === (plan.parentPlanId || null) &&
-          p.stats && p.stats.violations === 0;
+          sameIds(p.builtOn, plan.builtOn) && p.stats && p.stats.violations === 0;
       }).map(function (p) { return p.id; });
       const first = Array.isArray(plan.violations) && plan.violations[0] && plan.violations[0].detail ? ' (' + plan.violations[0].detail + ')' : '';
       const what = 'Plan ' + id + ' breaks ' + nViol + ' planning rule' + (nViol === 1 ? '' : 's') + first;
