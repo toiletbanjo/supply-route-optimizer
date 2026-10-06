@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIP Worker Minimal</title>
+<style>
+  :root { --bg:#fff; --fg:#111; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#111; --fg:#eee; } }
+  :root[data-theme="dark"] { --bg:#111; --fg:#eee; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,sans-serif; margin:16px; }
+  pre { white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<button id="go">Solve (20 s limit)</button> <button id="cancel" disabled>Cancel</button>
+<pre id="out"></pre>
+
+<!-- 1) HiGHS Emscripten loader (node_modules/highs/build/highs.js, verbatim; it contains no "</script") -->
+<script type="text/plain" id="highs-js">/*HIGHS_JS*/</script>
+<!-- 2) highs.wasm, gzip -9 then base64 (1.63 MB instead of 4.71 MB for plain base64) -->
+<script type="text/plain" id="highs-wasm-gz">/*WASM_GZ_B64*/</script>
+<!-- 3) the model to solve (in the real app this is generated in JS) -->
+<script type="text/plain" id="model-lp">/*MODEL_LP*/</script>
+
+<script>
+"use strict";
+// ---------------- worker body: runs inside a Blob-URL Worker, after highs.js has defined global `Module` -------------
+function workerMain() {
+  async function wasmBytesFromGzB64(b64) {
+    const bin = atob(b64.trim());
+    const gz = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) gz[i] = bin.charCodeAt(i);
+    const ds = new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return new Uint8Array(await new Response(ds).arrayBuffer());
+  }
+  let highs = null;
+  self.onmessage = async (e) => {
+    const m = e.data;
+    try {
+      if (m.type === "init") {
+        const bytes = await wasmBytesFromGzB64(m.wasmGzB64);
+        // NOTE: highs-js 1.15.3 ignores the documented {wasmBinary} / {wasmModule} options; instantiateWasm works.
+        highs = await Module({
+          instantiateWasm(imports, receive) {
+            WebAssembly.instantiate(bytes, imports).then((r) => receive(r.instance));
+            return {};
+          },
+        });
+        postMessage({ type: "ready", version: highs.version.string });
+      } else if (m.type === "solve") {
+        const model = highs.createModel({ format: "lp", data: m.lp });
+        try {
+          model.options.set({ output_flag: false, time_limit: m.timeLimit, mip_rel_gap: m.mipRelGap ?? 1e-4 });
+          const names = [];
+          for (let i = 0, n = model.getDimensions().numCols; i < n; i++) names.push(model.getColName(i));
+          if (m.start) { // MIP start keyed by column name -> dense vector in HiGHS column order
+            model.setSolution({ colValue: Float64Array.from(names, (nm) => m.start[nm] || 0) });
+          }
+          postMessage({ type: "names", names });
+          const C = highs.constants.callbackType;
+          let lastPost = 0;
+          model.run({
+            [C.mipImprovingSolution](ev) { // every new incumbent, with the full solution vector
+              const d = ev.data;
+              postMessage({ type: "incumbent", t: d.running_time, obj: d.objective_function_value, bound: d.mip_dual_bound, gap: d.mip_gap, x: d.mip_solution });
+            },
+            [C.mipInterrupt](ev) { // fires even with output_flag=false (mipLogging does not); throttle
+              const d = ev.data, now = Date.now();
+              if (now - lastPost < 250) return;
+              lastPost = now;
+              postMessage({ type: "progress", t: d.running_time, obj: d.mip_primal_bound, bound: d.mip_dual_bound, gap: d.mip_gap, nodes: Number(d.mip_node_count) });
+              // optional: if (d.running_time > softLimit && d.mip_gap < 0.05) ev.interrupt();
+            },
+          });
+          const hasX = Number(model.info.get("primal_solution_status")) === 2;
+          postMessage({ type: "done", status: model.getModelStatus(), // 7 optimal, 13 time limit, 8 infeasible ...
+            obj: hasX ? model.getObjectiveValue() : null, gap: model.info.get("mip_gap"), bound: model.info.get("mip_dual_bound"),
+            x: hasX ? model.getSolution().colValue : null, runTime: model.getRunTime() });
+        } finally { model.dispose(); }
+      }
+    } catch (err) { postMessage({ type: "error", message: String((err && err.stack) || err) }); }
+  };
+}
+
+// ---------------- page side ----------------
+const $ = (id) => document.getElementById(id);
+const out = (s) => { $("out").textContent += s + "\n"; console.log(s); };
+let solverUrl = null;
+function startSolverWorker() {
+  if (!solverUrl) {
+    const code = $("highs-js").textContent + "\n;(" + workerMain.toString() + ")();";
+    solverUrl = URL.createObjectURL(new Blob([code], { type: "text/javascript" }));
+  }
+  const w = new Worker(solverUrl); // works from file:// (origin "null") in Chromium; tested
+  w.postMessage({ type: "init", wasmGzB64: $("highs-wasm-gz").textContent });
+  return w;
+}
+
+let worker = null, best = null;
+window.__state = { events: [] };
+$("go").onclick = () => {
+  best = null;
+  worker = startSolverWorker();
+  $("cancel").disabled = false;
+  worker.onmessage = (e) => {
+    const d = e.data; window.__state.events.push(d.type);
+    if (d.type === "ready") { out("HiGHS " + d.version + " ready"); worker.postMessage({ type: "solve", lp: $("model-lp").textContent, timeLimit: 20 }); }
+    if (d.type === "incumbent") { best = d; out(`incumbent ${d.obj.toFixed(1)} at ${d.t.toFixed(2)} s, gap ${(100 * d.gap).toFixed(1)}%`); }
+    if (d.type === "progress") window.__state.lastProgress = d;
+    if (d.type === "done") { out(`done status=${d.status} obj=${d.obj} gap=${(100 * d.gap).toFixed(2)}% t=${d.runTime.toFixed(1)}s`); window.__state.done = d; worker.terminate(); $("cancel").disabled = true; }
+    if (d.type === "error") { out("ERROR " + d.message); window.__state.error = d.message; }
+  };
+  worker.onerror = (e) => { out("worker error " + e.message); window.__state.error = e.message; };
+};
+$("cancel").onclick = () => {
+  // run() is synchronous inside the worker, so a message cannot reach it; terminate() kills it instantly.
+  // The best plan survives because every incumbent was already posted (best.x).
+  worker.terminate(); $("cancel").disabled = true;
+  out(best ? `cancelled; keeping incumbent ${best.obj.toFixed(1)} (gap ${(100 * best.gap).toFixed(1)}%)` : "cancelled before any incumbent");
+  window.__state.cancelled = best ? { obj: best.obj, gap: best.gap, nx: best.x.length } : null;
+};
+</script>
+</body>
+</html>

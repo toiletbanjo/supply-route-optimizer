@@ -1,0 +1,18 @@
+{
+  "name": "supply-route-optimizer",
+  "private": true,
+  "description": "MA481X supply route optimizer prototype (notional data)",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "build": "python3 tools/build.py",
+    "test:ui": "s=0; for f in tests/ui/*.spec.mjs; do echo \"== $f\"; node \"$f\" || s=1; done; exit $s"
+  },
+  "devDependencies": {
+    "highs": "1.15.3",
+    "leaflet": "1.9.4",
+    "mgrs": "2.2.0",
+    "milsymbol": "3.0.4",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2"
+  }
+}

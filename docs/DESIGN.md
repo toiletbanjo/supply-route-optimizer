@@ -17,14 +17,16 @@ src/
     grid_links.json       main-road links between grid points (fallback times, arc paths, closures)
     catalog.js            supply catalog, units, pallet conversions, daily use rates
     scenario.js           hubs, default fleet, callsigns, colors, sample unit names, periods
-    taiwan.geo.js         simplified Taiwan coastline GeoJSON (offline base layer)
-    roads.json            (optional) precomputed leg paths from tools/fetch_osrm_paths.py
-    google_matrix.json    (optional) Google travel-time matrix; absent until the user runs the script
+    taiwan_coast.json     Taiwan coastline GeoJSON (Natural Earth, offline base layer)
+    roads_graph.json      Taiwan road graph (Overture/OpenStreetMap, ODbL) for routing and drawing
+    roads.json            (optional) precomputed leg paths from tools/roads/fetch_osrm_polylines.py
+    time_matrix.json      (optional) external travel-time matrix (OSRM, or Google if ever allowed)
   core/                   runs on the main thread
     ns.js                 creates the SRO namespace (must load first)
     util.js               seeded RNG, ids, deep clone, clamp
     format.js             24h time, DTG, MGRS, class labels, miles
     geo.js                haversine, point/segment-in-circle, snapping, polyline length/interpolation
+    road_router.js        Dijkstra router over roads_graph.json (SRO.lib.RoadRouter)
     network.js            travel matrix (Google or fallback), closures, all-pairs shortest paths, risk miles
     roads.js              road path provider (layered, see section 6)
     store.js              state, actions, persistence adapter interface
@@ -59,8 +61,7 @@ src/
     planner/outputs.js    movement table (print/PDF/CSV), pickup notices, history, snapshots
 tools/
   build.py                inlines everything into prototype/supply-route-app.html
-  fetch_google_matrix.py  one-time Google Routes API matrix pull (user runs it with their key)
-  fetch_osrm_paths.py     one-time OSRM road path pull (user runs it)
+  roads/                  road graph rebuild pipeline (Overture), coastline extract, optional OSRM polyline fetch
 tests/
   solver/*.test.mjs       node --test
   ui/*.spec.mjs           Playwright checks
@@ -202,22 +203,62 @@ Each item has a notional `dailyUse` per platoon (used for hours-of-supply and fo
 
 ## 5. Grid, travel times and closures (network.js)
 
-- `grid.json`: `[{ id, name, lat, lon, kind: 'hub' | 'town' | 'junction' | 'rally', region: 'north' | 'central' | 'south' | 'east', rallyCandidate: bool }]`, about 50 points.
-- `grid_links.json`: `[{ a, b, road: 'freeway' | 'highway' | 'mountain' | 'local' }]`, the main-road adjacency between grid points (west-coast freeways, cross-island highways, east-coast and rift-valley highways, Suhua and South Link). It keeps the fallback from cutting straight across the Central Mountain Range and gives every arc a `gridPath` for drawing and for closure checks.
-- Base travel minutes between grid points: Google matrix if `google_matrix.json` exists (`source: 'google'`); otherwise fallback = shortest path over `grid_links` with link miles = haversine x road factor (freeway 1.15, highway 1.3, mountain 1.8, local 1.4) at road speeds (freeway 55 mph, highway 40, mountain 22, local 30), flagged `source: 'estimate'` and labeled in the UI. The arc's `gridPath` is always the link-graph shortest path, whatever the time source.
-- Convoy minutes = base x convoyFactor (1.5). Miles from the matrix (Google meters) or the estimate.
-- Closed zones remove every grid arc whose drawn path (road polyline if available, else its `gridPath` of link segments) passes through the circle. All-pairs shortest paths (Floyd-Warshall, ~50 nodes) give rerouted minutes, miles and the grid-node path. Unreachable pairs = Infinity.
-- Risk units for an arc = sum over risk zones of (miles of the path inside the circle x rating value). Time-of-day risk factor is applied per leg at evaluation time.
-- Off-grid locations (platoons): a direct-delivery node is the platoon location, connected through its nearest grid point with an added short leg = haversine x 1.3 at 25 mph (convoy factor applied too).
+Verified 2026-10-05 (see `docs/VERIFICATION.md`). **Travel times come from OpenStreetMap road data (Aidan, 2026-10-06), not Google.** Google Maps Platform terms (3.2.3(a)/(b), Routes API 19.2/19.3) do not allow storing Routes API durations or using them with a non-Google map, so the app embeds no Google data and needs no key.
+
+- `grid.json`: `[{ id, name, lat, lon, kind: 'hub' | 'town' | 'junction' | 'rally', region: 'north' | 'central' | 'south' | 'east', rallyCandidate: bool }]`, about 50 points. Points should sit on primary-or-bigger roads (the router snaps to the nearest graph node).
+- `roads_graph.json` (`SRO.data.roads_graph`, 322 KB): Taiwan motorway + trunk + primary road graph built from Overture Maps release 2026-09-23.1 (OpenStreetMap-derived, ODbL), 7,673 nodes, 11,809 edges, one-way rules kept, 15 m simplification. Rebuild with `tools/roads/` (see the README there).
+- `src/core/road_router.js` (`SRO.lib.RoadRouter`): `G = RoadRouter.load(data)`; `G.route([lat,lon], [lat,lon], { blocked: [{ lat, lon, radiusM }] }) -> { coords, meters, seconds, snap }` (~1 ms); `G.tree([lat,lon]).pathTo([lat,lon])` reuses one Dijkstra for many targets (all pairs of a 50-point grid in ~250 ms). Class speeds (km/h): motorway 90, trunk 70, primary 55, links 40.
+- **Time source order** (`network.source`):
+  1. `matrix`: an external matrix file `src/data/time_matrix.json` (`{ source: 'osrm' | 'google' | ..., ids, minutes[i][j], meters[i][j] }`, base times, before the convoy factor) if present and allowed. Only arcs untouched by closed zones use it.
+  2. `osm-roads` (default): minutes and miles of the road-graph route between the two points.
+  3. `estimate`: if the road graph is missing or a point snaps more than 5 km from it: shortest path over `grid_links.json` (haversine x road factor at road speeds; freeway 1.15/55 mph, highway 1.3/40, mountain 1.8/22, local 1.4/30).
+  The UI labels which source produced the times.
+- Convoy minutes = base x convoyFactor (1.5), applied by the instance builder, not network.js.
+- **Closed zones**: road-graph routes are recomputed with every closed circle in `blocked`, so detours follow real roads. If no route exists the pair is `Infinity` (unreachable). In `estimate` mode, links crossing a closed circle are removed before the shortest path.
+- **Risk units** for an arc = sum over risk zones of (miles of the arc's drawn path inside the circle x rating value). Time-of-day risk factor is applied per leg at evaluation time.
+- **Off-grid points** (platoon locations for direct delivery): routed on the road graph like grid points; if a platoon snaps more than 5 km from a road, add a final straight leg at haversine x 1.3 at 25 mph and mark the leg `offRoad`.
+- `grid_links.json`: `[{ a, b, road: 'freeway' | 'highway' | 'mountain' | 'local' }]`, the coarse fallback graph above.
 
 ## 6. Road paths for drawing (roads.js)
 
-Layered provider `SRO.core.roads.path(gridA, gridB) -> { coords: [[lat,lon]...], source }`:
-1. `precomputed`: from `roads.js` data if the user ran `fetch_osrm_paths.py` (or an offline road graph shipped in the build).
-2. `osrm-live`: when online, fetch from the public OSRM demo server, at most 1 request per second, cache in `state.roadCache`.
-3. `straight`: straight line, drawn dashed with a legend note "road path unavailable".
+`SRO.core.roads.path(fromPoint, toPoint, zones) -> { coords: [[lat,lon]...], source }`, cached by key + closure set:
+1. `osm-roads`: the same road-graph route network.js timed (so the drawn path and the time always match).
+2. `precomputed`: `src/data/roads.json` from `tools/roads/fetch_osrm_polylines.py` if the user ran it (optional, only for legs no closed zone touches).
+3. `straight`: dashed line labelled "approximate" when a point is far from the road graph or no route exists.
 
-Times always come from the matrix, never from the drawn path. The planner map shows a small note: "Road lines are drawn from OpenStreetMap; times come from the travel-time table."
+No live calls to OSRM from the browser. Attribution shown on the map: "Road data (c) OpenStreetMap contributors (ODbL), via Overture Maps Foundation".
+
+### Base map
+
+- Online and served over http(s): OpenStreetMap tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`, attribution required). A page opened from `file://` sends no Referer and OSM blocks it, so tiles only work once the app is hosted (GitHub Pages / PWA).
+- Always underneath: the Taiwan coastline (`taiwan_coast.json`, Natural Earth, 6.7 KB) on a sea-colored background, plus the road graph drawn as thin vector lines (motorway/trunk heavier). This is the offline and `file://` map and still shows real roads.
+- Fallback rule: drop the tile layer and show a small note when offline, when 4 tile errors occur before any load, when no tile has loaded after 8 s, or when a fetch of the center tile is not ok (catches 403 image bodies). Re-add on the `online` event. No tile prefetching (OSM policy).
+
+### Libraries (pinned, inlined by build.py)
+
+| package | version | global | notes |
+|---|---|---|---|
+| leaflet | 1.9.4 | `L` | inline CSS; default marker images as data URIs with `L.Icon.Default.imagePath = ''` |
+| milsymbol | 3.0.4 | `ms` | 862 KB; `new ms.Symbol(sidc, { size, uniqueDesignation, higherFormation })`, use `getAnchor()` for `iconAnchor` |
+| mgrs | 2.2.0 | `mgrs` | `mgrs.forward([lon, lat], 5)` (longitude first); format.js may use its own implementation if it matches |
+| highs | 1.15.3 | (worker) | see section 7, MIP |
+
+build.py must rewrite `</script` inside inlined code to `<\/script`.
+
+### Symbols (MIL-STD-2525D SIDCs, all pass `ms.Symbol(...).isValid()`)
+
+| thing | SIDC |
+|---|---|
+| Dismounted infantry platoon | `10031000141211000000` |
+| Mounted (mechanized) infantry platoon | `10031000141211020000` |
+| Mounted (motorized) infantry platoon | `10031000141211040000` |
+| Fixed-in-place platoon | dismounted or mounted SIDC per unit; "fixed" is shown in the label, not the symbol |
+| Hub (supply installation) | `10031000001634000000` drawn with installation indicator, or 2525C `SFGPUSS---H----` |
+| Cargo truck | `10031500001401000000` |
+| Fuel tanker | `10031500001409000000` |
+| Rally / drop point | `10032500003209000000` (Logistics Release Point) |
+
+Truck icons are drawn with the truck's color as a ring or label background so the 2525 frame colors stay standard.
 
 ## 7. Solver contract (solver/*)
 
@@ -239,7 +280,7 @@ The solver is pure and deterministic given a seed. The main thread builds an **i
            lockedTruck: null | id }],
   weights: { fuel, distance, risk, simplicity },
   params: { mpg, serviceMin, loadMin, maxRallyPoints, pinnedRally: [node], bannedRally: [node] },
-  penalties: { latePerMin: [1, 3, 50, 500], defer: [200, 600, 5000, 50000], classFactor: [1.0, 0.9, 0.85, 0.8, 0.6] },
+  penalties: { latePerMin: [2, 6, 60, 600], defer: [5000, 15000, 60000, 250000], classFactor: [1.0, 0.9, 0.85, 0.8, 0.6], lateCapShare: 0.9, pinUnused: 2000 },
   fixed: null | { /* contingency: delivered stops and en-route truck states */ }
 }
 ```
@@ -255,13 +296,13 @@ The solver is pure and deterministic given a seed. The main thread builds an **i
 ### Evaluation semantics (exact rules for evaluate.js)
 
 - **Start.** A vehicle starts at `startNode` (default `hubNode`) at `t0 = max(instance.startMin, availableAt) + (preloaded ? 0 : loadMin)`, visits its stops in order, then returns to `hubNode`. Contingency re-plans set `startNode`, `availableAt` and `preloaded: true` on en-route trucks, and lock the jobs they carry with `lockedTruck`.
-- **Legs.** Leg minutes = `minutes[i][j] / period.speed`, using the period that contains the leg's departure minute. Leg risk = `riskUnits[i][j] * period.risk`. Miles and risk units are counted for every leg including the return leg. A leg with `minutes = Infinity` makes the solution infeasible.
+- **Legs.** Travel is integrated across periods so the clock is FIFO (leaving later never arrives earlier): the leg needs `minutes[i][j]` base minutes; in each period the truck covers base minutes at `period.speed` per clock minute until the base minutes are used up. Leg risk = `riskUnits[i][j] * (time-weighted mean of period.risk over the leg's clock minutes)`. `leg.periodIdx` is the period at departure (for display). Miles and risk units are counted for every leg including the return leg. A leg with `minutes = Infinity` makes the solution infeasible.
 - **Stops.** Arrival time is the delivery time for every job at that stop. Each stop adds `serviceMin` before departure. No waiting for early arrival.
 - **Capacity and type.** Fuel jobs only on tankers, cargo jobs only on cargo trucks; the sum of quantities on a route is at most the vehicle capacity.
 - **Splits.** A job may appear in several stops (same or different trucks). Sum of delivered quantity is at most `job.qty`; the remainder is deferred.
 - **Nodes.** A job may only be delivered at a node in its `candidates`. Platoon cost is counted once per distinct (requestId, node) pair used: `weights.distance * candidate.platoonCost` (`platoonCost` already includes miles x mobility cost per mile).
-- **Rally points.** Distinct rally nodes used (including pinned ones that are used) at most `maxRallyPoints`; banned rally nodes never appear in candidates.
-- **Lateness** per delivered chunk = `max(0, arrive - job.deadline) * latePerMin[tier] * qty / job.qty`.
+- **Rally points.** Distinct rally nodes used (including pinned ones) at most `maxRallyPoints`; banned rally nodes never appear in candidates. A pinned rally node means "use this point": each pinned node that is a candidate of at least one job but receives no delivery adds `pinUnused` (2000).
+- **Lateness** per delivered chunk = `min(max(0, arrive - job.deadline) * latePerMin[tier], lateCapShare * defer[tier] * classFactor[classRank]) * qty / job.qty`. The cap keeps a late delivery always cheaper than deferring it to the next window (which would arrive even later).
 - **Deferral** per job = `deferredQty / job.qty * defer[tier] * classFactor[classRank]`.
 - **Simplicity** = `5 * total stops + 25 * trucks used` (a route with no stops is not used and costs nothing).
 - **Violations** (wrong vehicle type, over capacity, node not a candidate, too many rally points, unreachable leg, vehicle used twice, locked job on the wrong truck, quantity over job qty) are listed in `violations` and each adds `1e7` to `total`, so heuristics can pass through infeasible states but never prefer them. `feasible = violations.length === 0`.
@@ -279,12 +320,13 @@ distance   = weights.distance   * 0.5 * truck miles
 risk       = weights.risk       * riskUnits x period risk factor
 simplicity = weights.simplicity * (5 * stops + 25 * trucks used)
 platoon    = weights.distance   * sum(platoonMiles x mobility costPerMi)
-lateness   = sum(minutes late x latePerMin[tier])
+lateness   = sum(min(minutes late x latePerMin[tier], cap)) (see Evaluation semantics)
 deferral   = sum(deferred job share x defer[tier] x classFactor[classRank])
+pinned     = pinUnused x unused pinned rally nodes that some job could use
 total      = sum of the above
 ```
 
-Penalties are sized so that a missed deadline or deferral always costs more than any routing savings, and deferral order follows Routine, Priority, Urgent, Immediate, then class rank, then cost. Immediate deadlines are hard: a solution that misses one is only accepted if no feasible alternative exists, and the plan flags it.
+Penalties are sized (and were re-checked on 2026-10-06 after review found Routine jobs deferred while trucks sat idle under the first values) so that deferral costs more than any single job's routing cost: the longest round trip on the island (~400 miles) costs about fuel 600 + distance 600 + risk ~300 + simplicity 60, under the Routine deferral of 5000. A missed deadline or deferral always costs more than any routing savings, and deferral order follows Routine, Priority, Urgent, Immediate, then class rank, then cost. Immediate deadlines are hard: a solution that misses one is only accepted if no feasible alternative exists, and the plan flags it.
 
 Constraints: capacity per truck per trip; one trip per truck per window; truck starts after `availableAt + loadMin` at its home hub and returns there; at most `maxRallyPoints` distinct rally nodes (pinned count toward it; banned never used); a job's node must be one of its candidates; `lockedTruck` respected.
 
@@ -295,11 +337,21 @@ Constraints: capacity per truck per trip; one trip per truck per window; truck s
 | `tabu` | Tabu search | default; relocate/swap/2-opt/rally-reassign moves, tabu tenure, aspiration |
 | `sa` | Simulated annealing | same move set, geometric cooling |
 | `aco` | Ant colony | pheromone on (node, node) and (job, candidate) choices, local search on best ant |
-| `mip` | Exact (MIP) | HiGHS WebAssembly, time limit, returns best incumbent + gap; warm start if supported |
+| `mip` | Exact (MIP) | HiGHS WebAssembly; warm-started from the best heuristic plan; returns best plan found + proven gap at the time limit |
 
 All methods start from `construct.js` output. Each reports progress at least every 250 ms: `{ fraction, bestCost, elapsedSec, message }`. Cancel terminates the worker; the last reported best solution is kept.
 
 `estimate(instance, method, params) -> { seconds, low, high, basis }` from a quick timing probe on the actual instance.
+
+### MIP (mip.js) - verified facts
+
+- At 20 stops / ~29 delivery tasks an arc-based MIP (788 rows, 2,107 columns, 2,020 binaries) never proved optimal: cold start gap 23.5% at 10 s, 19% at 60 s, 7.9% at 300 s. A simple annealing heuristic beat the 300 s MIP result in ~2 s. Warm-started with that plan, HiGHS proved it within 6.4% of optimal in 60 s.
+- So "Exact (MIP)" first runs a quick tabu pass (a few seconds), passes that plan to HiGHS as a MIP start, and reports the best plan plus the **proven gap** ("within 6% of the best possible plan"). Its estimate states the time limit, not a finish time. Expect status "Time limit reached".
+- Packaging: `highs@1.15.3`; `build/highs.js` inlined as `<script type="text/plain" id="highs-js">`, `highs.wasm` gzip -9 + base64 (1.63 MB) in `<script type="text/plain" id="highs-wasm-gz">`. Worker source = highs.js text + solver files + worker main, started from a Blob URL. In the worker: base64 -> bytes -> `DecompressionStream('gzip')` -> `Module({ instantiateWasm(imports, receive) { WebAssembly.instantiate(bytes, imports).then(r => receive(r.instance)); return {}; } })`. `wasmBinary` / `wasmModule` options are ignored by 1.15.3; do not pass `threads`.
+- API: `highs.createModel({ format: 'lp', data })`, `model.options.set({ output_flag: false, time_limit, mip_rel_gap })`, MIP start via `model.setSolution({ indices, values })` (binaries only is fine; column order = first appearance in the LP text, read names with `getColName`), progress via `mipImprovingSolution` and `mipInterrupt` callbacks, results via `getModelStatus()` (7 optimal, 13 time limit), `info.get('mip_gap')`, `getSolution().colValue`; always `dispose()`.
+- Cancel: `run()` blocks the worker and `SharedArrayBuffer` is unavailable on `file://`, so cancel = `worker.terminate()` and keep the last incumbent the worker posted (post every improving solution, decoded).
+- Reference code from the verification run: `scratchpad/verify-solver/{vrp-model.js, solve-core.js, minimal-template.html, heuristic-sa.js}` (copied to `tools/reference/highs/`).
+
 
 ### Method parameters (planner-tunable, Advanced tab)
 

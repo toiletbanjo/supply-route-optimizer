@@ -1,0 +1,11 @@
+const fs = require("fs"), zlib = require("zlib");
+const VRP = require("./vrp-model.js");
+const lp = VRP.buildModel(VRP.makeInstance({ seed: 1 })).lp;
+let html = fs.readFileSync("minimal-template.html", "utf8");
+const rep = (k, v) => { if (!html.includes(k)) throw new Error("missing " + k); if (/<\/script/i.test(v)) throw new Error("unsafe " + k); html = html.split(k).join(v); };
+rep("/*HIGHS_JS*/", fs.readFileSync("node_modules/highs/build/highs.js", "utf8"));
+rep("/*WASM_GZ_B64*/", zlib.gzipSync(fs.readFileSync("node_modules/highs/build/highs.wasm"), { level: 9 }).toString("base64"));
+rep("/*MODEL_LP*/", lp);
+fs.mkdirSync("dist", { recursive: true });
+fs.writeFileSync("dist/minimal-solver.html", html);
+console.log("dist/minimal-solver.html bytes", Buffer.byteLength(html), "of which LP", lp.length);
