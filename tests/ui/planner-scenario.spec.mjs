@@ -8,8 +8,8 @@
 //
 // Builds the single file (python3 tools/build.py --out <tmp>) and opens it from file://. A seed
 // state is made once with the real planner engine (19 sample requests, a short Tabu search run,
-// approved) and loaded into every page before boot. Then, at 1440x900 and 390x844 in the dark,
-// light and night themes (--quick: dark only), it checks:
+// approved) and loaded into every page before boot. Then, once per viewport (1440x900 and 390x844)
+// in the dark theme, it checks:
 //   - trucks per hub (Fleet steppers, typed count, the Settings shortcut) change the fleet
 //   - mark a truck out (reason, expected back) and available again; the Re-plan banner appears,
 //     folds and unfolds; Re-plan now runs engine.replan (dark theme only: it runs the solver)
@@ -29,7 +29,8 @@
 //     count steppers keep their number box; the daily-use table is not a nested scroll box
 //   - no horizontal page scroll, no white in night mode, zero console errors (blocked
 //     OpenStreetMap tiles are expected and ignored) and no non-tile network requests
-// 820x1180 gets a screenshot pass in all three themes. Then a contingency runs once with the real
+// The light and night themes (and 820x1180 in all three) get a screenshot pass only: theme boot,
+// no white in night mode, count steppers, no horizontal scroll on every subtab (--quick: dark only). Then a contingency runs once with the real
 // engine (0800: a truck with stops made and stops left breaks down, a road closes ahead; Re-plan now,
 // Review, approve) and its outputs are checked in every size and theme: the banner is gone, Done
 // stops, the Out of service end row, the CSV done column, Delivered / Updated notices, History
@@ -144,6 +145,8 @@ async function slide(page, sel, pos) {
 async function clearToasts(page) {
   await page.evaluate(() => document.querySelectorAll('#toast-root > .toast, .toast-root > .toast').forEach((t) => t.remove()));
 }
+const toastTexts = (page) => page.evaluate(() => Array.from(document.querySelectorAll('#toast-root > .toast')).map((t) => ({
+  text: t.querySelector('.toast-msg').textContent, action: !!t.querySelector('.toast-action') })));
 async function closeModals(page) {
   for (let i = 0; i < 4; i++) {
     if (!(await page.locator('.modal-backdrop').count())) return;
@@ -499,6 +502,8 @@ async function runCombo(browser, url, vp, theme, seed) {
       check(running === 1, 'Re-plan now shows progress while the solver runs');
       await page.waitForFunction((pid) => SRO.app.store.getState().plans.some((p) => p.parentPlanId === pid), parent, { timeout: 90000 });
       await settle(page, 100);
+      const rt = (await toastTexts(page)).find((t) => /Re-plan ready/.test(t.text));
+      check(rt && rt.text === 'Re-plan ready. Review the changes, then approve.' && !rt.action, 'the re-plan toast says what to do next and has no button (the Plan tab is already open)', rt);
       const r = await page.evaluate(({ pid, id }) => {
         const s = SRO.app.store.getState();
         const p = s.plans.filter((x) => x.parentPlanId === pid).pop();
@@ -605,9 +610,12 @@ async function runCombo(browser, url, vp, theme, seed) {
     await page.click('li.sc-rally[data-grid="' + g1 + '"] [data-act="ban"]'); await settle(page);
     r = await rally();
     check(!r.pinned.includes(g1) && r.banned.includes(g1), 'banning a pinned point unpins it', r);
+    await clearToasts(page);
     await page.click('li.sc-rally[data-grid="' + g1 + '"] [data-act="clear"]'); await settle(page);
     r = await rally();
     check(!r.pinned.includes(g1) && !r.banned.includes(g1), 'Clear returns it to a candidate', r);
+    const ct = (await toastTexts(page)).map((t) => t.text);
+    check(ct.length === 1 && / unbanned: the optimizer may use it or not\.$/.test(ct[0]), 'Clear says the point is unbanned and the optimizer may use it or not', ct);
     // the dialog the map opens on a rally point click
     await page.evaluate((g) => SRO.ui.scenario.rallyDialog(g), g2);
     await page.waitForSelector('[data-action="rally-pin"]', { state: 'visible' });
@@ -641,6 +649,8 @@ async function runCombo(browser, url, vp, theme, seed) {
     const s1 = await page.evaluate(() => { const s = SRO.app.store.getState().scenario.settings; return { fuel: s.weights.fuel, t: s.timeLimitSec, m: s.method }; });
     check(s1.fuel === 7 && s1.t === 120 && s1.m === 'sa', 'weight slider, time limit and method are saved', s1);
     await page.selectOption('#sc-method', 'tabu'); await settle(page);
+    const mh = await page.evaluate(() => document.querySelector('#sc-method').parentNode.querySelector('.field-help').textContent);
+    check(!/\d+\s*-\s*\d+\s*(s|min)\b/.test(mh) && /Plan tab/.test(mh), 'method help gives no fixed run times and points to the Plan tab estimate', mh);
     const wl = await page.locator('.sc-weight').allInnerTexts();
     check(wl.length === 4 && /Fuel/.test(wl.join(' ')) && /Simplicity/.test(wl.join(' ')), 'four cost weight sliders with explanations', wl.length);
     // trucks-per-hub shortcut
@@ -668,6 +678,18 @@ async function runCombo(browser, url, vp, theme, seed) {
     check(s2.convoy === 1.7 && s2.mpg === 2.5 && s2.mounted === 40 && s2.high === 7 && s2.du === 123, 'advanced travel, mobility, risk and daily-use values are saved', s2);
     const duw = await page.evaluate(() => { const w = document.querySelector('.sc-du-wrap'); return { rows: w.querySelectorAll('.sc-du-input').length, sh: w.scrollHeight, ch: w.clientHeight, max: getComputedStyle(w).maxHeight }; });
     check(duw.rows > 10 && duw.max === 'none' && duw.sh <= duw.ch + 1, 'daily-use table is not a scroll box inside the page scroll', duw);
+    // re-plan ETA-change cost and the sample seed (spec: fixed seed, changeable)
+    const etaHelp = await page.evaluate(() => (document.querySelector('#sc-f-etaSlip-help') || {}).textContent || '');
+    check(/later than the time the approved plan gave/.test(etaHelp) && /0 lets a re-plan move them freely/.test(etaHelp), 'the ETA-change cost has plain-language help', etaHelp);
+    await commit(page, '[data-fk="etaSlip"]', 3);
+    await commit(page, '[data-fk="sampleSeed"]', 4242);
+    const s3 = await page.evaluate(() => { const s = SRO.app.store.getState().scenario.settings; return { eta: s.etaSlipPerMin, seed: s.sampleSeed, mark: (document.querySelector('[data-field="etaSlip"] .sc-changed') || {}).textContent || '' }; });
+    check(s3.eta === 3 && s3.seed === 4242 && /default: 1/.test(s3.mark), 'ETA-change cost and sample seed are saved, with the changed mark', s3);
+    await commit(page, '[data-fk="etaSlip"]', -2);
+    const s4 = await page.evaluate(() => ({ inv: document.querySelector('[data-fk="etaSlip"]').getAttribute('aria-invalid'), eta: SRO.app.store.getState().scenario.settings.etaSlipPerMin }));
+    check(s4.inv === 'true' && s4.eta === 3, 'a negative ETA-change cost is flagged and not saved', s4);
+    await commit(page, '[data-fk="etaSlip"]', 1);
+    await commit(page, '[data-fk="sampleSeed"]', 20261005);
     await commit(page, '[data-fk="convoy"]', 9);
     const bad = await page.evaluate(() => { const i = document.querySelector('[data-fk="convoy"]'); return { inv: i.getAttribute('aria-invalid'), v: SRO.app.store.getState().scenario.settings.convoyFactor }; });
     check(bad.inv === 'true' && bad.v === 1.7, 'out-of-range convoy factor is flagged and not saved', bad);
@@ -696,8 +718,11 @@ async function runCombo(browser, url, vp, theme, seed) {
     let tp = await stored('tabu');
     const row = await page.evaluate((sel) => { const r = document.querySelector(sel); return { changed: r.getAttribute('data-changed'), dot: !!r.querySelector('.sc-dot'), mark: (r.querySelector('.sc-changed') || {}).textContent || '' }; }, P('tabu', 'tenure'));
     check(tp.tenure === 20 && row.changed === 'true' && row.dot && /default: 12/.test(row.mark), 'int knob (tenure): saved, changed dot and "default: 12"', { tp, row });
+    await clearToasts(page);
     await commit(page, P('tabu', 'tenure') + ' input.sc-knob-num', 999);
     tp = await stored('tabu');
+    const kt = (await toastTexts(page)).filter((t) => /kept within/.test(t.text));
+    check(kt.length === 1, 'one "kept within" toast for one clamped value (fill and change fire twice)', kt);
     const shownT = await page.locator(P('tabu', 'tenure') + ' input.sc-knob-num').inputValue();
     check(tp.tenure === 200 && shownT === '200', 'int knob is clamped to its maximum (200)', { tp, shownT });
     await slide(page, P('tabu', 'iterations') + ' input.sc-knob-range', 800);
@@ -1296,14 +1321,18 @@ async function contingencyOutputs(browser, url, vp, theme, cont) {
   await ctx.close();
 }
 
-// ---- 820x1180 screenshot pass -----------------------------------------------------------------------
-async function tabletShots(browser, url, theme, seed) {
-  scope = 'tablet 820x1180 ' + theme;
+// ---- screenshot pass (the tablet in every theme; desktop and phone in light and night) --------------
+// Every Scenario and Outputs screen: no sideways overflow, steppers fit, night colours, a screenshot.
+async function themeShots(browser, url, vp, theme, seed) {
+  scope = vp.name + ' ' + vp.width + 'x' + vp.height + ' ' + theme + ' screens';
   console.log('\n== ' + scope);
   const s0 = JSON.parse(seed);
   s0.ui.theme = theme;
-  const { ctx, page, errors, blocked } = await openPage(browser, url, TABLET, JSON.stringify(s0));
+  const { ctx, page, errors, blocked } = await openPage(browser, url, vp, JSON.stringify(s0));
+  const TABLET = vp;
   const tag = TABLET.width + '-' + theme;
+  const b = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
+  check(b === theme, 'boots in the ' + theme + ' theme', b);
   const shot = async (name) => { await clearToasts(page); await settle(page); await page.screenshot({ path: path.join(SHOTS, tag + '-' + name + '.png') }); };
   await page.evaluate(() => {
     const S = SRO.app.store;
@@ -1314,17 +1343,24 @@ async function tabletShots(browser, url, theme, seed) {
   for (const sub of ['fleet', 'zones', 'rally', 'settings']) {
     await showScenario(page, sub);
     await overflowOk(page, TABLET.width, sub);
+    if (theme === 'night') await nightOk(page, sub);
     await shot(sub);
   }
+  await steppersOk(page, 'settings');
   await page.evaluate(() => { const d = document.querySelector('details.sc-adv'); if (!d.open) d.querySelector('summary').click(); });
-  await page.evaluate(() => document.querySelector('.sc-tune-seg').scrollIntoView());
-  await shot('tuning');
+  await settle(page);
+  await overflowOk(page, TABLET.width, 'advanced');
+  for (const [name, sel] of [['travel', '.sc-adv'], ['periods', '.sc-ptable'], ['tuning', '.sc-tune-seg'], ['demo-data', '[data-field="sampleSeed"]']]) {
+    await page.evaluate((sel) => { const e = document.querySelector(sel); if (e) e.scrollIntoView(); }, sel);
+    if (theme === 'night') await nightOk(page, name);
+    await shot(name);
+  }
   for (const sub of ['movement', 'notices', 'snapshots', 'history', 'data']) {
     await showOutputs(page, sub);
     await overflowOk(page, TABLET.width, sub);
+    if (theme === 'night') await nightOk(page, sub);
     await shot(sub);
   }
-  if (theme === 'night') await nightOk(page, 'outputs');
   check(!errors.length, 'zero console errors (tiles excepted)', errors);
   check(!blocked.length, 'no non-tile network requests', blocked.slice(0, 5));
   await ctx.close();
@@ -1342,14 +1378,18 @@ async function main() {
     const seed = await makeSeed(browser, url);
     const only = opt('--only', '');          // e.g. --only phone:night
     const want = (vp, theme) => !only || only === vp.name + ':' + theme || only === vp.name || only === theme;
+    // the functional walk (every control, the solver) runs once per viewport in the dark theme; the
+    // light and night themes get the screenshot, overflow and theme-colour pass of every screen
     for (const vp of VIEWPORTS) {
       for (const theme of THEMES) {
         if (!want(vp, theme)) continue;
-        await runCombo(browser, url, vp, theme, seed);
-        await persistenceCheck(browser, url, vp, theme, seed);
+        if (theme === 'dark') {
+          await runCombo(browser, url, vp, theme, seed);
+          await persistenceCheck(browser, url, vp, theme, seed);
+        } else await themeShots(browser, url, vp, theme, seed);
       }
     }
-    for (const theme of THEMES) if (want(TABLET, theme)) await tabletShots(browser, url, theme, seed);
+    for (const theme of THEMES) if (want(TABLET, theme)) await themeShots(browser, url, TABLET, theme, seed);
     const after = VIEWPORTS.concat([TABLET]).flatMap((vp) => THEMES.filter((t) => want(vp, t)).map((t) => [vp, t]));
     if (after.length && !flag('--no-contingency')) {
       const cont = await makeContingency(browser, url, seed);

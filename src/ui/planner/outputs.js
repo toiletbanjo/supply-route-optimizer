@@ -150,7 +150,7 @@
 
   // 'Diesel / JP-8, Diesel (DF-2)': item name and option, comma separated like the other planner
   // views (option labels carry their own parentheses, so no nesting). An item with one option, or an
-  // option named like the item, shows the item name only.
+  // option the item name already contains ('Diesel / JP-8' and JP-8), shows the item name only.
   function itemText(line) {
     const H = cats();
     const it = H && H.itemById ? H.itemById(line.itemId) : null;
@@ -158,7 +158,8 @@
     let opt = '';
     if (it.freeText) opt = line.option ? String(line.option) : '';
     else if (it.options.length > 1) { const op = H.optionById(line.itemId, line.option); opt = op ? op.label : ''; }
-    return opt && opt.toLowerCase() !== it.name.toLowerCase() ? it.name + ', ' + opt : it.name;
+    const nl = it.name.toLowerCase(), ol = opt.toLowerCase();
+    return opt && ol !== nl && !(ol.length >= 3 && nl.indexOf(ol) >= 0) ? it.name + ', ' + opt : it.name;
   }
   // One delivery (or deferred line) -> display parts. Works with lineIdx (number or array) or without.
   function deliveryInfo(st, d) {
@@ -806,7 +807,8 @@
     });
   }
   function buildData(st) {
-    const size = (function () { try { return (SRO.core.store.serialize(st).length / 1024); } catch (e) { return NaN; } })();
+    // the size of the file Export writes (pretty-printed JSON), not of the compact browser copy
+    const size = (function () { try { return (SRO.core.store.exportJson(st).length / 1024); } catch (e) { return NaN; } })();
     return [
       h('section.card.op-data',
         h('div.card-header', h('div', h('h3.card-title', 'Export all data'), h('div.card-sub', 'A JSON file with every request, plan, snapshot, the scenario and settings on this device' + (isNum(size) ? ' (about ' + F().number(Math.max(1, size), 0) + ' KB)' : '') + '. Data lives only in this browser, so export to back it up or move it to another device.'))),

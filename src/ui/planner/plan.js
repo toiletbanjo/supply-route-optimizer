@@ -5,12 +5,22 @@
 //                    reports how close to optimal it got), Plan now, Compare mode (pick methods -> run
 //                    them -> comparison table -> keep one). While running: progress bar, live best-cost
 //                    sparkline (engine status.history), elapsed time, Cancel (keeps the best plan).
-//   Plan             name (rename), status, plan picker, the summary strip in spec order (requests,
-//                    stops, trucks used, miles, gallons, risk, delayed (red, opens the list of delayed
-//                    requests and what blocked each), run time), Approve plan (confirm says what
-//                    happens), Save snapshot, Compare to previous plan (what moved), before/after list
-//                    after a contingency re-plan, per-truck route cards (open Route detail) and a
-//                    compact timeline with day / dusk / night / dawn shading.
+//   Plan             name (rename), status, what Exact (MIP) proved (plan.mipProof), optimizer notes
+//                    (plan.warnings; turn-backs and kept plans shown open), plan picker, the summary
+//                    strip in spec order (requests, stops, trucks used, miles, gallons, risk, delayed
+//                    (red, opens the list of delayed requests and what blocked each), run time; a
+//                    re-plan adds a 'This window' strip from plan.windowStats next to its 'From now'
+//                    one), Approve plan (confirm says what happens, which trucks leave and which carry
+//                    on, and lists plan.violations; a refused approval ('infeasible-plan') offers the
+//                    plans that meet every rule), Save snapshot, Compare to previous plan (what
+//                    moved), before/after list after a contingency re-plan, per-truck route cards
+//                    with the stops in order in plain words (open Route detail) and a compact
+//                    timeline with day / dusk / night / dawn shading.
+//   Compare table    one column per method: total cost and the parts that add up to it (fuel,
+//                    distance, risk, simplicity, platoon travel, lateness, delay and ETA-change
+//                    penalties, plus pinned and rule-break penalties when any plan has them), then late
+//                    and delayed requests, run time and MIP gap. After a compare (or Cancel during
+//                    one) the lowest-cost plan is shown and is the one Approve acts on.
 // All numbers come from the stored Plan (plan.stats, plan.cost, plan.routes); the optimizer runs through
 // SRO.core.engine (DESIGN.md 8b). The view keeps only UI state (compare picks, toggles, estimate text).
 (function (root) {
@@ -55,10 +65,77 @@
     });
     return out;
   }
+  function pickerLabel(p, withId) {
+    const k = K();
+    const st = statusOf(p);
+    // a stopped plan's name already says '(stopped)'
+    const lab = st.key === 'cancelled' && /stopped/i.test(p.name || '') ? 'draft' : st.label.toLowerCase();
+    return (withId ? p.id + ' · ' : '') + (p.name || p.id) + ' · ' + (p.cost && k.isNum(p.cost.total) ? k.num(p.cost.total, 0) + ' pts' : 'no cost') + ' · ' + lab;
+  }
   function stableKey(o) { try { return JSON.stringify(o); } catch (e) { return String(Math.random()); } }
   function openCount(state) {
     const k = K();
     return k.queueRequests(state).filter(function (r) { return k.OPEN_STATUSES.indexOf(r.status) >= 0; }).length;
+  }
+
+  // What Exact (MIP) proved, from plan.mipProof ({ stopReason 'optimal' | 'gap' | 'time' | 'cancel' |
+  // 'error', gap, dualBound, gapTarget, exactModel }); plans stored before that field get one from
+  // plan.stopReason and plan.mipGap. null for the heuristics.
+  function mipProofOf(plan) {
+    const k = K();
+    if (!plan) return null;
+    if (plan.mipProof) return plan.mipProof;
+    if (plan.method !== 'mip' && !k.isNum(plan.mipGap)) return null;
+    const g = k.isNum(plan.mipGap) ? plan.mipGap : null;
+    const sr = plan.cancelled ? 'cancel' : plan.stopReason === 'time' ? 'time'
+      : plan.stopReason === 'optimal' || plan.stopReason === 'gap' ? (g !== null && g <= 1e-6 ? 'optimal' : 'gap')
+      : plan.stopReason === 'error' ? 'error' : 'unknown';
+    return { stopReason: sr, gap: g, dualBound: null, gapTarget: plan.params && k.isNum(plan.params.mipGap) ? plan.params.mipGap : null, exactModel: null };
+  }
+  function pctText(g) { return g > 0 && g < 0.0005 ? 'under 0.1%' : (g * 100).toFixed(1) + '%'; }
+  // One plain sentence (plus a caveat) for the notice under the plan name. The gap is measured against
+  // the exact model's bound (the lowest cost the model could still prove possible), not against every
+  // possible plan, and the model is exact only when there is one time-of-day period.
+  function mipNotice(plan) {
+    const k = K(), pr = mipProofOf(plan);
+    if (!pr) return null;
+    const g = k.isNum(pr.gap) ? pr.gap : null;
+    const within = g !== null ? h('span', ' proven within ', h('strong.num', pctText(g)), ' of the exact model\'s bound.') : null;
+    let lead;
+    if (pr.stopReason === 'optimal') lead = h('span', 'Exact (MIP) proved this is the best plan its model can make (gap ', h('strong.num', '0%'), ').');
+    else if (pr.stopReason === 'gap') lead = h('span', 'Exact (MIP) stopped at your gap target' + (k.isNum(pr.gapTarget) ? ' of ' + pctText(pr.gapTarget) : '') + ':', within);
+    else if (pr.stopReason === 'time') lead = within ? h('span', 'Exact (MIP) reached its time limit:', within) : h('span', 'Exact (MIP) reached its time limit before it could prove a gap.');
+    else if (pr.stopReason === 'cancel') lead = within ? h('span', 'Exact (MIP) was stopped with Cancel:', within) : h('span', 'Exact (MIP) was stopped with Cancel before it could prove a gap.');
+    else if (pr.stopReason === 'unknown') lead = within ? h('span', 'Exact (MIP):', within) : h('span', 'Exact (MIP) did not record what it proved for this plan.');
+    else lead = h('span', 'Exact (MIP) hit a solver error, so this is the starting plan it was given; no gap is proven.');
+    const notes = [];
+    if (g !== null && pr.stopReason !== 'optimal') notes.push('The bound is the lowest cost the model could still prove possible, so the best plan lies somewhere in that gap.');
+    if (pr.exactModel === false) notes.push('The model uses each leg\'s average time-of-day speed and risk, while the plan is scored on the real times, so its cost can differ a little from the model\'s.');
+    return h('div.notice.notice-info.pp-gap', { 'data-testid': 'mip-notice', 'data-reason': pr.stopReason }, ui.icon('info'),
+      h('div', lead, notes.length ? h('div.small.muted.pp-gap-note', notes.join(' ')) : null));
+  }
+
+  // The stops of a route in plain words, in order: rally point names, and the unit designator for a
+  // direct delivery ("Su'ao > 1/B/4-98CAV > Sanyi > Zhudong"); a turn-back reads 'turned back'.
+  function stopsLine(state, rt) {
+    const k = K();
+    const stops = rt.stops || [];
+    const ix = k.legStops(rt), tb = k.turnBack(rt);
+    const tbAt = tb ? ix.slice(tb.legIndex + 1).find(function (x) { return x >= 0; }) : undefined;
+    const names = [];
+    stops.forEach(function (st, i) {
+      if (tb && tbAt === i) names.push('turned back');
+      // short place names ("Su'ao interchange", not "... (Suhua Hwy north end)")
+      let name = String((st.kind === 'rally' && st.gridId ? k.gridName(st.gridId) : st.label) || '').replace(/\s*\([^)]*\)\s*$/, '');
+      if (st.kind !== 'rally') {
+        const ids = {};
+        (st.deliveries || []).forEach(function (d) { ids[d.requestId] = true; });
+        const one = Object.keys(ids).length === 1 ? k.request(state, Object.keys(ids)[0]) : null;
+        if (one && one.designator) name = one.designator;
+      }
+      names.push(name || ('Stop ' + (i + 1)));
+    });
+    return names.join(' > ');
   }
 
   // small SVG line of best cost over time, drawn on to the elapsed time (nowT) so a run that has
@@ -286,7 +363,7 @@
       const limit = effectiveLimit(state, method);
       if (root.document.activeElement !== r.limit && String(r.limit.value) !== String(limit)) r.limit.value = String(limit);
       r.limitHelp.textContent = method === 'mip'
-        ? 'The exact solver runs until this limit, then returns its best plan and how close it is to the best possible.'
+        ? 'The exact solver runs until this limit (or until it proves its gap target), then returns its best plan and its proven gap to the exact model\'s bound.'
         : 'The run stops here at the latest and keeps the best plan found so far.';
       const eng = k.engine();
       const running = self.isRunning();
@@ -380,7 +457,7 @@
       let text;
       if (method === 'mip') {
         text = h('span', h('strong.num', 'Up to ' + k.secs(res.seconds)), ': a quick heuristic start, then the exact solver until its ' + k.secs(limit) +
-          ' limit. It reports how close the plan is to the best possible (proven gap).');
+          ' limit. It reports how close the plan is to the exact model\'s bound (proven gap).');
       } else {
         const range = k.isNum(res.low) && k.isNum(res.high) && res.high > res.low ? ' (' + k.secs(res.low) + ' to ' + k.secs(res.high) + ')' : '';
         text = h('span', 'Estimated run time ', h('strong.num', 'about ' + k.secs(res.seconds)), h('span.num', range),
@@ -468,13 +545,15 @@
         let best = null;
         plans.forEach(function (x) { if (x.cost && (!best || x.cost.total < best.cost.total)) best = x; });
         self.pulseId = best ? best.id : null;
+        // the cheapest plan is shown (and is what Approve acts on), not the last one stored
         if (best) K().showPlan(best.id);
         const st = eng.status ? eng.status() : { phase: 'done' };
         self.onStatus(st);
         self.render(self.ctx.getState(), true);
+        const which = best ? ' (' + k.methodLabel(best.method) + (best.cancelled ? ', stopped early' : '') + ')' : '';
         if (!plans.length) ui.toast('Stopped before any method finished a plan.', 'warn');
-        else if (st.phase === 'cancelled') ui.toast('Stopped. Kept ' + plans.length + (plans.length === 1 ? ' plan' : ' plans') + ' found so far; keep the one you want.', 'warn');
-        else ui.toast('Compared ' + plans.length + ' methods. Showing the lowest-cost plan; keep the one you want.', 'success');
+        else if (st.phase === 'cancelled') ui.toast('Stopped. Kept ' + plans.length + (plans.length === 1 ? ' plan' : ' plans') + ' found so far. Showing the lowest-cost one' + which + '; keep the one you want.', 'warn');
+        else ui.toast('Compared ' + plans.length + ' methods. Showing the lowest-cost plan' + which + '; keep the one you want.', 'success');
         self.scrollTo(self.secCompare);
       }, function (err) { self.failed(err); });
     },
@@ -535,16 +614,34 @@
       if (!plans.length) return;
       let best = null;
       plans.forEach(function (p) { if (p.cost && (!best || p.cost.total < best.cost.total)) best = p; });
+      // the cost parts add up to the total: the route terms, the plan-level penalties, and (only when a
+      // plan has them) ETA changes of a re-plan, unused pinned points and the penalty for broken rules
+      const n0 = function (v) { return k.num(v, 0); };
+      const part = function (key) { return function (p) { return p.cost && k.isNum(p.cost[key]) ? p.cost[key] : 0; }; };
+      const PARTS = ['fuel', 'distance', 'risk', 'simplicity', 'platoon', 'lateness', 'deferral', 'stability', 'pinned'];
+      const rest = function (p) {
+        if (!p.cost || !k.isNum(p.cost.total)) return 0;
+        const r = p.cost.total - PARTS.reduce(function (a, key) { return a + part(key)(p); }, 0);
+        return r > 0.5 ? r : 0;
+      };
+      const any = function (get) { return plans.some(function (p) { return get(p) > 0.005; }); };
       const rows = [
-        { label: 'Total cost', get: function (p) { return p.cost && p.cost.total; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Fuel', get: function (p) { return p.cost && p.cost.fuel; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Distance', get: function (p) { return p.cost && p.cost.distance; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Risk', get: function (p) { return p.cost && p.cost.risk; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Simplicity', get: function (p) { return p.cost && p.cost.simplicity; }, fmt: function (v) { return k.num(v, 0); }, low: true },
-        { label: 'Delayed', get: function (p) { return p.stats && p.stats.delayed; }, fmt: function (v) { return k.num(v, 0); }, low: true, alert: true },
+        { label: 'Total cost', get: function (p) { return p.cost && p.cost.total; }, fmt: n0, low: true, cls: 'pp-cmp-total' },
+        { label: 'Fuel', get: part('fuel'), fmt: n0, low: true, part: true },
+        { label: 'Distance', get: part('distance'), fmt: n0, low: true, part: true },
+        { label: 'Risk', get: part('risk'), fmt: n0, low: true, part: true },
+        { label: 'Simplicity', get: part('simplicity'), fmt: n0, low: true, part: true },
+        { label: 'Platoon travel', get: part('platoon'), fmt: n0, low: true, part: true },
+        { label: 'Late penalty', get: part('lateness'), fmt: n0, low: true, part: true },
+        { label: 'Delay penalty', get: part('deferral'), fmt: n0, low: true, part: true },
+        any(part('stability')) || plans.some(function (p) { return p.parentPlanId; }) ? { label: 'ETA changes', get: part('stability'), fmt: n0, low: true, part: true } : null,
+        any(part('pinned')) ? { label: 'Unused pinned points', get: part('pinned'), fmt: n0, low: true, part: true } : null,
+        any(rest) ? { label: 'Broken rules', get: rest, fmt: n0, low: true, part: true, alert: true } : null,
+        { label: 'Late', get: function (p) { return p.stats && p.stats.late; }, fmt: n0, low: true, alert: true, cls: 'pp-cmp-first' },
+        { label: 'Delayed', get: function (p) { return p.stats && p.stats.delayed; }, fmt: n0, low: true, alert: true },
         { label: 'Run time', get: function (p) { return p.stats && k.isNum(p.stats.runtimeSec) ? p.stats.runtimeSec : p.runtimeSec; }, fmt: function (v) { return k.secs(v); } },
         { label: 'Gap (MIP)', get: function (p) { return k.isNum(p.mipGap) ? p.mipGap : null; }, fmt: function (v) { return v === null ? '-' : (v * 100).toFixed(1) + '%'; } }
-      ];
+      ].filter(Boolean);
       const head = h('tr', h('th', { scope: 'col' }, h('span.sr-only', 'Measure')), plans.map(function (p) {
         return h('th.num', { scope: 'col', class: { 'is-viewed': p === viewed } }, h('div.pp-cmp-m', k.methodLabel(p.method)),
           p === best ? h('div.pp-cmp-best', 'Lowest cost') : null, p.cancelled ? h('div.faint', 'stopped early') : null);
@@ -553,7 +650,8 @@
         const vals = plans.map(function (p) { const v = row.get(p); return k.isNum(v) ? v : null; });
         const nums = vals.filter(function (v) { return v !== null; });
         const min = row.low && nums.length > 1 ? Math.min.apply(null, nums) : null;
-        return h('tr', h('th', { scope: 'row' }, row.label), vals.map(function (v, i) {
+        return h('tr', { class: [row.part ? 'pp-cmp-part' : null, row.cls || null].filter(Boolean).join(' ') || null },
+          h('th', { scope: 'row', title: row.part ? 'Part of the total cost' : null }, row.label), vals.map(function (v, i) {
           return h('td.num', {
             class: { 'is-best': min !== null && v === min && nums.some(function (x) { return x !== min; }), 'text-danger': row.alert && v > 0, 'is-viewed': plans[i] === viewed },
             'data-col': plans[i].method, 'data-row': row.label
@@ -573,7 +671,7 @@
         }, kept ? ui.icon('check') : null, kept ? 'Kept' : 'Keep'));
       }));
       sec.appendChild(h('div.card.pp-cmp-card',
-        h('div.card-header', h('div', h('h2.card-title', 'Method comparison'), h('div.card-sub', 'Same requests, cost points from one scoring rule. Lower is better.')),
+        h('div.card-header', h('div', h('h2.card-title', 'Method comparison'), h('div.card-sub', 'Same requests, cost points from one scoring rule; the indented rows add up to the total. Lower is better.')),
           h('button.btn.btn-ghost.btn-icon.btn-sm', { type: 'button', 'aria-label': 'Close comparison', onClick: function () { self.compareIds = null; self.render(self.ctx.getState(), true); } }, ui.icon('x'))),
         h('div.table-wrap.pp-cmp-wrap', h('table.table.table-compact.pp-cmp-table', { 'data-testid': 'compare-table' }, h('thead', head), h('tbody', body, keep)))));
     },
@@ -602,10 +700,8 @@
         k.isNum(plan.createdAt) ? h('span.num', 'Made ' + k.dtg(plan.createdAt)) : null);
       sec.appendChild(title);
       sec.appendChild(meta);
-      if (k.isNum(plan.mipGap)) {
-        sec.appendChild(h('div.notice.notice-info.pp-gap', ui.icon('info'), h('div', 'Exact (MIP): within ', h('strong.num', (plan.mipGap * 100).toFixed(1) + '%'),
-          ' of the best possible plan (proven when the time limit was reached).')));
-      }
+      const mn = mipNotice(plan);
+      if (mn) sec.appendChild(mn);
       if (plan.cancelled) sec.appendChild(h('div.notice.notice-warn', ui.icon('alert'), h('div', 'Stopped early with Cancel: this is the best plan found before stopping.')));
       if (plan.superseded) {
         const by = (state.plans || []).find(function (p) { return p.id === plan.supersededBy; });
@@ -617,11 +713,20 @@
       }
       // what the engine had to adjust (a lock it could not keep, a truck cut off, a pickup point out of
       // reach): the planner needs to see these before approving
+      // Notes about a truck on the road (turned back from a closed road, cut off, a load it could not
+      // place) and a re-plan that kept the current plan change what happens next: they stay open.
       const warns = (plan.warnings || []).filter(function (w, i, a) { return typeof w === 'string' && w && a.indexOf(w) === i; });
-      if (warns.length) {
+      const KEY_NOTE = /^Truck |turns back|cut off|keeps it\.|stays on the truck|rally points? (?:pinned|is out of reach)|out of reach of every platoon|used \d+ rally points?|already on the road carry/;
+      const key = warns.filter(function (w) { return KEY_NOTE.test(w); });
+      const other = warns.filter(function (w) { return key.indexOf(w) < 0; });
+      if (key.length) {
+        sec.appendChild(h('div.notice.notice-warn.pp-key-notes', { 'data-testid': 'plan-key-notes' }, ui.icon('alert'),
+          key.length === 1 ? h('div', key[0]) : h('ul.pp-key-list', key.map(function (w) { return h('li', w); }))));
+      }
+      if (other.length) {
         sec.appendChild(h('details.notice.notice-info.pp-warnings', { 'data-testid': 'plan-warnings' },
-          h('summary', ui.icon('info'), h('span', warns.length === 1 ? '1 note from the optimizer' : warns.length + ' notes from the optimizer')),
-          h('ul', warns.map(function (w) { return h('li', w); }))));
+          h('summary', ui.icon('info'), h('span', (other.length === 1 ? '1 note' : other.length + ' notes') + ' from the optimizer' + (key.length ? ' (more)' : ''))),
+          h('ul', other.map(function (w) { return h('li', w); }))));
       }
       // plan picker
       const list = k.plansForPicker(state, plan);
@@ -630,8 +735,10 @@
           'data-testid': 'plan-picker',
           onChange: function (e) { K().showPlan(e.target.value); }
         }, list.map(function (p) {
-          const s2 = statusOf(p);
-          return h('option', { value: p.id, selected: p === plan }, p.name + ' (' + k.methodLabel(p.method) + ', ' + s2.label.toLowerCase() + ')');
+          // name (it names the method already), total cost and status; the plan id too when two plans
+          // share a name (the same method run twice in a window)
+          const twin = list.some(function (q) { return q !== p && q.name === p.name; });
+          return h('option', { value: p.id, selected: p === plan }, pickerLabel(p, twin));
         }));
         sel.value = plan.id;
         sec.appendChild(h('div.pp-picker-row', h('label.field-label', { for: 'pp-picker' }, 'Show plan'), sel));
@@ -668,10 +775,31 @@
         self.pulseId = null;
         strip.classList.add('is-pulse');
       }
+      // a re-plan: the strip above counts what is planned from now on; plan.windowStats adds the stops
+      // already made, for the whole window
+      const ws = plan.parentPlanId && plan.windowStats ? plan.windowStats : null;
+      if (ws) sec.appendChild(h('div.caps.pp-summary-cap', 'From now'));
       sec.appendChild(strip);
+      if (ws) {
+        const wstat = function (key, label, value, display, unit) {
+          return h('div.stat', { 'data-wstat': key, 'data-value': k.isNum(value) ? String(value) : '' },
+            h('span.stat-label', label), h('span.stat-value', display, unit ? h('span.stat-unit', unit) : null));
+        };
+        sec.appendChild(h('div.caps.pp-summary-cap', 'This window (stops made + planned)'));
+        sec.appendChild(h('div.summary.pp-summary.pp-summary-window', { role: 'group', 'aria-label': 'Whole window', 'data-testid': 'summary-window' },
+          wstat('requests', 'Requests', ws.requests, k.num(ws.requests, 0)),
+          wstat('stops', 'Stops', ws.stops, k.num(ws.stops, 0), k.isNum(ws.stopsDone) && ws.stopsDone ? ws.stopsDone + ' made' : null),
+          wstat('trucks', 'Trucks used', ws.trucksUsed, k.num(ws.trucksUsed, 0)),
+          wstat('miles', 'Miles', ws.miles, k.num(ws.miles, 0), 'mi'),
+          wstat('gallons', 'Gallons', ws.gallons, k.num(ws.gallons, 0), 'gal'),
+          wstat('risk', 'Risk', ws.riskUnits, k.num(ws.riskUnits, 1)),
+          wstat('delayed', 'Delayed', ws.delayed, k.num(ws.delayed, 0)),
+          wstat('rally', 'Rally points', ws.rallyPoints, k.num(ws.rallyPoints, 0), k.isNum(state.scenario.settings.maxRallyPoints) ? 'of ' + state.scenario.settings.maxRallyPoints : null)));
+      }
       if (plan.parentPlanId) {
         sec.appendChild(h('div.small.faint.pp-summary-note', { 'data-testid': 'summary-note' },
-          'Re-plan totals count what is planned from now on: for a truck already on the road, from its next stop. The truck cards show whole trips.'));
+          ws ? 'From now counts what is planned from now on: for a truck already on the road, from its next stop. This window adds the stops already made. The truck cards show whole trips.'
+            : 'Re-plan totals count what is planned from now on: for a truck already on the road, from its next stop. The truck cards show whole trips.'));
       }
       if (delayed > 0 && !plan.approved && !plan.superseded) {
         const win = k.planWindow(plan);
@@ -691,10 +819,11 @@
         onClick: function () { self.approve(plan); }
       }, ui.icon('check'), plan.approved ? 'Approved' : plan.superseded ? 'Replaced' : 'Approve plan');
       const snap = h('button.btn.btn-secondary', { type: 'button', 'data-testid': 'snapshot', onClick: function () { self.snapshot(plan); } }, ui.icon('download'), 'Save snapshot');
-      const cmp = prev ? h('button.btn.btn-secondary', {
-        type: 'button', 'aria-pressed': String(self.showDiff || !!plan.parentPlanId), 'data-testid': 'compare-previous', disabled: !!plan.parentPlanId,
+      // a re-plan always shows its before / after list, so there is nothing to toggle
+      const cmp = prev && !plan.parentPlanId ? h('button.btn.btn-secondary', {
+        type: 'button', 'aria-pressed': String(self.showDiff), 'data-testid': 'compare-previous',
         onClick: function () { self.showDiff = !self.showDiff; self.render(self.ctx.getState(), false); }
-      }, ui.icon('layers'), plan.parentPlanId ? 'Before / after shown' : self.showDiff ? 'Hide comparison' : 'Compare to previous plan') : null;
+      }, ui.icon('layers'), self.showDiff ? 'Hide comparison' : 'Compare to previous plan') : null;
       sec.appendChild(h('div.pp-actions-row', approve, snap, cmp));
       const snaps = (state.snapshots || []).filter(function (x) { return x.planId === plan.id; });
       if (snaps.length) sec.appendChild(h('div.small.faint', 'Snapshots: ' + snaps.map(function (x) { return x.name; }).join(', ')));
@@ -744,15 +873,25 @@
     // ==== approve / rename / snapshot ================================================================
     approve: function (plan) {
       const self = this, k = K();
+      const now = self.ctx.getState().clock.simMin;
       const routes = k.activeRoutes(plan);
-      const first = routes.reduce(function (a, r) { return k.isNum(r.depart) && (a === null || r.depart < a) ? r.depart : a; }, null);
+      // a re-plan made after trucks left: those carry on with the new plan; only the others still leave
+      const leave = routes.filter(function (r) { return !(k.isNum(r.depart) && r.depart <= now); });
+      const onRoad = routes.filter(function (r) { return leave.indexOf(r) < 0 && !(k.isNum(r.returnAt) && r.returnAt <= now); });
+      const first = leave.reduce(function (a, r) { return k.isNum(r.depart) && (a === null || r.depart < a) ? r.depart : a; }, null);
       const win = k.planWindow(plan);
       const delayed = (plan.stats && plan.stats.delayed) || 0;
+      const viol = Array.isArray(plan.violations) ? plan.violations : [];
+      const ids = function (list) { return list.map(function (r) { return r.truckId; }).join(', '); };
       const body = h('div.vstack-sm',
         h('p.modal-text', 'This plan becomes the movement schedule' + (win ? ' for ' + k.windowLabel(win) : '') + '.'),
+        viol.length ? h('div.notice.notice-error.pp-confirm-viol', { 'data-testid': 'approve-violations' }, ui.icon('alert'),
+          h('div', h('strong', 'This plan breaks ' + (viol.length === 1 ? 'a planning rule' : viol.length + ' planning rules') + ':'),
+            h('ul', viol.map(function (v) { return h('li', v.detail || v.code); })))) : null,
         h('ul.pp-confirm-list',
-          h('li', routes.length + (routes.length === 1 ? ' truck leaves' : ' trucks leave') + ' at the planned times' + (first !== null ? ' (first at ' + k.dtg(first) + ')' : '') + ': ' +
-            routes.map(function (r) { return r.truckId; }).join(', ') + '.'),
+          onRoad.length ? h('li', onRoad.length + (onRoad.length === 1 ? ' truck already on the road carries' : ' trucks already on the road carry') + ' on with the new plan: ' + ids(onRoad) + '.') : null,
+          leave.length ? h('li', leave.length + (leave.length === 1 ? ' truck leaves' : ' trucks leave') + ' at the planned times' + (first !== null ? ' (first at ' + k.dtg(first) + ')' : '') + ': ' + ids(leave) + '.')
+            : !onRoad.length ? h('li', 'No truck drives in this plan.') : null,
           h('li', 'Platoon sergeants see their pickup point and ETA, and the truck callsign and frequency.'),
           delayed ? h('li', delayed === 1 ? 'The platoon sergeant of the 1 delayed request is told it is not in this window' : 'The platoon sergeants of the ' + delayed + ' delayed requests are told they are not in this window',
             (win ? '; the next plan starts at ' + k.dtg(win.end) : ''), '.') : null,
@@ -765,12 +904,48 @@
           { label: 'Cancel', kind: 'secondary' },
           { label: 'Approve plan', kind: 'primary', id: 'approve', onClick: function () {
             const res = self.ctx.dispatch({ type: 'plan/approve', planId: plan.id, now: Math.floor(self.ctx.getState().clock.simMin) });
+            if (res && !res.ok && res.code === 'infeasible-plan') { self.refused(plan, res); return true; }
             if (!res || !res.ok) { ui.toast((res && res.error) || 'Could not approve the plan.', 'error'); return false; }
             K().showPlan(plan.id);
-            ui.toast('Plan approved. Platoon sergeants now see their pickup point and ETA.', 'success');
+            // approved although it breaks a rule (no other plan of the window meets them all)
+            if (res.warning) ui.toast(res.warning, 'warn', { timeout: 12000 });
+            else ui.toast('Plan approved. Platoon sergeants now see their pickup point and ETA.', 'success');
             return true;
           } }
         ]
+      });
+    },
+
+    // plan/approve refused a plan that breaks a planning rule while other drafts of the window meet
+    // them all: say why and offer those plans (the planner reviews one, then approves it).
+    refused: function (plan, res) {
+      const self = this, k = K();
+      const plans = self.ctx.getState().plans || [];
+      const alts = (res.alternativeIds || []).map(function (id) { return plans.find(function (p) { return p.id === id; }); }).filter(Boolean)
+        .sort(function (a, b) { return ((a.cost && a.cost.total) || 0) - ((b.cost && b.cost.total) || 0); });
+      ui.modal.open({
+        title: 'Not approved',
+        size: 'sm',
+        body: function (el, handle) {
+          el.appendChild(h('div.notice.notice-error', { 'data-testid': 'approve-refused' }, ui.icon('alert'), h('div', res.error || 'This plan breaks a planning rule.')));
+          if (alts.length) {
+            el.appendChild(h('p.modal-text', alts.length === 1 ? 'This plan for the same window meets every rule:' : 'These plans for the same window meet every rule:'));
+            el.appendChild(h('div.list.list-dense.pp-alt-list', alts.map(function (p) {
+              return h('div.list-row', { 'data-plan': p.id },
+                h('div.list-row-main', h('div.list-row-title', p.name || p.id),
+                  h('div.list-row-sub.num', p.id + ' · ' + k.methodLabel(p.method) + ' · ' + (p.cost ? k.num(p.cost.total, 0) + ' pts' : '') + ' · ' + ((p.stats && p.stats.delayed) || 0) + ' delayed')),
+                h('button.btn.btn-sm.btn-secondary.list-row-action', { type: 'button', 'data-testid': 'show-alt-' + p.id,
+                  onClick: function () {
+                    handle.close();
+                    K().showPlan(p.id);
+                    self.render(self.ctx.getState(), true);
+                    self.scrollTo(self.secHead);
+                    ui.toast('Showing ' + (p.name || p.id) + '. Review it, then approve.', 'info');
+                  } }, 'Show plan'));
+            })));
+          } else el.appendChild(h('p.modal-text', 'Re-plan, or change the settings, then try again.'));
+        },
+        actions: [{ label: 'Close', kind: 'secondary' }]
       });
     },
 
@@ -892,6 +1067,7 @@
         h('div.pp-truck-top', h('span.truck-chip', { style: { '--truck': color } }, rt.truckId), h('span.pp-truck-type', k.truckTypeLabel(type)),
           stopped ? h('span.badge.badge-danger', rt.out ? 'Out of service' : 'Cut off') : null,
           h('span.pp-truck-go', ui.icon('chevron'))),
+        h('div.pp-truck-stops', { 'data-testid': 'truck-stops', title: stopsLine(state, rt) }, stopsLine(state, rt)),
         h('div.pp-truck-grid',
           h('div', h('span.pp-k', 'Depart'), h('span.num', k.dtg(rt.depart))),
           stopped ? h('div', h('span.pp-k', 'Stopped'), h('span', 'after stop ' + nDone))

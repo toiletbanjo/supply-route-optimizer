@@ -19,12 +19,18 @@
 //   - time limit field (settings), estimate text before running (heuristic "about", MIP "Up to" and
 //     "proven gap"), Plan now with the default method and a 5 s cap, the running panel
 //   - the summary strip is in spec order and every number equals plan.stats; delayed is red and opens
-//     the list of delayed requests with plain-word reasons; truck cards and the timeline
+//     the list of delayed requests with plain-word reasons (forced on the phone by keeping one truck
+//     of each type); truck cards with one stops line each, and the timeline
 //   - a click on a route line on the map opens Route detail (stops with MGRS and DTG, deliveries with
 //     class labels, legs, cost split); the truck switcher, Back, and truck cards open it too
 //   - rename, snapshot, approve (the confirm names the pickup point and ETA), compare mode (table with
-//     every measure, Keep), compare to previous, Cancel (keeps the best plan, marked stopped early),
-//     a contingency re-plan (before / after list)
+//     every measure, the cost rows add up to the total, the lowest-cost plan is shown and approved even
+//     when the last method costs more, also after Cancel during a compare; the MIP notice follows
+//     plan.mipProof), compare to previous, Cancel (keeps the best plan, marked stopped early), a
+//     contingency re-plan (before / after list); a mid-route re-plan shows its "this window" stats and
+//     its approve dialog names the trucks already on the road
+//   - a plan that breaks a rule: the approve dialog lists it, the store refuses it and offers the
+//     plans that meet every rule
 //   - trucks of the approved plan appear and move on the demo clock (none drawn before departure)
 //   - all three themes: no horizontal overflow, no white backgrounds in dark and night, no emoji,
 //     numbers and DTG times not cut off
@@ -136,15 +142,18 @@ function installStubEngine() {
     });
     const sum = (f) => routes.reduce((a, r) => a + f(r), 0);
     const cost = { fuel: sum((r) => r.cost.fuel), distance: sum((r) => r.cost.distance), risk: 0, simplicity: sum((r) => r.cost.simplicity), platoon: 0, lateness: 0 };
-    cost.total = cost.fuel + cost.distance + cost.simplicity + deferred.length * 50;
+    cost.deferral = deferred.length * 50;
+    cost.total = cost.fuel + cost.distance + cost.simplicity + cost.deferral;
     const delayed = {};
     deferred.forEach((d) => { delayed[d.requestId] = true; });
     return {
       method, methodLabel: label(method), name: (o.parentPlanId ? 'Re-plan, ' : 'Stub, ') + label(method) + (o.cancelled ? ' (stopped)' : '') + ', ' + F.dtg(now),
       windowId: K.currentWindow(st).id, createdAt: now, runtimeSec: o.runtimeSec, mipGap: method === 'mip' ? 0.042 : null, cancelled: !!o.cancelled,
+      mipProof: method === 'mip' ? { stopReason: o.cancelled ? 'cancel' : 'time', gap: 0.042, dualBound: cost.total * 0.958, gapTarget: 0.01, exactModel: false } : null,
+      stopReason: method === 'mip' ? (o.cancelled ? 'cancel' : 'time') : null, violations: [],
       parentPlanId: o.parentPlanId || null, replanReason: o.reason || null, rallyPoints: [], routes, deferred, late: [], cost,
       stats: { requests: reqs.length, stops: sum((r) => r.stops.length), trucksUsed: routes.length, miles: sum((r) => r.miles), gallons: sum((r) => r.gallons),
-        riskUnits: 0, late: 0, delayed: Object.keys(delayed).length, runtimeSec: o.runtimeSec }
+        riskUnits: 0, late: 0, delayed: Object.keys(delayed).length, runtimeSec: o.runtimeSec, violations: 0 }
     };
   }
   function store1(plan) {
@@ -285,6 +294,8 @@ async function waitRunEnd(page, nPlansBefore) {
   }, nPlansBefore, { timeout: RUN_TIMEOUT, polling: 200 });
   await page.waitForTimeout(250);
 }
+
+const toastTexts = (page) => page.evaluate(() => Array.from(document.querySelectorAll('#toast-root .toast-msg')).map((t) => t.textContent));
 
 // the viewed plan as the views see it (minus heavy fields)
 function viewedPlan(page) {
@@ -590,6 +601,20 @@ async function runViewport(browser, fileUrl, vp, label) {
 
   // ---------------------------------------------------------------- plan now
   section(label + ': plan now');
+  // on the phone, keep one tanker and one cargo truck so the plan must delay requests and the delayed
+  // list is always checked in one viewport (the trucks come back after the delayed list)
+  const parked = phone ? await page.evaluate(() => {
+    const st = SRO.app.store.getState(), keep = {}, out = [];
+    st.scenario.fleet.forEach((t) => {
+      const g = t.type === 'tanker' ? 'fuel' : 'cargo';
+      if (t.status === 'out') return;
+      if (!keep[g]) { keep[g] = t.id; return; }
+      SRO.app.store.dispatch({ type: 'truck/markOut', truckId: t.id, reason: 'Held back for the spec' });
+      out.push(t.id);
+    });
+    return out;
+  }) : [];
+  if (phone) check(parked.length > 0, 'the phone run keeps one truck of each type to force a shortfall', parked.length);
   let nPlans = await page.evaluate(() => SRO.app.store.getState().plans.length);
   await page.click('[data-testid="plan-now"]');
   await page.waitForSelector('[data-testid="run-panel"]:not([hidden])', { timeout: 10000 });
@@ -642,7 +667,12 @@ async function runViewport(browser, fileUrl, vp, label) {
       await page.keyboard.press('Escape');
     }
   } else {
+    check(!phone, 'the forced shortfall delays requests, so the delayed list can be checked', plan.stats);
     note('the plan has no delayed requests, so the delayed list was not opened');
+  }
+  if (parked.length) {
+    await page.evaluate((ids) => ids.forEach((id) => SRO.app.store.dispatch({ type: 'truck/markAvailable', truckId: id })), parked);
+    await page.waitForTimeout(200);
   }
 
   // truck cards + timeline
@@ -651,6 +681,14 @@ async function runViewport(browser, fileUrl, vp, label) {
   check(cards === used.length, 'one route card per truck used', [cards, used.length]);
   const card0 = await page.locator('.pp-truck[data-truck]').first().innerText();
   check(DTG_RE.test(card0) && /mi\b/.test(card0) && /%/.test(card0), 'route card shows DTG times, miles and load %', card0.replace(/\s+/g, ' '));
+  // one plain-language stops line per card: a name per stop, in order
+  const stopLines = await page.evaluate(() => Array.from(document.querySelectorAll('.pp-truck[data-truck]')).map((c) => ({ id: c.getAttribute('data-truck'),
+    lines: c.querySelectorAll('[data-testid="truck-stops"]').length, text: ((c.querySelector('[data-testid="truck-stops"]') || {}).textContent || '').trim() })));
+  stopLines.forEach((c) => {
+    const r = used.find((x) => x.truckId === c.id);
+    const segs = c.text ? c.text.split(' > ').filter((x) => x !== 'turned back') : [];
+    check(c.lines === 1 && r && segs.length === r.stops && segs.every((x) => x.length > 1), c.id + ' card has one stops line with a name per stop', [c.text, r && r.stops]);
+  });
   const tl = await page.evaluate(() => ({ rows: document.querySelectorAll('[data-testid="timeline"] .pp-tl-row').length,
     bg: (document.querySelector('[data-testid="timeline"] .pp-tl-track') || { style: {} }).style.background || '' }));
   check(tl.rows === used.length, 'timeline has a row per truck', tl.rows);
@@ -686,6 +724,12 @@ async function runViewport(browser, fileUrl, vp, label) {
       reqs: document.querySelectorAll('[data-testid="stop-list"] .pr-req').length, rally: rt.stops.some((s) => s.kind === 'rally'), direct: rt.stops.some((s) => s.kind === 'direct') };
   });
   check(rd.stops.length === rd.n, 'stop list has every stop', [rd.stops.length, rd.n]);
+  const loadFact = await page.evaluate(() => {
+    const f = Array.from(document.querySelectorAll('section.pl-view[data-tab="route"] .fact, section.pl-view[data-tab="route"] [class*="fact"]')).find((e) => /^\s*Load/i.test(e.innerText));
+    const v = f && (f.querySelector('.fact-value, [class*="value"]') || f);
+    return v ? { text: v.innerText.trim(), clipped: v.scrollWidth > v.clientWidth + 1 } : null;
+  });
+  check(!loadFact || (!loadFact.clipped && /\d+% · [\d,.]+\/[\d,.]+ /.test(loadFact.text)), 'the Load fact shows percent and amount without being cut off', loadFact);
   check(rd.stops.every((t) => MGRS_RE.test(t)), 'every stop shows MGRS', rd.stops.find((t) => !MGRS_RE.test(t)));
   check(rd.stops.every((t) => /Arrive \d{6}[A-Z] [A-Z]{3} \d{2}/.test(t) && /depart \d{6}[A-Z]/.test(t)), 'every stop shows arrive and depart DTG');
   check(rd.stops.every((t) => /(Day|Dusk|Night|Dawn)/.test(t)), 'every stop names the period');
@@ -793,7 +837,17 @@ async function runViewport(browser, fileUrl, vp, label) {
   });
   check(ct.cols.length === cmpMethods.length && /Tabu/.test(ct.cols.join()) && /annealing/.test(ct.cols.join()) && (!withMip || /MIP/.test(ct.cols.join())), 'comparison table has a column per method', ct.cols);
   check(ct.overflow <= 1, 'the comparison table fits the panel without sideways scrolling (' + cmpMethods.length + ' methods)', ct.overflow);
-  ['Total cost', 'Fuel', 'Distance', 'Risk', 'Simplicity', 'Delayed', 'Run time', 'Gap (MIP)'].forEach((r) => check(ct.rows.indexOf(r) >= 0, 'comparison row ' + r));
+  ['Total cost', 'Fuel', 'Distance', 'Risk', 'Simplicity', 'Platoon travel', 'Late penalty', 'Delay penalty', 'Late', 'Delayed', 'Run time', 'Gap (MIP)']
+    .forEach((r) => check(ct.rows.indexOf(r) >= 0, 'comparison row ' + r));
+  // the indented part rows add up to the total of each column (each cell is rounded)
+  const sums = await page.evaluate(() => {
+    const t = document.querySelector('[data-testid="compare-table"]'), out = {};
+    const num = (e) => Number(e.innerText.replace(/,/g, ''));
+    t.querySelectorAll('td[data-col][data-row="Total cost"]').forEach((e) => { out[e.getAttribute('data-col')] = { total: num(e), parts: 0, n: 0 }; });
+    t.querySelectorAll('tr.pp-cmp-part td[data-col]').forEach((e) => { const o = out[e.getAttribute('data-col')]; o.parts += num(e); o.n++; });
+    return out;
+  });
+  Object.keys(sums).forEach((m) => { const o = sums[m]; check(Math.abs(o.parts - o.total) <= 0.5 * o.n + 0.5, 'the ' + m + ' cost rows add up to its total', o); });
   const cmpPlans = await page.evaluate((n) => SRO.app.store.getState().plans.slice(-n).map((p) => ({ id: p.id, method: p.method, total: p.cost.total, mipGap: p.mipGap, compareId: p.compareId || null })), cmpMethods.length);
   cmpPlans.forEach((p) => {
     const cell = ct.cells.find((c) => c.m === p.method);
@@ -802,7 +856,24 @@ async function runViewport(browser, fileUrl, vp, label) {
     const wantGap = typeof p.mipGap === 'number' ? (p.mipGap * 100).toFixed(1) + '%' : '-';
     check(g && g.v === wantGap, 'gap cell of ' + p.method + ' equals plan.mipGap', [g && g.v, wantGap]);
   });
+  const cheapest = cmpPlans.reduce((a, p) => (!a || p.total < a.total ? p : a), null);
+  const afterCmp = await viewedPlan(page);
+  check(afterCmp && afterCmp.id === cheapest.id, 'after Compare the lowest-cost plan is shown (T1)', [afterCmp && afterCmp.id, cheapest.id]);
+  const cmpToast = (await toastTexts(page)).find((t) => /^Compared \d+ methods/.test(t)) || '';
+  check(/Showing the lowest-cost plan \(.+\); keep the one you want\.$/.test(cmpToast), 'the compare toast says the lowest-cost plan is shown', cmpToast);
   await shot(page, label + '-dark-compare');
+  if (withMip) {
+    // the MIP notice reads from what the solver proved, and never claims the best possible plan
+    await page.click('[data-testid="keep-mip"]');
+    await page.waitForTimeout(250);
+    const mn = await page.evaluate(() => {
+      const p = SRO.ui.plannerKit.viewedPlan(SRO.app.store.getState()), e = document.querySelector('[data-testid="mip-notice"]');
+      return { want: p.mipProof ? p.mipProof.stopReason : null, exact: p.mipProof ? p.mipProof.exactModel : null, reason: e && e.getAttribute('data-reason'), text: e ? e.innerText : '' };
+    });
+    check(!!mn.reason && (!mn.want || mn.reason === mn.want), 'the MIP notice follows plan.mipProof.stopReason', mn);
+    check(!/best possible plan/i.test(mn.text) && (mn.reason === 'optimal' || /exact model's bound/.test(mn.text)), 'the MIP notice says what the gap is measured against', mn.text);
+    if (mn.exact === false) check(/average time-of-day/.test(mn.text), 'the MIP notice says when the model is not exact', mn.text);
+  }
   await page.click('[data-testid="keep-sa"]');
   await page.waitForTimeout(250);
   check(await page.locator('[data-testid="keep-sa"]').getAttribute('aria-pressed') === 'true', 'Keep marks the kept plan');
@@ -822,6 +893,57 @@ async function runViewport(browser, fileUrl, vp, label) {
   check(/Compared to/.test(diffT), 'the diff card names the plan it compares to', diffT.slice(0, 120));
   await shot(page, label + '-dark-diff');
   await prevBtn.click();
+
+  // ---------------------------------------------------------------- compare: the last method costs more
+  // B1: the plan shown (and approved) after Compare is the cheapest, not the last one stored. Tabu then
+  // a deliberately weak Ant colony (one ant, one round, no local search) so the last plan costs more.
+  section(label + ': compare shows the lowest-cost plan');
+  // enough open requests that one weak ant cannot match Tabu search, and that Cancel finds the ants running
+  const open2 = await page.evaluate(() => { const K = SRO.ui.plannerKit, st = SRO.app.store.getState(); return K.queueRequests(st).filter((r) => K.OPEN_STATUSES.indexOf(r.status) >= 0).length; });
+  if (open2 < 12) await page.evaluate(() => SRO.app.store.dispatch({ type: 'samples/load' }));
+  if (await page.locator('[data-testid="cmp-sa"]').isChecked()) await page.locator('[data-testid="cmp-sa"]').uncheck();
+  if (withMip && await mipCmp.isChecked()) await mipCmp.uncheck();
+  await page.locator('[data-testid="cmp-aco"]').check();
+  await page.evaluate(() => SRO.app.store.dispatch({ type: 'settings/update', changes: { methodParams: { aco: { ants: 1, iterations: 1, localSearch: false, timeCapSec: 5 } } } }));
+  nPlans = await page.evaluate(() => SRO.app.store.getState().plans.length);
+  await page.click('[data-testid="compare-run"]');
+  await page.waitForFunction((n) => SRO.app.store.getState().plans.length >= n && !document.querySelector('[data-testid="run-panel"]:not([hidden])'), nPlans + 2, { timeout: RUN_TIMEOUT * 2, polling: 250 });
+  await page.waitForTimeout(300);
+  const pair = await page.evaluate(() => SRO.app.store.getState().plans.slice(-2).map((p) => ({ id: p.id, method: p.method, total: p.cost.total, name: p.name })));
+  check(pair[1].method === 'aco', 'Ant colony is the last plan stored', pair.map((p) => p.method));
+  if (pair[1].total <= pair[0].total) note('the weak Ant colony plan was not the more expensive one here: ' + pair.map((p) => Math.round(p.total)).join(' / '));
+  const low = pair[0].total <= pair[1].total ? pair[0] : pair[1];
+  const shown2 = await viewedPlan(page);
+  check(shown2 && shown2.id === low.id, 'with the last method the more expensive one, Compare still shows the lowest-cost plan', [shown2 && shown2.id, pair]);
+  await page.click('[data-testid="approve"]');
+  await page.waitForSelector('.modal');
+  const apTitle = await page.locator('.modal').last().innerText();
+  check(apTitle.indexOf(low.name) >= 0 || apTitle.indexOf(low.id) >= 0, 'Approve acts on the plan shown after Compare', apTitle.replace(/\s+/g, ' ').slice(0, 160));
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(250);
+  // Cancel during the last method: the plans found so far are kept and the cheapest is shown
+  section(label + ': cancel during compare shows the lowest-cost plan');
+  await page.evaluate(() => SRO.app.store.dispatch({ type: 'settings/update', changes: { methodParams: { aco: { ants: 1, iterations: 10000, localSearch: false, timeCapSec: 60 } } } }));
+  nPlans = await page.evaluate(() => SRO.app.store.getState().plans.length);
+  await page.click('[data-testid="compare-run"]');
+  await page.waitForFunction(() => { const s = SRO.ui.plannerKit.engine().status(); return s.phase === 'running' && s.method === 'aco'; }, null, { timeout: RUN_TIMEOUT, polling: 100 });
+  await page.waitForTimeout(300);
+  await page.click('[data-testid="cancel"]');
+  await page.waitForFunction(() => !document.querySelector('[data-testid="run-panel"]:not([hidden])') && SRO.ui.plannerKit.engine().status().phase !== 'running', null, { timeout: 60000, polling: 200 });
+  await page.waitForTimeout(400);
+  const kept2 = await page.evaluate((n) => SRO.app.store.getState().plans.slice(n).map((p) => ({ id: p.id, method: p.method, total: p.cost.total, cancelled: !!p.cancelled })), nPlans);
+  const low2 = kept2.reduce((a, p) => (!a || p.total < a.total ? p : a), null);
+  const shown3 = await viewedPlan(page);
+  check(!!low2 && shown3 && shown3.id === low2.id, 'after Cancel during Compare the lowest-cost plan found so far is shown', [shown3 && shown3.id, kept2]);
+  const cancelToast = (await toastTexts(page)).find((t) => /^Stopped\. Kept/.test(t)) || '';
+  check(/Showing the lowest-cost one/.test(cancelToast), 'the cancel toast says the lowest-cost plan is shown', cancelToast);
+  await page.evaluate(() => SRO.app.store.dispatch({ type: 'settings/update', changes: { methodParams: { aco: { iterations: 10000, ants: 20, localSearch: true, timeCapSec: 5 } } } }));
+  await page.locator('[data-testid="cmp-aco"]').uncheck();
+  await page.locator('[data-testid="cmp-sa"]').check();
+  // picker labels name each plan once
+  const pick = await page.locator('[data-testid="plan-picker"] option, select.pp-picker option').evaluateAll((os) => os.map((o) => o.textContent));
+  if (pick.length) check(new Set(pick).size === pick.length, 'plan picker labels are unique', pick);
+  else note('no plan picker found');
 
   // ---------------------------------------------------------------- cancel
   section(label + ': cancel keeps the best plan');
@@ -915,6 +1037,8 @@ async function runViewport(browser, fileUrl, vp, label) {
     const real = await page.evaluate(() => !SRO.core.engine.stub);
     let midId = null;
     if (real) {
+      // marking the truck out asks for a fresh estimate; let it finish before the re-plan starts
+      await page.waitForFunction(() => ['running', 'preparing', 'estimating'].indexOf(SRO.ui.plannerKit.engine().status().phase) < 0, null, { timeout: 60000, polling: 100 }).catch(() => null);
       const r2 = await page.evaluate(() => SRO.ui.plannerKit.engine().replan({ reason: 'Blown tire' }).then((p) => (p ? p.id : null), (e) => 'ERR ' + (e && e.message)));
       check(r2 && !/^ERR/.test(r2), 'the mid-route re-plan finishes', r2);
       midId = r2;
@@ -957,6 +1081,32 @@ async function runViewport(browser, fileUrl, vp, label) {
     }, mid);
     check(mv.id === midId && mv.parent, 'the mid-route re-plan is shown', [mv.id, midId, mv.parent]);
     check(/from its next stop/.test(mv.summaryNote) && /whole trips/.test(mv.summaryNote), 'a re-plan says its summary totals cover the re-planned part and the cards whole trips', mv.summaryNote);
+    // "this window" stats next to the "from now" ones, straight from plan.windowStats
+    const ws = await page.evaluate(() => {
+      const p = SRO.ui.plannerKit.viewedPlan(SRO.app.store.getState());
+      const cells = Array.from(document.querySelectorAll('[data-testid="summary-window"] [data-wstat]')).map((e) => ({ k: e.getAttribute('data-wstat'), v: e.getAttribute('data-value'), text: e.innerText.replace(/\s+/g, ' ') }));
+      return { want: p.windowStats || null, cells };
+    });
+    if (ws.want) {
+      const map = { requests: 'requests', stops: 'stops', trucks: 'trucksUsed', miles: 'miles', gallons: 'gallons', risk: 'riskUnits', delayed: 'delayed', rally: 'rallyPoints' };
+      check(ws.cells.length >= 6, 'a re-plan shows the "this window" stats strip', ws.cells.length);
+      ws.cells.forEach((c) => { if (map[c.k] && c.v != null) check(Math.abs(Number(c.v) - Number(ws.want[map[c.k]])) < 1e-6, 'window ' + c.k + ' equals plan.windowStats', [c.v, ws.want[map[c.k]]]); });
+    } else note('this re-plan has no windowStats (stub engine), so the window strip is not checked');
+    // approve dialog: trucks already on the road carry on; no past departure is listed
+    await page.click('[data-testid="approve"]');
+    await page.waitForSelector('.modal');
+    const ad = await page.locator('.modal').last().innerText();
+    const firstAt = /first at (\d{6}[A-Z] [A-Z]{3} \d{2})/.exec(ad);
+    const nowDtg = await page.evaluate(() => SRO.core.format.dtg(SRO.app.store.getState().clock.simMin));
+    const onRoad = await page.evaluate(() => {
+      const K = SRO.ui.plannerKit, st = SRO.app.store.getState(), now = st.clock.simMin;
+      return K.activeRoutes(K.viewedPlan(st)).filter((r) => r.depart <= now && !(r.returnAt <= now)).length;
+    });
+    if (!onRoad) note('no truck of this re-plan has left yet, so the dialog has no on-the-road line');
+    else check(/already on the road carr/.test(ad), 'the approve dialog of a mid-route re-plan names the trucks already on the road', ad.replace(/\s+/g, ' ').slice(0, 240));
+    if (firstAt) check(firstAt[1] >= nowDtg || firstAt[1].slice(-6) !== nowDtg.slice(-6), 'the approve dialog lists no departure in the past', [firstAt[1], nowDtg]);
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(250);
     const vr = mv.routes.find((r) => r.truckId === mid.truckId);
     check(vr && vr.out && vr.done >= 1, 'the re-plan keeps the done stop of the truck marked out', vr);
     const vc = mv.cards.find((c) => c.id === mid.truckId);
@@ -1082,6 +1232,40 @@ async function runViewport(browser, fileUrl, vp, label) {
     check(/Check reason A/.test(dlt) && /Check reason B/.test(dlt), 'the delayed list shows both notes', dlt.slice(0, 200));
     await page.keyboard.press('Escape');
     await page.waitForTimeout(200);
+  }
+
+  // ---------------------------------------------------------------- refused approve
+  // a copy of the shown plan that breaks a planning rule: the approve dialog lists the broken rule, the
+  // store refuses it (other plans of the window meet every rule) and the dialog offers those plans
+  section(label + ': approve refused for a plan that breaks a rule');
+  const badId = await page.evaluate(() => {
+    const S = SRO.app.store, K = SRO.ui.plannerKit, p = JSON.parse(JSON.stringify(K.viewedPlan(S.getState())));
+    delete p.id; p.name = 'Rule-break check'; p.parentPlanId = null; p.approved = false; p.superseded = false;
+    p.stats = Object.assign({}, p.stats, { violations: 1, feasible: false });
+    p.violations = [{ code: 'too-many-rally', detail: 'Check rule: the plan uses 9 rally points; the limit is 8.' }];
+    const r = S.dispatch({ type: 'plan/store', plan: p });
+    if (r.ok) K.showPlan(r.id);
+    return r.ok ? r.id : null;
+  });
+  await showTab(page, 'plan');
+  await page.waitForTimeout(300);
+  await page.click('[data-testid="approve"]');
+  await page.waitForSelector('.modal');
+  const vl = await page.locator('[data-testid="approve-violations"]').innerText().catch(() => '');
+  check(/Check rule/.test(vl), 'the approve dialog lists the rules the plan breaks', vl);
+  await page.click('.modal [data-action="approve"]');
+  await page.waitForTimeout(400);
+  const rf = await page.evaluate((id) => ({ shown: !!document.querySelector('[data-testid="approve-refused"]'), approved: !!SRO.app.store.getState().plans.find((p) => p.id === id).approved,
+    alts: Array.from(document.querySelectorAll('.pp-alt-list [data-plan]')).map((e) => e.getAttribute('data-plan')) }), badId);
+  check(rf.shown && !rf.approved, 'the store refuses the plan and the dialog says why', rf);
+  if (rf.alts.length) {
+    await page.locator('.pp-alt-list [data-plan] button').first().click();
+    await page.waitForTimeout(400);
+    const alt = await viewedPlan(page);
+    check(alt && alt.id === rf.alts[0], '"Show plan" shows the cheapest plan that meets every rule', [alt && alt.id, rf.alts]);
+  } else {
+    note('no other plan of this window meets every rule, so the store approved with a warning or refused without alternatives');
+    await page.keyboard.press('Escape');
   }
 
   // ---------------------------------------------------------------- console
